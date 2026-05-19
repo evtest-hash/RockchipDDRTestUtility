@@ -17,6 +17,8 @@ public final class RkUsbTransportLibusb: UsbTransport {
     private static let handshakeOpcode: UInt32 = 0x00
 
     private static let timeoutMs: UInt32 = 5000
+    private static let gb18030Encoding: UInt32 = 0x0632
+    private static let fallbackParameterAddress: UInt32 = 0xFF0F_FF00
 
     private var context: OpaquePointer?
     private var handle: OpaquePointer?
@@ -28,16 +30,7 @@ public final class RkUsbTransportLibusb: UsbTransport {
     private var openedDevice: UsbDevice?
     private var tokenSeed: UInt32 = 0x13572468
     private let debugEnabled = false
-    private let noClaimMode = false
-    private let forceSetConfig = false
-    private let libusbLogEnabled = false
-    private let claimOnOpen = false
-    private let trimBootZeroPadding = false
-    private let forceSetAlt = false
-    private let forceClearHalt = false
-    private let bootLimitBytes: Int? = nil
     private let bootChunkDelayUs: useconds_t = 60_000
-    private let openSettleUs: useconds_t = 0
     private let transferTimeoutMs: UInt32 = RkUsbTransportLibusb.timeoutMs
 
     public init() throws {
@@ -196,10 +189,6 @@ public final class RkUsbTransportLibusb: UsbTransport {
         _ = libusb_set_interface_alt_setting(selected, claimedInterface, claimedAltSetting)
         _ = libusb_clear_halt(selected, bulkOutEndpoint)
         _ = libusb_clear_halt(selected, bulkInEndpoint)
-        if openSettleUs > 0 {
-            usleep(openSettleUs)
-            debug("open settle delay us=\(openSettleUs)")
-        }
     }
 
     public func downloadBoot(item: CfgItem, payload: Data) throws {
@@ -208,13 +197,7 @@ public final class RkUsbTransportLibusb: UsbTransport {
             throw DDRToolError.transportError("Boot payload is empty")
         }
 
-        var bootPayload = bootPayloadWithCRC(payload)
-        if trimBootZeroPadding {
-            bootPayload = trimTrailingZeros(bootPayload)
-        }
-        if let bootLimitBytes, bootLimitBytes > 0, bootLimitBytes < bootPayload.count {
-            bootPayload = bootPayload.prefix(bootLimitBytes)
-        }
+        let bootPayload = bootPayloadWithCRC(payload)
         debug("downloadBoot bytes=\(bootPayload.count)")
 
         var offset = 0
@@ -262,7 +245,7 @@ public final class RkUsbTransportLibusb: UsbTransport {
     public func downloadParam(item: CfgItem, address: UInt32?, params: [CfgParameter]) throws {
         try ensureOpened()
         let payload = makeParameterPayload(params: params)
-        let targetAddress = address ?? 0xFF0F_FF00
+        let targetAddress = address ?? Self.fallbackParameterAddress
         let token = nextToken()
         let command = makeCommand(
             opcode: Self.writeOpcode,
@@ -345,7 +328,7 @@ public final class RkUsbTransportLibusb: UsbTransport {
         // Try GBK first; if that fails, try UTF-8, then ASCII.
         // As a fallback, if UTF-8 produced Latin-1-range garbage, fix double-encoding.
         var text: String?
-        let gbEncoding = String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(0x0632)) // GB18030
+        let gbEncoding = String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(Self.gb18030Encoding)) // GB18030
         if let s = String(data: trimmed, encoding: gbEncoding), !s.isEmpty {
             text = s
         } else if let s = String(data: trimmed, encoding: .utf8), !s.isEmpty {
@@ -401,9 +384,6 @@ public final class RkUsbTransportLibusb: UsbTransport {
         let rc = libusb_init(&newContext)
         guard rc == 0, let newContext else {
             throw makeUSBError("libusb_init failed", code: rc)
-        }
-        if libusbLogEnabled {
-            libusb_set_debug(newContext, Int32(LIBUSB_LOG_LEVEL_DEBUG.rawValue))
         }
         context = newContext
     }
@@ -797,12 +777,6 @@ public final class RkUsbTransportLibusb: UsbTransport {
             return
         }
 
-        if noClaimMode {
-            debug("no-claim mode enabled; skip libusb_claim_interface")
-            interfaceClaimed = true
-            return
-        }
-
         let claimRC = libusb_claim_interface(handle, claimedInterface)
         guard claimRC == 0 else {
             throw DDRToolError.transportError(
@@ -810,28 +784,6 @@ public final class RkUsbTransportLibusb: UsbTransport {
             )
         }
         debug("claim interface rc=0 (lazy)")
-
-        if forceSetAlt {
-            let altRC = libusb_set_interface_alt_setting(handle, claimedInterface, claimedAltSetting)
-            guard altRC == 0 else {
-                _ = libusb_release_interface(handle, claimedInterface)
-                throw DDRToolError.transportError(
-                    "libusb_set_interface_alt_setting(\(claimedInterface),\(claimedAltSetting)) failed: \(usbErrorMessage(code: altRC))"
-                )
-            }
-            debug("set alt setting rc=0 (lazy)")
-        } else {
-            debug("skip set alt setting (lazy)")
-        }
-
-        if forceClearHalt {
-            let clearOutRC = libusb_clear_halt(handle, bulkOutEndpoint)
-            let clearInRC = libusb_clear_halt(handle, bulkInEndpoint)
-            debug("clear halt out rc=\(clearOutRC), in rc=\(clearInRC) (lazy)")
-        } else {
-            debug("skip clear halt (lazy)")
-        }
-
         interfaceClaimed = true
     }
 

@@ -1,11 +1,15 @@
 import Foundation
 
 public final class ResultLogWriter {
+    private static let dateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy/MM/dd HH:mm:ss"
+        return formatter
+    }()
+
     public init() {}
 
     public func render(result: ExecutionResult, sourceCfgPath: String, outcome: TestOutcome? = nil) -> String {
-        let dateFormatter = DateFormatter()
-        dateFormatter.dateFormat = "yyyy/MM/dd HH:mm:ss"
         let finalOutcome = outcome ?? result.outcome
 
         var lines: [String] = []
@@ -13,7 +17,7 @@ public final class ResultLogWriter {
         if let device = result.selectedDevice {
             lines.append("Device: \(device.productName)")
         }
-        lines.append("Time: \(dateFormatter.string(from: result.startedAt))")
+        lines.append("Time: \(Self.dateFormatter.string(from: result.startedAt))")
         lines.append("Result: \(finalOutcome == .passed ? "PASS" : "FAIL")")
         lines.append("")
 

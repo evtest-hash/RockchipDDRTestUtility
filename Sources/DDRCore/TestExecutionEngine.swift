@@ -2,6 +2,13 @@ import Foundation
 
 public actor TestExecutionEngine {
     public typealias LogHandler = (ExecutionLogEntry) -> Void
+
+    private enum ItemName {
+        static let boot = "Boot"
+        static let forceinit = "forceinit"
+        static let connect = "connect"
+    }
+
     private let maxPrintfReadsPerItem = 256
     private let maxConsecutiveEmptyPrintfReads = 8
     private let defaultBootSettleDelayMs: UInt64 = 800
@@ -72,7 +79,7 @@ public actor TestExecutionEngine {
             }
 
             // ── Stage 1: Boot ──
-            let bootItem = plan.items.first { $0.name.caseInsensitiveCompare("Boot") == .orderedSame }
+            let bootItem = plan.items.first { $0.name.caseInsensitiveCompare(ItemName.boot) == .orderedSame }
             if let bootItem {
                 let bootPayload = plan.embeddedBins[bootItem.name] ?? Data()
                 state = .downloading
@@ -88,7 +95,7 @@ public actor TestExecutionEngine {
             }
 
             // ── Stage 2+: Test items (forceinit, connect, ...) ──
-            let testItems = plan.items.filter { $0.name.caseInsensitiveCompare("Boot") != .orderedSame }
+            let testItems = plan.items.filter { $0.name.caseInsensitiveCompare(ItemName.boot) != .orderedSame }
 
             for item in testItems {
                 let payload = plan.embeddedBins[item.name] ?? Data()
@@ -141,23 +148,22 @@ public actor TestExecutionEngine {
                 while printfReadCount < maxPrintfReadsPerItem,
                       emptyReadCount < maxConsecutiveEmptyPrintfReads {
                     let printf = try transport.readPrintf()
-                    guard let printf, !printf.isEmpty else {
+                    if let printf, !printf.isEmpty {
+                        emptyReadCount = 0
+                        itemLogText += printf
+                        append(.info, "INFO_PRINTF", printf)
+                        printfReadCount += 1
+
+                        if deviceReportedFailure(item: item, text: printf) {
+                            itemFailed = true
+                            break
+                        }
+                        if isItemLogComplete(item: item, text: itemLogText) {
+                            break
+                        }
+                    } else {
                         emptyReadCount += 1
                         printfReadCount += 1
-                        continue
-                    }
-
-                    emptyReadCount = 0
-                    itemLogText += printf
-                    append(.info, "INFO_PRINTF", printf)
-                    printfReadCount += 1
-
-                    if deviceReportedFailure(item: item, text: printf) {
-                        itemFailed = true
-                        break
-                    }
-                    if isItemLogComplete(item: item, text: itemLogText) {
-                        break
                     }
                     try await Task.sleep(nanoseconds: printfPollDelayMs * 1_000_000)
                 }
@@ -186,17 +192,17 @@ public actor TestExecutionEngine {
     // MARK: - Private
 
     private func shouldDownloadParam(for item: CfgItem) -> Bool {
-        item.name.caseInsensitiveCompare("forceinit") == .orderedSame
+        item.name.caseInsensitiveCompare(ItemName.forceinit) == .orderedSame
     }
 
     /// Check if the device's printf output indicates the current stage completed.
     private func isItemLogComplete(item: CfgItem, text: String) -> Bool {
-        if item.name.caseInsensitiveCompare("forceinit") == .orderedSame {
+        if item.name.caseInsensitiveCompare(ItemName.forceinit) == .orderedSame {
             return text.contains("Force init DDR pass.")
                 || text.contains("Force init DDR fail")
                 || text.contains("sdram_init_all_channel end.")
         }
-        if item.name.caseInsensitiveCompare("connect") == .orderedSame {
+        if item.name.caseInsensitiveCompare(ItemName.connect) == .orderedSame {
             let upper = text.uppercased()
             return upper.contains("RESULT: PASS")
                 || upper.contains("RESULT: FAIL")

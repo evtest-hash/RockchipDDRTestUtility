@@ -141,6 +141,10 @@ cp "$BUILD_DIR/DDRUserToolCLI"    "$BUNDLE_DIR/Contents/MacOS/"
 cp "$PROJECT_DIR/scripts/Info.plist" "$BUNDLE_DIR/Contents/"
 printf "APPL????" > "$BUNDLE_DIR/Contents/PkgInfo"
 
+if [ -f "$PROJECT_DIR/scripts/AppIcon.icns" ]; then
+    cp "$PROJECT_DIR/scripts/AppIcon.icns" "$BUNDLE_DIR/Contents/Resources/AppIcon.icns"
+fi
+
 # ── Step 5: Bundle DDR test files ──
 
 echo "=== Copying DDRTestFiles ==="

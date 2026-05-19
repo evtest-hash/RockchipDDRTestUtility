@@ -67,6 +67,25 @@ bash scripts/package.sh
 swift test
 ```
 
+## Test File Structure
+
+The app bundles test configuration files in `DDRTestFiles/` with one subdirectory per SoC:
+
+```
+DDRTestFiles/
+  RK3588/
+    4GB LPDDR4.cfg
+    8GB LPDDR4X.cfg
+  RK3568&RK3566/
+    2GB DDR4.cfg
+  ...
+```
+
+At runtime, `CfgRepository` discovers files from:
+1. App bundle: `Contents/Resources/DDRTestFiles/` (DMG install)
+2. Executable directory: `DDRTestFiles/` next to the binary (CLI / development)
+3. Current working directory: `./DDRTestFiles/` (fallback)
+
 ## Usage
 
 1. Connect a Rockchip device via USB (device must be in download mode)

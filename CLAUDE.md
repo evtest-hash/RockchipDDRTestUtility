@@ -29,9 +29,10 @@ bash scripts/package.sh
 ```bash
 swift test                              # run all tests
 swift test --filter CfgBinaryParserTests # run single test suite
+swift test --filter CfgRepositoryTests   # test SoC discovery
 ```
 
-Tests cover CfgBinaryParser, TestExecutionEngine state transitions, and ResultLogWriter. No USB hardware required for unit tests.
+Tests cover CfgBinaryParser, CfgRepository (SoC name extraction), TestExecutionEngine state transitions, and ResultLogWriter. No USB hardware required for unit tests.
 
 ## Architecture
 
@@ -44,10 +45,19 @@ Tests cover CfgBinaryParser, TestExecutionEngine state transitions, and ResultLo
 
 ### Key Data Flow
 
-1. `CfgRepository` reads `DDR_UserTool_v1.41/resource/config.ini` and discovers `.cfg` test files from `TestFiles/` directory.
-2. `CfgBinaryParser` parses binary `.cfg` files by extracting UTF-16LE ASCII tokens, identifying test items (Boot, forceinit, connect), and loading payloads from embedded binary data.
+1. `CfgRepository` discovers `.cfg` test files from `DDRTestFiles/` directory. Each SoC has its own subdirectory (e.g., `DDRTestFiles/RK3588/4GB LPDDR4.cfg`). The SoC name is extracted as `components[0]` from the relative path (SoC directory / filename).
+2. `CfgBinaryParser` parses binary `.cfg` files by extracting UTF-16LE ASCII tokens, identifying test items (Boot, forceinit, connect), and loading payloads from embedded binary data (RC4-encrypted, except Boot).
 3. `TestExecutionEngine` (actor) drives the test: for each item — download boot via USB control transfer, settle delay, download item via bulk write/read, optionally download parameters, run item, poll printf output until completion markers appear.
 4. `ResultLogWriter` renders the final pass/fail result.
+
+### Resource Discovery
+
+`CfgRepository.makeDefaultRootURL()` probes three locations in order:
+1. **Bundled app**: `Bundle.main.resourceURL/DDRTestFiles` (inside `.app/Contents/Resources/`)
+2. **CLI / development**: DDRTestFiles sibling to the executable
+3. **Fallback**: `./DDRTestFiles` relative to CWD
+
+The DMG build script (`scripts/package.sh`) copies `DDRTestFiles/` to `Contents/Resources/DDRTestFiles` in the app bundle.
 
 ### Failure Detection
 
@@ -61,6 +71,7 @@ The engine detects device-side failures from printf output:
 `RkUsbTransportLibusb` implements Rockchip's proprietary USB protocol:
 - Boot: vendor-specific control transfer (request=0x0C, index=0x0471), 4096-byte chunks with CRC-CCITT
 - Bulk commands: 32-byte packets (opcode + address + length + token + padding)
+- Token generation: LCG pseudo-random (seed 0x13572468)
 - Parameter payloads are hardcoded for known SoCs (RK3588: 38 params, RK3568: 18 params)
 
 ## CI/CD
@@ -68,5 +79,3 @@ The engine detects device-side failures from printf output:
 GitHub Actions builds a universal (arm64 + x86_64) DMG on:
 - Push of `v*` tags (auto-creates GitHub Release)
 - Manual workflow dispatch
-
-Runtime data (TestFiles/, resource/) is bundled into the app at package time from `../DDR_UserTool_v1.41`.

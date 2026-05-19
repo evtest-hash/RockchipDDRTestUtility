@@ -1,7 +1,4 @@
 import Foundation
-#if canImport(CryptoKit)
-import CryptoKit
-#endif
 
 public final class CfgBinaryParser {
     private static let cfgRC4Key = Data([
@@ -11,6 +8,8 @@ public final class CfgBinaryParser {
 
     private static let recordSpacing = 0x2C3
     private static let firstRecordOffset = 0x41
+    private static let bootPayloadMinimumBytes = 10_242
+    private static let defaultDownloadBaseAddress: UInt32 = 0xFF00_4000
 
     public init() {}
 
@@ -131,7 +130,7 @@ public final class CfgBinaryParser {
                 } else {
                     gap = record.span
                 }
-                length = max(record.span, gap, 10242)
+                length = max(record.span, gap, Self.bootPayloadMinimumBytes)
             } else {
                 length = record.span
             }
@@ -182,12 +181,12 @@ public final class CfgBinaryParser {
 
     private func parseDownloadBaseAddress(from data: Data) -> UInt32 {
         let offset = 0x5B6
-        guard data.count >= offset + 4 else { return 0xFF00_4000 }
+        guard data.count >= offset + 4 else { return Self.defaultDownloadBaseAddress }
         let value = UInt32(data[offset])
             | (UInt32(data[offset + 1]) << 8)
             | (UInt32(data[offset + 2]) << 16)
             | (UInt32(data[offset + 3]) << 24)
-        return value != 0 ? value : 0xFF00_4000
+        return value != 0 ? value : Self.defaultDownloadBaseAddress
     }
 
     private func parseAddress(from value: String?) -> UInt32? {

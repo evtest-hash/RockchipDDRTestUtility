@@ -1,6 +1,6 @@
 import Foundation
 
-public enum DDRToolError: Error, LocalizedError {
+public enum DDRToolError: Error, LocalizedError, Sendable {
     case fileNotFound(String)
     case invalidFormat(String)
     case parseFailure(String)
@@ -29,7 +29,7 @@ public enum DDRToolError: Error, LocalizedError {
     }
 }
 
-public struct AppLanguage: Hashable, Identifiable {
+public struct AppLanguage: Hashable, Identifiable, Sendable {
     public var id: String { tag }
     public let tag: String
     public let titleChinese: String
@@ -44,7 +44,7 @@ public struct AppLanguage: Hashable, Identifiable {
     }
 }
 
-public struct ConfigSettings {
+public struct ConfigSettings: Sendable {
     public let defaultTestFile: String?
     public let autoTest: String?
     public let logFlag: Bool
@@ -106,13 +106,13 @@ public struct TestFileEntry: Identifiable, Hashable {
     }
 }
 
-public enum CfgParamInputType: String {
+public enum CfgParamInputType: String, Sendable {
     case combo = "COMBO"
     case edit = "EDIT"
     case unknown
 }
 
-public struct CfgParameter: Hashable {
+public struct CfgParameter: Hashable, Sendable {
     public let index: Int
     public let section: String
     public let name: String
@@ -146,7 +146,7 @@ public struct CfgParameter: Hashable {
     }
 }
 
-public struct CfgItem: Hashable {
+public struct CfgItem: Hashable, Sendable {
     public let name: String
     public let pathHint: String?
     public let nameOffset: Int
@@ -162,7 +162,7 @@ public struct CfgItem: Hashable {
     }
 }
 
-public struct CfgTestPlan {
+public struct CfgTestPlan: Sendable {
     public let sourcePath: String
     public let address: UInt32?
     public let downloadBaseAddress: UInt32
@@ -209,7 +209,7 @@ public enum RockchipPidMap {
     ]
 }
 
-public struct UsbDevice: Identifiable, Hashable {
+public struct UsbDevice: Identifiable, Hashable, Sendable {
     public var id: String { deviceID }
     public let deviceID: String
     public let vendorID: UInt16
@@ -228,7 +228,7 @@ public struct UsbDevice: Identifiable, Hashable {
     }
 }
 
-public enum ExecutionState: String {
+public enum ExecutionState: String, Sendable {
     case idle = "Idle"
     case initializing = "Init"
     case downloading = "Download"
@@ -238,12 +238,12 @@ public enum ExecutionState: String {
     case failed = "Failed"
 }
 
-public enum LogLevel: String {
+public enum LogLevel: String, Sendable {
     case info = "INFO"
     case error = "ERROR"
 }
 
-public struct ExecutionLogEntry: Hashable {
+public struct ExecutionLogEntry: Hashable, Sendable {
     public let timestamp: Date
     public let level: LogLevel
     public let code: String
@@ -257,12 +257,12 @@ public struct ExecutionLogEntry: Hashable {
     }
 }
 
-public enum TestOutcome: String {
+public enum TestOutcome: String, Sendable {
     case passed = "PASS"
     case failed = "FAIL"
 }
 
-public enum StepState {
+public enum StepState: Sendable {
     case pending
     case downloading
     case running
@@ -284,7 +284,7 @@ public struct TestStep: Identifiable {
     }
 }
 
-public struct ExecutionResult {
+public struct ExecutionResult: Sendable {
     public let outcome: TestOutcome
     public let state: ExecutionState
     public let selectedDevice: UsbDevice?
@@ -309,7 +309,7 @@ public struct ExecutionResult {
     }
 }
 
-public struct LocalizedStrings {
+public struct LocalizedStrings: Sendable {
     public let map: [String: String]
 
     public init(map: [String: String]) {

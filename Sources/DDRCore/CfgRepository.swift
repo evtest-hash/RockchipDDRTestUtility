@@ -12,19 +12,25 @@ public final class CfgRepository {
         if let resourceURL = Bundle.main.resourceURL {
             let bundled = resourceURL.appendingPathComponent("DDRTestFiles")
             if FileManager.default.fileExists(atPath: bundled.path) {
+                log("Using bundled DDRTestFiles: \(bundled.path)")
                 return bundled
             }
+            log("Bundle resource DDRTestFiles not found at: \(bundled.path)")
         }
         // CLI / development: DDRTestFiles sibling to executable
         if let exeURL = Bundle.main.executableURL ?? ExecutableHelper.executableURL {
             let candidate = exeURL.deletingLastPathComponent().appendingPathComponent("DDRTestFiles")
             if FileManager.default.fileExists(atPath: candidate.path) {
+                log("Using executable-sibling DDRTestFiles: \(candidate.path)")
                 return candidate.standardizedFileURL
             }
+            log("Executable-sibling DDRTestFiles not found at: \(candidate.path)")
         }
         // Final fallback: CWD relative
-        return URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        let fallback = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             .appendingPathComponent("DDRTestFiles").standardizedFileURL
+        log("Falling back to CWD-relative DDRTestFiles: \(fallback.path)")
+        return fallback
     }
 
     public func loadSettings() throws -> (settings: ConfigSettings, languages: [AppLanguage], selectedLanguageTag: String) {
@@ -96,9 +102,11 @@ public final class CfgRepository {
 
         while let url = enumerator?.nextObject() as? URL {
             guard url.pathExtension.lowercased() == "cfg" else { continue }
-            let relative = url.path.replacingOccurrences(of: rootPath + "/", with: "")
+            let fullPath = url.path
+            guard fullPath.hasPrefix(rootPath + "/") else { continue }
+            let relative = String(fullPath.dropFirst(rootPath.count + 1))
             let components = relative.split(separator: "/")
-            let soc = components.count >= 2 ? String(components[1]) : "Unknown"
+            let soc = components.count >= 2 ? String(components[0]) : "Unknown"
             entries.append(TestFileEntry(
                 absolutePath: url.path,
                 relativePath: relative,
@@ -150,6 +158,9 @@ public final class CfgRepository {
         default:
             return fallback
         }
+    }
+    private static func log(_ message: String) {
+        fputs("[CfgRepository] \(message)\n", stderr)
     }
 }
 

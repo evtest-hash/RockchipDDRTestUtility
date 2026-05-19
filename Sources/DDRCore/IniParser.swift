@@ -14,8 +14,11 @@ public struct IniDocument {
 
 public enum IniParser {
     public static func parse(url: URL) throws -> IniDocument {
-        guard let data = try? Data(contentsOf: url) else {
-            throw DDRToolError.fileNotFound("INI file not found: \(url.path)")
+        let data: Data
+        do {
+            data = try Data(contentsOf: url)
+        } catch {
+            throw DDRToolError.fileNotFound("Failed to read INI file at \(url.path): \(error.localizedDescription)")
         }
         return try parse(data: data)
     }
