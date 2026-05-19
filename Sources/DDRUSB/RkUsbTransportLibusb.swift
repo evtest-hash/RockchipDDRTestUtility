@@ -1,0 +1,914 @@
+import CLibusb
+import DDRCore
+import Foundation
+
+public final class RkUsbTransportLibusb: UsbTransport {
+    private static let rockchipVendorID: UInt16 = 0x2207
+    private static let bootControlRequestType: UInt8 = 0x40
+    private static let bootControlRequest: UInt8 = 0x0C
+    private static let bootControlIndex: UInt16 = 0x0471
+    private static let bootControlChunkSize = 4096
+
+    private static let downloadChunkSize = 0x4000
+    private static let pollReadLength: UInt32 = 0x200
+    private static let pollOpcode: UInt32 = 0x80
+    private static let writeOpcode: UInt32 = 0x02
+    private static let runOpcode: UInt32 = 0x03
+    private static let handshakeOpcode: UInt32 = 0x00
+
+    private static let timeoutMs: UInt32 = 5000
+
+    private var context: OpaquePointer?
+    private var handle: OpaquePointer?
+    private var claimedInterface: Int32 = -1
+    private var claimedAltSetting: Int32 = 0
+    private var interfaceClaimed = false
+    private var bulkOutEndpoint: UInt8 = 0x02
+    private var bulkInEndpoint: UInt8 = 0x81
+    private var openedDevice: UsbDevice?
+    private var tokenSeed: UInt32 = 0x13572468
+    private let debugEnabled = ProcessInfo.processInfo.environment["DDR_USB_DEBUG"] == "1"
+    private let noClaimMode = ProcessInfo.processInfo.environment["DDR_USB_NOCLAIM"] == "1"
+    private let forceSetConfig = ProcessInfo.processInfo.environment["DDR_USB_FORCE_SETCONFIG"] == "1"
+    private let libusbLogEnabled = ProcessInfo.processInfo.environment["DDR_USB_LIBUSB_LOG"] == "1"
+    private let claimOnOpen = ProcessInfo.processInfo.environment["DDR_USB_CLAIM_ON_OPEN"] == "1"
+    private let trimBootZeroPadding = ProcessInfo.processInfo.environment["DDR_USB_TRIM_BOOT_ZERO_PADDING"] == "1"
+    private let forceSetAlt = ProcessInfo.processInfo.environment["DDR_USB_FORCE_SET_ALT"] == "1"
+    private let forceClearHalt = ProcessInfo.processInfo.environment["DDR_USB_FORCE_CLEAR_HALT"] == "1"
+    private let bootLimitBytes = Int(ProcessInfo.processInfo.environment["DDR_USB_BOOT_LIMIT_BYTES"] ?? "")
+    private let bootChunkDelayUs = useconds_t(ProcessInfo.processInfo.environment["DDR_USB_BOOT_CHUNK_DELAY_US"] ?? "") ?? 60_000
+    private let openSettleUs = useconds_t(ProcessInfo.processInfo.environment["DDR_USB_OPEN_SETTLE_US"] ?? "") ?? 0
+    private let transferTimeoutMs = UInt32(ProcessInfo.processInfo.environment["DDR_USB_TIMEOUT_MS"] ?? "") ?? RkUsbTransportLibusb.timeoutMs
+
+    public init() throws {
+        try initializeContext()
+    }
+
+    deinit {
+        try? close()
+        if let context {
+            libusb_exit(context)
+        }
+    }
+
+    public func discoverDevices() throws -> [UsbDevice] {
+        try ensureContext()
+        let list = try enumerateDevices()
+        defer {
+            for dev in list {
+                libusb_unref_device(dev)
+            }
+        }
+        var devices: [UsbDevice] = []
+
+        for dev in list {
+            var descriptor = libusb_device_descriptor()
+            let rc = libusb_get_device_descriptor(dev, &descriptor)
+            guard rc == 0 else {
+                continue
+            }
+            guard descriptor.idVendor == Self.rockchipVendorID else {
+                continue
+            }
+
+            let bus = libusb_get_bus_number(dev)
+            let addr = libusb_get_device_address(dev)
+            let socName = RockchipPidMap.pidToSoc[descriptor.idProduct]
+            let productName: String
+            if let soc = socName {
+                productName = "Rockchip \(soc) (0x\(String(format: "%04X", descriptor.idProduct)))"
+            } else {
+                productName = String(format: "Rockchip USB (0x%04X)", descriptor.idProduct)
+            }
+
+            var serialNumber: String?
+            if descriptor.iSerialNumber != 0 {
+                var handleForSerial: OpaquePointer?
+                if libusb_open(dev, &handleForSerial) == 0, let handleForSerial {
+                    var serialBuf = [CChar](repeating: 0, count: 256)
+                    let len = libusb_get_string_descriptor_ascii(
+                        handleForSerial,
+                        descriptor.iSerialNumber,
+                        &serialBuf,
+                        Int32(serialBuf.count)
+                    )
+                    if len > 0 {
+                        serialNumber = String(cString: serialBuf)
+                    }
+                    libusb_close(handleForSerial)
+                }
+            }
+
+            let deviceID = String(
+                format: "%03u-%03u-%04X-%04X-%@",
+                bus,
+                addr,
+                descriptor.idVendor,
+                descriptor.idProduct,
+                serialNumber ?? "NA"
+            )
+            devices.append(
+                UsbDevice(
+                    deviceID: deviceID,
+                    vendorID: descriptor.idVendor,
+                    productID: descriptor.idProduct,
+                    productName: productName,
+                    serialNumber: serialNumber,
+                    socName: socName
+                )
+            )
+        }
+
+        return devices
+    }
+
+    public func open(device: UsbDevice) throws {
+        try ensureContext()
+        try close()
+
+        let list = try enumerateDevices()
+        defer {
+            for dev in list {
+                libusb_unref_device(dev)
+            }
+        }
+        var selected: OpaquePointer?
+
+        for dev in list {
+            var descriptor = libusb_device_descriptor()
+            guard libusb_get_device_descriptor(dev, &descriptor) == 0 else {
+                continue
+            }
+            guard descriptor.idVendor == device.vendorID, descriptor.idProduct == device.productID else {
+                continue
+            }
+
+            let bus = libusb_get_bus_number(dev)
+            let addr = libusb_get_device_address(dev)
+            let candidate = String(
+                format: "%03u-%03u-%04X-%04X-",
+                bus,
+                addr,
+                descriptor.idVendor,
+                descriptor.idProduct
+            )
+            if device.deviceID.hasPrefix(candidate) {
+                var handleCandidate: OpaquePointer?
+                let rc = libusb_open(dev, &handleCandidate)
+                guard rc == 0, let handleCandidate else {
+                    throw makeUSBError("libusb_open failed for selected device", code: rc)
+                }
+                selected = handleCandidate
+                break
+            }
+        }
+
+        if selected == nil, let context {
+            selected = libusb_open_device_with_vid_pid(context, device.vendorID, device.productID)
+        }
+
+        guard let selected else {
+            throw DDRToolError.transportError("Failed to open USB device \(device.deviceID)")
+        }
+
+        handle = selected
+        openedDevice = device
+        claimedInterface = -1
+        claimedAltSetting = 0
+        interfaceClaimed = false
+        bulkOutEndpoint = 0x02
+        bulkInEndpoint = 0x81
+
+        // Set configuration to reset USB state
+        let setConfigRC = libusb_set_configuration(selected, 1)
+        debug("set configuration rc=\(setConfigRC)")
+
+        _ = libusb_set_auto_detach_kernel_driver(selected, 1)
+        let resolved = try resolveInterfaceAndEndpoints(handle: selected)
+        claimedInterface = resolved.interfaceNumber
+        claimedAltSetting = resolved.altSetting
+        bulkOutEndpoint = resolved.bulkOut
+        bulkInEndpoint = resolved.bulkIn
+        if let outOverride = parseEndpointOverride("DDR_USB_OUT_EP") {
+            bulkOutEndpoint = outOverride
+        }
+        if let inOverride = parseEndpointOverride("DDR_USB_IN_EP") {
+            bulkInEndpoint = inOverride
+        }
+        debug("open selected iface=\(claimedInterface) alt=\(claimedAltSetting) out=0x\(String(format: "%02X", bulkOutEndpoint)) in=0x\(String(format: "%02X", bulkInEndpoint))")
+
+        // Claim interface and set alt setting
+        try ensureBulkInterfaceClaimed(handle: selected)
+        _ = libusb_set_interface_alt_setting(selected, claimedInterface, claimedAltSetting)
+        _ = libusb_clear_halt(selected, bulkOutEndpoint)
+        _ = libusb_clear_halt(selected, bulkInEndpoint)
+        if openSettleUs > 0 {
+            usleep(openSettleUs)
+            debug("open settle delay us=\(openSettleUs)")
+        }
+    }
+
+    public func downloadBoot(item: CfgItem, payload: Data) throws {
+        try ensureOpened()
+        guard payload.count > 0 else {
+            throw DDRToolError.transportError("Boot payload is empty")
+        }
+
+        var bootPayload = bootPayloadWithCRC(payload)
+        if trimBootZeroPadding {
+            bootPayload = trimTrailingZeros(bootPayload)
+        }
+        if let bootLimitBytes, bootLimitBytes > 0, bootLimitBytes < bootPayload.count {
+            bootPayload = bootPayload.prefix(bootLimitBytes)
+        }
+        debug("downloadBoot bytes=\(bootPayload.count)")
+
+        var offset = 0
+        while offset < bootPayload.count {
+            let chunkLen = min(Self.bootControlChunkSize, bootPayload.count - offset)
+            let chunk = bootPayload.subdata(in: offset..<(offset + chunkLen))
+            try sendBootControlChunk(chunk)
+            offset += chunkLen
+            if bootChunkDelayUs > 0 {
+                usleep(bootChunkDelayUs)
+            }
+        }
+    }
+
+    public func downloadItem(item: CfgItem, payload: Data, address: UInt32) throws {
+        try ensureOpened()
+        guard payload.count > 0 else {
+            throw DDRToolError.transportError("Payload is empty for \(item.name)")
+        }
+
+        var offset = 0
+        while offset < payload.count {
+            let chunkLen = min(Self.downloadChunkSize, payload.count - offset)
+            let chunkAddress = address &+ UInt32(offset)
+            let token = nextToken()
+            let command = makeCommand(
+                opcode: Self.writeOpcode,
+                address: chunkAddress,
+                length: UInt32(chunkLen),
+                token: token
+            )
+
+            try bulkWrite(command)
+            try bulkWrite(payload.subdata(in: offset..<(offset + chunkLen)))
+            guard let ack = try bulkRead(requiredBytes: 16, timeoutMs: transferTimeoutMs) else {
+                throw DDRToolError.transportError("downloadItem ack timeout")
+            }
+            try validateAck(ack, expectedToken: token, stage: "downloadItem")
+
+            offset += chunkLen
+            usleep(10_000)
+        }
+    }
+
+    public func downloadParam(item: CfgItem, address: UInt32?, params: [CfgParameter]) throws {
+        try ensureOpened()
+        let payload = makeParameterPayload(params: params)
+        let targetAddress = address ?? 0xFF0F_FF00
+        let token = nextToken()
+        let command = makeCommand(
+            opcode: Self.writeOpcode,
+            address: targetAddress,
+            length: UInt32(payload.count),
+            token: token
+        )
+
+        try bulkWrite(command)
+        try bulkWrite(payload)
+        guard let ack = try bulkRead(requiredBytes: 16, timeoutMs: transferTimeoutMs) else {
+            throw DDRToolError.transportError("downloadParam ack timeout")
+        }
+        try validateAck(ack, expectedToken: token, stage: "downloadParam")
+        usleep(10_000)
+    }
+
+    public func runItem(item: CfgItem, address: UInt32) throws {
+        try ensureOpened()
+
+        let runToken = nextToken()
+        let runCommand = makeCommand(
+            opcode: Self.runOpcode,
+            address: address,
+            length: 0,
+            token: runToken
+        )
+        try bulkWrite(runCommand)
+        guard let runAck = try bulkRead(requiredBytes: 16, timeoutMs: transferTimeoutMs) else {
+            throw DDRToolError.transportError("runItem ack timeout")
+        }
+        try validateAck(runAck, expectedToken: runToken, stage: "runItem")
+
+        let handshakeToken = nextToken()
+        let handshakeCommand = makeCommand(
+            opcode: Self.handshakeOpcode,
+            address: 0,
+            length: 0,
+            token: handshakeToken
+        )
+        try bulkWrite(handshakeCommand)
+        guard let handshakeAck = try bulkRead(requiredBytes: 16, timeoutMs: transferTimeoutMs) else {
+            throw DDRToolError.transportError("runItem handshake ack timeout")
+        }
+        try validateAck(handshakeAck, expectedToken: handshakeToken, stage: "runItemHandshake")
+    }
+
+    public func readPrintf() throws -> String? {
+        try ensureOpened()
+
+        let poll = makeCommand(
+            opcode: Self.pollOpcode,
+            address: 0,
+            length: Self.pollReadLength,
+            token: 0
+        )
+        try bulkWrite(poll)
+
+        guard let data = try bulkRead(requiredBytes: nil, timeoutMs: 100) else {
+            return nil
+        }
+        guard !data.isEmpty else {
+            return nil
+        }
+
+        if data.count == 16 {
+            return nil
+        }
+
+        if data.count >= 128 {
+            try acknowledgeRuntimeLog()
+        }
+
+        let trimmed = trimTrailingZeros(data)
+        guard !trimmed.isEmpty else {
+            return nil
+        }
+
+        // Device firmware outputs GBK-encoded Chinese mixed with ASCII.
+        // Try GBK first; if that fails, try UTF-8, then ASCII.
+        // As a fallback, if UTF-8 produced Latin-1-range garbage, fix double-encoding.
+        var text: String?
+        let gbEncoding = String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(0x0632)) // GB18030
+        if let s = String(data: trimmed, encoding: gbEncoding), !s.isEmpty {
+            text = s
+        } else if let s = String(data: trimmed, encoding: .utf8), !s.isEmpty {
+            text = s
+        } else if let s = String(data: trimmed, encoding: .ascii), !s.isEmpty {
+            text = s
+        }
+
+        if let text {
+            // Filter control characters but keep \n, \r, \t
+            let filtered = text.unicodeScalars.filter { scalar in
+                !CharacterSet.controlCharacters.contains(scalar) ||
+                CharacterSet.newlines.contains(scalar) || scalar == "\t"
+            }.map(String.init).joined()
+            return fixDoubleEncodedGBK(filtered)
+        }
+
+        // Binary data: hex dump
+        return trimmed.map { String(format: "%02x", $0) }.joined(separator: " ")
+    }
+
+    public func close() throws {
+        if let handle {
+            if interfaceClaimed, claimedInterface >= 0 {
+                _ = libusb_release_interface(handle, claimedInterface)
+            }
+            libusb_close(handle)
+        }
+        handle = nil
+        openedDevice = nil
+        claimedInterface = -1
+        claimedAltSetting = 0
+        interfaceClaimed = false
+    }
+
+    public func reset(device: UsbDevice) throws {
+        try open(device: device)
+        guard let handle else {
+            throw DDRToolError.transportError("USB handle missing")
+        }
+        let rc = libusb_reset_device(handle)
+        // After reset, the handle may be invalidated — always close and clear state.
+        try close()
+        if rc != 0 {
+            throw makeUSBError("libusb_reset_device failed", code: rc)
+        }
+    }
+
+    // MARK: - Core USB helpers
+
+    private func initializeContext() throws {
+        var newContext: OpaquePointer?
+        let rc = libusb_init(&newContext)
+        guard rc == 0, let newContext else {
+            throw makeUSBError("libusb_init failed", code: rc)
+        }
+        if libusbLogEnabled {
+            libusb_set_debug(newContext, Int32(LIBUSB_LOG_LEVEL_DEBUG.rawValue))
+        }
+        context = newContext
+    }
+
+    private func ensureContext() throws {
+        if context == nil {
+            try initializeContext()
+        }
+    }
+
+    private func ensureOpened() throws {
+        guard handle != nil else {
+            throw DDRToolError.transportError("USB device is not opened")
+        }
+    }
+
+    private func enumerateDevices() throws -> [OpaquePointer] {
+        var listPtr: UnsafeMutablePointer<OpaquePointer?>?
+        let count = libusb_get_device_list(context, &listPtr)
+        guard count >= 0 else {
+            throw makeUSBError("libusb_get_device_list failed", code: Int32(count))
+        }
+        defer { libusb_free_device_list(listPtr, 1) }
+
+        guard let listPtr else { return [] }
+        var devices: [OpaquePointer] = []
+        let intCount = Int(count)
+        for idx in 0..<intCount {
+            if let dev = listPtr[idx], let retained = libusb_ref_device(dev) {
+                devices.append(retained)
+            }
+        }
+        return devices
+    }
+
+    private func resolveInterfaceAndEndpoints(handle: OpaquePointer) throws -> (interfaceNumber: Int32, altSetting: Int32, bulkOut: UInt8, bulkIn: UInt8) {
+        guard let dev = libusb_get_device(handle) else {
+            throw DDRToolError.transportError("libusb_get_device returned nil")
+        }
+
+        var configPtr: UnsafeMutablePointer<libusb_config_descriptor>?
+        let rc = libusb_get_active_config_descriptor(dev, &configPtr)
+        guard rc == 0, let configPtr else {
+            throw makeUSBError("libusb_get_active_config_descriptor failed", code: rc)
+        }
+        defer { libusb_free_config_descriptor(configPtr) }
+
+        struct Candidate {
+            let interfaceNumber: Int32
+            let altSetting: Int32
+            let outEp: UInt8
+            let inEp: UInt8
+        }
+        var candidates: [Candidate] = []
+
+        let interfaceCount = Int(configPtr.pointee.bNumInterfaces)
+        let ifaceArray = UnsafeBufferPointer(start: configPtr.pointee.interface, count: interfaceCount)
+        for iface in ifaceArray {
+            let altCount = Int(iface.num_altsetting)
+            let altArray = UnsafeBufferPointer(start: iface.altsetting, count: altCount)
+            for alt in altArray {
+                let epCount = Int(alt.bNumEndpoints)
+                let epArray = UnsafeBufferPointer(start: alt.endpoint, count: epCount)
+                var outEp: UInt8?
+                var inEp: UInt8?
+                for ep in epArray {
+                    let typeMask = UInt8(LIBUSB_TRANSFER_TYPE_MASK)
+                    let type = ep.bmAttributes & typeMask
+                    guard type == UInt8(LIBUSB_TRANSFER_TYPE_BULK.rawValue) else {
+                        continue
+                    }
+                    let addr = ep.bEndpointAddress
+                    let inMask = UInt8(LIBUSB_ENDPOINT_DIR_MASK)
+                    let inValue = UInt8(LIBUSB_ENDPOINT_IN.rawValue)
+                    if (addr & inMask) == inValue {
+                        inEp = addr
+                    } else {
+                        outEp = addr
+                    }
+                }
+                if let outEp, let inEp {
+                    candidates.append(
+                        Candidate(
+                            interfaceNumber: Int32(alt.bInterfaceNumber),
+                            altSetting: Int32(alt.bAlternateSetting),
+                            outEp: outEp,
+                            inEp: inEp
+                        )
+                    )
+                }
+            }
+        }
+
+        if debugEnabled {
+            for c in candidates {
+                debug("candidate iface=\(c.interfaceNumber) alt=\(c.altSetting) out=0x\(String(format: "%02X", c.outEp)) in=0x\(String(format: "%02X", c.inEp))")
+            }
+        }
+
+        if let exact = candidates.first(where: { $0.outEp == 0x02 && $0.inEp == 0x81 }) {
+            return (exact.interfaceNumber, exact.altSetting, exact.outEp, exact.inEp)
+        }
+        if let first = candidates.first {
+            return (first.interfaceNumber, first.altSetting, first.outEp, first.inEp)
+        }
+
+        return (0, 0, 0x02, 0x81)
+    }
+
+    private func sendBootControlChunk(_ chunk: Data) throws {
+        guard let handle else {
+            throw DDRToolError.transportError("USB handle missing")
+        }
+        var buffer = [UInt8](chunk)
+        let transferCount = buffer.withUnsafeMutableBufferPointer { ptr -> Int32 in
+            libusb_control_transfer(
+                handle,
+                Self.bootControlRequestType,
+                Self.bootControlRequest,
+                0,
+                Self.bootControlIndex,
+                ptr.baseAddress,
+                UInt16(ptr.count),
+                transferTimeoutMs
+            )
+        }
+        if transferCount == Int32(buffer.count) {
+            return
+        }
+
+        if (transferCount == LIBUSB_ERROR_TIMEOUT.rawValue || transferCount == LIBUSB_ERROR_IO.rawValue),
+           chunk.count > 512 {
+            let split = chunk.count / 2
+            let first = chunk.prefix(split)
+            let second = chunk.dropFirst(split)
+            debug("boot control retry split len=\(chunk.count) rc=\(transferCount)")
+            try sendBootControlChunk(Data(first))
+            try sendBootControlChunk(Data(second))
+            return
+        }
+
+        guard transferCount == Int32(buffer.count) else {
+            throw DDRToolError.transportError(
+                "Boot control transfer failed, expected \(buffer.count) got \(transferCount)"
+            )
+        }
+    }
+
+    private func bulkWrite(_ data: Data) throws {
+        guard let handle else {
+            throw DDRToolError.transportError("USB handle missing")
+        }
+        try ensureBulkInterfaceClaimed(handle: handle)
+
+        var bytes = [UInt8](data)
+        let maxAttempts = bytes.count > 32 ? 3 : 1
+        var transferred: Int32 = 0
+        var rc: Int32 = 0
+        for attempt in 1...maxAttempts {
+            transferred = 0
+            rc = bytes.withUnsafeMutableBufferPointer { ptr -> Int32 in
+                libusb_bulk_transfer(
+                    handle,
+                    bulkOutEndpoint,
+                    ptr.baseAddress,
+                    Int32(ptr.count),
+                    &transferred,
+                    transferTimeoutMs
+                )
+            }
+
+            if rc == 0, transferred == Int32(bytes.count) {
+                break
+            }
+
+            let shouldRetry = (rc == LIBUSB_ERROR_TIMEOUT.rawValue || rc == LIBUSB_ERROR_IO.rawValue) && attempt < maxAttempts
+            if shouldRetry {
+                usleep(80_000)
+                continue
+            }
+            break
+        }
+
+        if debugEnabled, bytes.count == 32 {
+            debug("bulk OUT cmd \(hexBytes(bytes))")
+        }
+        guard rc == 0 else {
+            throw makeUSBError("bulk OUT failed (ep=0x\(String(format: "%02X", bulkOutEndpoint)), len=\(bytes.count))", code: rc)
+        }
+        guard transferred == Int32(bytes.count) else {
+            throw DDRToolError.transportError("bulk OUT short write: \(transferred)/\(bytes.count)")
+        }
+    }
+
+    private func bulkRead(requiredBytes: Int?, timeoutMs: UInt32) throws -> Data? {
+        guard let handle else {
+            throw DDRToolError.transportError("USB handle missing")
+        }
+        try ensureBulkInterfaceClaimed(handle: handle)
+
+        let bufferSize = requiredBytes ?? Int(Self.pollReadLength)
+        var bytes = [UInt8](repeating: 0, count: bufferSize)
+        var transferred: Int32 = 0
+        let rc = bytes.withUnsafeMutableBufferPointer { ptr -> Int32 in
+            libusb_bulk_transfer(
+                handle,
+                bulkInEndpoint,
+                ptr.baseAddress,
+                Int32(ptr.count),
+                &transferred,
+                timeoutMs
+            )
+        }
+
+        if rc == LIBUSB_ERROR_TIMEOUT.rawValue {
+            if requiredBytes == nil {
+                return nil
+            }
+            throw makeUSBError("bulk IN timeout", code: rc)
+        }
+        guard rc == 0 else {
+            throw makeUSBError("bulk IN failed", code: rc)
+        }
+
+        if let requiredBytes, transferred < Int32(requiredBytes) {
+            throw DDRToolError.transportError("bulk IN short read: \(transferred)/\(requiredBytes)")
+        }
+
+        return Data(bytes.prefix(Int(transferred)))
+    }
+
+    private func validateAck(_ data: Data, expectedToken: UInt32, stage: String) throws {
+        guard data.count >= 4 else {
+            throw DDRToolError.transportError("\(stage) ack too short: \(data.count)")
+        }
+        let token = decodeUInt32LE(data, at: 0)
+        guard token == expectedToken else {
+            throw DDRToolError.transportError(
+                "\(stage) ack token mismatch, expected 0x\(hex(expectedToken)), got 0x\(hex(token))"
+            )
+        }
+    }
+
+    private func makeCommand(opcode: UInt32, address: UInt32, length: UInt32, token: UInt32) -> Data {
+        var command = Data()
+        command.reserveCapacity(32)
+        appendUInt32LE(opcode, to: &command)
+        appendUInt32LE(address, to: &command)
+        appendUInt32LE(length, to: &command)
+        appendUInt32LE(token, to: &command)
+        appendUInt32LE(1, to: &command)
+        appendUInt32LE(0, to: &command)
+        appendUInt32LE(0, to: &command)
+        appendUInt32LE(0, to: &command)
+        return command
+    }
+
+    private func acknowledgeRuntimeLog() throws {
+        let token = nextToken()
+        let command = makeCommand(
+            opcode: Self.handshakeOpcode,
+            address: 0,
+            length: 0,
+            token: token
+        )
+        try bulkWrite(command)
+        guard let ack = try bulkRead(requiredBytes: 16, timeoutMs: 1000) else {
+            throw DDRToolError.transportError("runtime log ack timeout")
+        }
+        try validateAck(ack, expectedToken: token, stage: "runtimeLogAck")
+    }
+
+    // MARK: - Dynamic Parameter Encoding
+
+    private func makeParameterPayload(params: [CfgParameter]) -> Data {
+        var values: [UInt32] = []
+        for param in params {
+            values.append(resolveParamValue(param))
+        }
+        var data = Data()
+        data.reserveCapacity(values.count * 4)
+        for v in values {
+            appendUInt32LE(v, to: &data)
+        }
+        return data
+    }
+
+    private func resolveParamValue(_ param: CfgParameter) -> UInt32 {
+        switch param.inputType {
+        case .combo:
+            guard let rangeValues = param.inputRangeValue else {
+                return parseUInt32(param.value)
+            }
+            let options = rangeValues.split(separator: "|").map(String.init)
+            let idx = Int(param.value) ?? 0
+            guard idx < options.count else {
+                return parseUInt32(param.value)
+            }
+            return parseUInt32(options[idx])
+        case .edit:
+            return parseUInt32(param.value)
+        case .unknown:
+            return parseUInt32(param.value)
+        }
+    }
+
+    private func parseUInt32(_ s: String) -> UInt32 {
+        let trimmed = s.trimmingCharacters(in: .whitespaces)
+        if trimmed.lowercased().hasPrefix("0x") {
+            return UInt32(trimmed.dropFirst(2), radix: 16) ?? 0
+        }
+        return UInt32(trimmed) ?? 0
+    }
+
+    // MARK: - Token Generation
+
+    private func nextToken() -> UInt32 {
+        tokenSeed = tokenSeed &* 1664525 &+ 1013904223
+        if tokenSeed == 0 {
+            tokenSeed = 1
+        }
+        return tokenSeed
+    }
+
+    // MARK: - Utilities
+
+    private func appendUInt32LE(_ value: UInt32, to data: inout Data) {
+        var v = value.littleEndian
+        data.append(Data(bytes: &v, count: 4))
+    }
+
+    private func decodeUInt32LE(_ data: Data, at offset: Int) -> UInt32 {
+        guard data.count >= offset + 4 else { return 0 }
+        return data[offset..<(offset + 4)].withUnsafeBytes {
+            $0.load(as: UInt32.self).littleEndian
+        }
+    }
+
+    private func trimTrailingZeros(_ data: Data) -> Data {
+        var end = data.count
+        while end > 0, data[end - 1] == 0 {
+            end -= 1
+        }
+        return data.prefix(end)
+    }
+
+    private func bootPayloadWithCRC(_ payload: Data) -> Data {
+        guard payload.count >= 2 else {
+            return payload
+        }
+
+        let body = payload.dropLast(2)
+        let expectedCRC = UInt16(payload[payload.count - 2]) << 8 | UInt16(payload[payload.count - 1])
+        let actualCRC = crcCCITT(Data(body))
+        if expectedCRC == actualCRC {
+            return payload
+        }
+
+        // Embed CRC in the last 2 bytes (MASKROM expects fixed payload size)
+        var withCRC = payload
+        withCRC[withCRC.count - 2] = UInt8((actualCRC >> 8) & 0xFF)
+        withCRC[withCRC.count - 1] = UInt8(actualCRC & 0xFF)
+        return withCRC
+    }
+
+    private func crcCCITT(_ data: Data) -> UInt16 {
+        var crc: UInt16 = 0xFFFF
+        for byte in data {
+            var bit: UInt8 = 0x80
+            while bit != 0 {
+                if (crc & 0x8000) != 0 {
+                    crc = (crc &<< 1) ^ 0x1021
+                } else {
+                    crc = crc &<< 1
+                }
+                if (byte & bit) != 0 {
+                    crc ^= 0x1021
+                }
+                bit >>= 1
+            }
+        }
+        return crc
+    }
+
+    private func makeUSBError(_ prefix: String, code: Int32) -> DDRToolError {
+        DDRToolError.transportError("\(prefix): \(usbErrorMessage(code: code))")
+    }
+
+    private func ensureBulkInterfaceClaimed(handle: OpaquePointer) throws {
+        if interfaceClaimed {
+            return
+        }
+
+        if noClaimMode {
+            debug("no-claim mode enabled; skip libusb_claim_interface")
+            interfaceClaimed = true
+            return
+        }
+
+        let claimRC = libusb_claim_interface(handle, claimedInterface)
+        guard claimRC == 0 else {
+            throw DDRToolError.transportError(
+                "libusb_claim_interface(\(claimedInterface)) failed: \(usbErrorMessage(code: claimRC))"
+            )
+        }
+        debug("claim interface rc=0 (lazy)")
+
+        if forceSetAlt {
+            let altRC = libusb_set_interface_alt_setting(handle, claimedInterface, claimedAltSetting)
+            guard altRC == 0 else {
+                _ = libusb_release_interface(handle, claimedInterface)
+                throw DDRToolError.transportError(
+                    "libusb_set_interface_alt_setting(\(claimedInterface),\(claimedAltSetting)) failed: \(usbErrorMessage(code: altRC))"
+                )
+            }
+            debug("set alt setting rc=0 (lazy)")
+        } else {
+            debug("skip set alt setting (lazy)")
+        }
+
+        if forceClearHalt {
+            let clearOutRC = libusb_clear_halt(handle, bulkOutEndpoint)
+            let clearInRC = libusb_clear_halt(handle, bulkInEndpoint)
+            debug("clear halt out rc=\(clearOutRC), in rc=\(clearInRC) (lazy)")
+        } else {
+            debug("skip clear halt (lazy)")
+        }
+
+        interfaceClaimed = true
+    }
+
+    private func usbErrorMessage(code: Int32) -> String {
+        guard let cString = libusb_error_name(code) else {
+            return "LIBUSB_ERROR(\(code))"
+        }
+        return String(cString: cString)
+    }
+
+    private func hex(_ value: UInt32) -> String {
+        String(format: "%08X", value)
+    }
+
+    private func hexBytes(_ bytes: [UInt8]) -> String {
+        bytes.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Detect and fix double-encoded GBK text.
+    /// When GBK bytes are misinterpreted as Latin-1 and re-encoded to UTF-8,
+    /// each original byte > 0x7F becomes a 2-byte UTF-8 sequence (U+0080–U+00FF).
+    /// We detect these Latin-1-range runs, re-encode as Latin-1 bytes, and decode as GBK.
+    private func fixDoubleEncodedGBK(_ text: String) -> String {
+        let latin1Range: ClosedRange<UnicodeScalar> = "\u{0080}"..."\u{00FF}"
+        var result = ""
+        var i = text.unicodeScalars.startIndex
+        let scalars = text.unicodeScalars
+
+        while i < scalars.endIndex {
+            let scalar = scalars[i]
+            if latin1Range.contains(scalar) {
+                // Collect consecutive Latin-1 range characters
+                var run = ""
+                while i < scalars.endIndex {
+                    let s = scalars[i]
+                    if latin1Range.contains(s) || s == "\u{0020}" {
+                        run.append(Character(s))
+                        i = scalars.index(after: i)
+                    } else {
+                        break
+                    }
+                }
+                // Try to re-decode as GBK
+                if let latin1Data = run.data(using: .isoLatin1),
+                   let fixed = String(data: latin1Data, encoding: .init(rawValue: CFStringConvertEncodingToNSStringEncoding(0x0632))) {
+                    result.append(fixed)
+                } else {
+                    result.append(run)
+                }
+            } else {
+                result.append(Character(scalar))
+                i = scalars.index(after: i)
+            }
+        }
+        return result
+    }
+
+    private func debug(_ message: String) {
+        guard debugEnabled else { return }
+        fputs("[RKUSB_DEBUG] \(message)\n", stderr)
+    }
+
+    private func parseEndpointOverride(_ key: String) -> UInt8? {
+        guard let raw = ProcessInfo.processInfo.environment[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty else {
+            return nil
+        }
+        let normalized = raw.lowercased().hasPrefix("0x") ? String(raw.dropFirst(2)) : raw
+        guard let value = UInt8(normalized, radix: 16) else {
+            return nil
+        }
+        return value
+    }
+}
