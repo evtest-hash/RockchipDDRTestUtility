@@ -1,6 +1,6 @@
-# DDR User Tool for macOS
+# Rockchip DDR Test Utility for macOS
 
-macOS native port of Rockchip's DDR_UserTool — a utility for testing DDR memory soldering quality on Rockchip SoCs via USB.
+A macOS native tool for testing DDR memory soldering quality on Rockchip SoCs via USB.
 
 ## Supported SoCs
 
@@ -45,17 +45,17 @@ swift build -c release
 ### Run GUI (development)
 
 ```bash
-DDR_USERTOOL_ROOT=/path/to/DDR_UserTool_v1.41 swift run DDRUserToolMacApp
+swift run DDRUserToolMacApp
 ```
 
 ### Run CLI
 
 ```bash
-DDR_USERTOOL_ROOT=/path/to/DDR_UserTool_v1.41 swift run DDRUserToolCLI --list
-DDR_USERTOOL_ROOT=/path/to/DDR_UserTool_v1.41 swift run DDRUserToolCLI --cfg "/path/to/test.cfg"
+swift run DDRUserToolCLI --list
+swift run DDRUserToolCLI --cfg "/path/to/test.cfg"
 ```
 
-### Build DMG
+### Build Universal DMG
 
 ```bash
 bash scripts/package.sh
@@ -97,13 +97,3 @@ Printf   Printf     Printf → PASS/FAIL
 ```
 
 Each stage must pass before the next begins. Failure at any stage stops the test.
-
-## Environment Variables
-
-| Variable | Description |
-|----------|-------------|
-| `DDR_USERTOOL_ROOT` | Path to Windows tool data root (dev mode) |
-| `DDR_USB_DEBUG` | Enable verbose USB debug logging |
-| `DDR_USB_BOOT_SETTLE_MS` | Override boot settle delay (default 800ms) |
-| `DDR_USB_TIMEOUT_MS` | Override USB transfer timeout (default 5000ms) |
-| `DDR_USB_REOPEN_AFTER_BOOT` | Close and reopen USB after boot download |

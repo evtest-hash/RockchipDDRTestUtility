@@ -8,10 +8,6 @@ public final class CfgRepository {
     }
 
     public static func makeDefaultRootURL() -> URL {
-        let env = ProcessInfo.processInfo.environment["DDR_USERTOOL_ROOT"]
-        if let env, !env.isEmpty {
-            return URL(fileURLWithPath: env)
-        }
         // Check inside app bundle Resources/RuntimeData
         if let resourceURL = Bundle.main.resourceURL {
             let bundled = resourceURL.appendingPathComponent("RuntimeData")

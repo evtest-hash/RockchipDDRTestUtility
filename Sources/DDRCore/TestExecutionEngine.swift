@@ -84,15 +84,7 @@ public actor TestExecutionEngine {
                     return fail("ERROR_DOWNLOADBOOT_FAIL", "Download boot failed: \(error.localizedDescription)", device: selectedDevice)
                 }
 
-                if ProcessInfo.processInfo.environment["DDR_USB_REOPEN_AFTER_BOOT"] == "1" {
-                    try transport.close()
-                    append(.info, "INFO_USB_CLOSE_AFTER_BOOT", "Closed USB handle after boot")
-                    try await Task.sleep(nanoseconds: bootSettleDelayMs() * 1_000_000)
-                    try transport.open(device: selectedDevice)
-                    append(.info, "INFO_REOPEN_USB_OK", "Reopened USB after boot delay")
-                } else {
-                    try await Task.sleep(nanoseconds: bootSettleDelayMs() * 1_000_000)
-                }
+                try await Task.sleep(nanoseconds: defaultBootSettleDelayMs * 1_000_000)
             }
 
             // ── Stage 2+: Test items (forceinit, connect, ...) ──
@@ -192,14 +184,6 @@ public actor TestExecutionEngine {
     }
 
     // MARK: - Private
-
-    private func bootSettleDelayMs() -> UInt64 {
-        guard let raw = ProcessInfo.processInfo.environment["DDR_USB_BOOT_SETTLE_MS"],
-              let ms = UInt64(raw), ms > 0 else {
-            return defaultBootSettleDelayMs
-        }
-        return ms
-    }
 
     private func shouldDownloadParam(for item: CfgItem) -> Bool {
         item.name.caseInsensitiveCompare("forceinit") == .orderedSame

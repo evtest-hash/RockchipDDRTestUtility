@@ -14,11 +14,11 @@ swift build                  # debug build
 swift build -c release       # release build
 
 # Run GUI app (requires USB device plugged in for real testing)
-DDR_USERTOOL_ROOT=/path/to/DDR_UserTool_v1.41 swift run DDRUserToolMacApp
+swift run DDRUserToolMacApp
 
 # Run CLI
-DDR_USERTOOL_ROOT=/path/to/DDR_UserTool_v1.41 swift run DDRUserToolCLI --list
-DDR_USERTOOL_ROOT=/path/to/DDR_UserTool_v1.41 swift run DDRUserToolCLI --cfg "/path/to/test.cfg"
+swift run DDRUserToolCLI --list
+swift run DDRUserToolCLI --cfg "/path/to/test.cfg"
 
 # Build universal DMG
 bash scripts/package.sh
@@ -63,22 +63,10 @@ The engine detects device-side failures from printf output:
 - Bulk commands: 32-byte packets (opcode + address + length + token + padding)
 - Parameter payloads are hardcoded for known SoCs (RK3588: 38 params, RK3568: 18 params)
 
-## Environment Variables
-
-- `DDR_USERTOOL_ROOT` — path to the Windows tool data root (required in dev mode)
-- `DDR_USB_DEBUG=1` — enable verbose USB debug logging to stderr
-- `DDR_USB_NOCLAIM=1` — skip `libusb_claim_interface` (for debugging)
-- `DDR_USB_FORCE_SETCONFIG=1` — force `libusb_set_configuration`
-- `DDR_USB_BOOT_SETTLE_MS` — override boot settle delay (default 800ms)
-- `DDR_USB_TIMEOUT_MS` — override USB transfer timeout (default 5000ms)
-- `DDR_USB_BOOT_LIMIT_BYTES` — truncate boot payload to N bytes
-- `DDR_USB_REOPEN_AFTER_BOOT=1` — close and reopen USB after boot download
-- `DDR_USB_CLAIM_ON_OPEN=1` — claim interface at open time instead of lazily
-
 ## CI/CD
 
 GitHub Actions builds a universal (arm64 + x86_64) DMG on:
 - Push of `v*` tags (auto-creates GitHub Release)
 - Manual workflow dispatch
 
-Runtime data (TestFiles/, resource/) is bundled into the app at package time from `DDR_USERTOOL_ROOT` or `../DDR_UserTool_v1.41`.
+Runtime data (TestFiles/, resource/) is bundled into the app at package time from `../DDR_UserTool_v1.41`.

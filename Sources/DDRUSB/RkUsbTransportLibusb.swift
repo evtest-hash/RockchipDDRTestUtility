@@ -27,18 +27,18 @@ public final class RkUsbTransportLibusb: UsbTransport {
     private var bulkInEndpoint: UInt8 = 0x81
     private var openedDevice: UsbDevice?
     private var tokenSeed: UInt32 = 0x13572468
-    private let debugEnabled = ProcessInfo.processInfo.environment["DDR_USB_DEBUG"] == "1"
-    private let noClaimMode = ProcessInfo.processInfo.environment["DDR_USB_NOCLAIM"] == "1"
-    private let forceSetConfig = ProcessInfo.processInfo.environment["DDR_USB_FORCE_SETCONFIG"] == "1"
-    private let libusbLogEnabled = ProcessInfo.processInfo.environment["DDR_USB_LIBUSB_LOG"] == "1"
-    private let claimOnOpen = ProcessInfo.processInfo.environment["DDR_USB_CLAIM_ON_OPEN"] == "1"
-    private let trimBootZeroPadding = ProcessInfo.processInfo.environment["DDR_USB_TRIM_BOOT_ZERO_PADDING"] == "1"
-    private let forceSetAlt = ProcessInfo.processInfo.environment["DDR_USB_FORCE_SET_ALT"] == "1"
-    private let forceClearHalt = ProcessInfo.processInfo.environment["DDR_USB_FORCE_CLEAR_HALT"] == "1"
-    private let bootLimitBytes = Int(ProcessInfo.processInfo.environment["DDR_USB_BOOT_LIMIT_BYTES"] ?? "")
-    private let bootChunkDelayUs = useconds_t(ProcessInfo.processInfo.environment["DDR_USB_BOOT_CHUNK_DELAY_US"] ?? "") ?? 60_000
-    private let openSettleUs = useconds_t(ProcessInfo.processInfo.environment["DDR_USB_OPEN_SETTLE_US"] ?? "") ?? 0
-    private let transferTimeoutMs = UInt32(ProcessInfo.processInfo.environment["DDR_USB_TIMEOUT_MS"] ?? "") ?? RkUsbTransportLibusb.timeoutMs
+    private let debugEnabled = false
+    private let noClaimMode = false
+    private let forceSetConfig = false
+    private let libusbLogEnabled = false
+    private let claimOnOpen = false
+    private let trimBootZeroPadding = false
+    private let forceSetAlt = false
+    private let forceClearHalt = false
+    private let bootLimitBytes: Int? = nil
+    private let bootChunkDelayUs: useconds_t = 60_000
+    private let openSettleUs: useconds_t = 0
+    private let transferTimeoutMs: UInt32 = RkUsbTransportLibusb.timeoutMs
 
     public init() throws {
         try initializeContext()
@@ -189,12 +189,6 @@ public final class RkUsbTransportLibusb: UsbTransport {
         claimedAltSetting = resolved.altSetting
         bulkOutEndpoint = resolved.bulkOut
         bulkInEndpoint = resolved.bulkIn
-        if let outOverride = parseEndpointOverride("DDR_USB_OUT_EP") {
-            bulkOutEndpoint = outOverride
-        }
-        if let inOverride = parseEndpointOverride("DDR_USB_IN_EP") {
-            bulkInEndpoint = inOverride
-        }
         debug("open selected iface=\(claimedInterface) alt=\(claimedAltSetting) out=0x\(String(format: "%02X", bulkOutEndpoint)) in=0x\(String(format: "%02X", bulkInEndpoint))")
 
         // Claim interface and set alt setting
@@ -898,17 +892,5 @@ public final class RkUsbTransportLibusb: UsbTransport {
     private func debug(_ message: String) {
         guard debugEnabled else { return }
         fputs("[RKUSB_DEBUG] \(message)\n", stderr)
-    }
-
-    private func parseEndpointOverride(_ key: String) -> UInt8? {
-        guard let raw = ProcessInfo.processInfo.environment[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !raw.isEmpty else {
-            return nil
-        }
-        let normalized = raw.lowercased().hasPrefix("0x") ? String(raw.dropFirst(2)) : raw
-        guard let value = UInt8(normalized, radix: 16) else {
-            return nil
-        }
-        return value
     }
 }

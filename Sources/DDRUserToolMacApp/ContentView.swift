@@ -11,7 +11,7 @@ struct ContentView: View {
             mainContent
         }
         .frame(minWidth: 860, minHeight: 560)
-        .navigationTitle("瑞芯微DDR用户测试工具")
+        .navigationTitle("Rockchip DDR Test Utility")
         .task {
             await viewModel.load()
         }
