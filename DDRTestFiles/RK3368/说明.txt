@@ -1,0 +1,4 @@
+1. DDR3 LPDDR3 xxxMHz颗粒简单测试.cfg 对颗粒的部分存储空间进行读写扫描，测试速度较快，但是不完整。
+2. DDR3 LPDDR3 xxxMHz颗粒完整测试.cfg 对颗粒的所有存储空间进行读写扫描，测试速度比较慢。
+3. DDR3 LPDDR3 xxxMHz颗粒march专项测试，DDR3 LPDDR3 xxxMHz颗粒random专项测试，DDR3 LPDDR3 颗粒休眠专项测试，
+DDR3 LPDDR3 xxxMHz颗粒变频专项测试 是专门针对我们当前遇到的大部分白牌颗粒准备的测试项。

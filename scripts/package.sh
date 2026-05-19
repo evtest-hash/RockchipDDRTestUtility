@@ -5,7 +5,6 @@ PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BUNDLE_NAME="DDRUserToolMac.app"
 STAGING_DIR="$PROJECT_DIR/.staging"
 BUNDLE_DIR="$STAGING_DIR/$BUNDLE_NAME"
-DATA_SOURCE="${DDR_USERTOOL_ROOT:-$PROJECT_DIR/../DDR_UserTool_v1.41}"
 DMG_NAME="DDRUserToolMac"
 DMG_DIR="$STAGING_DIR/dmg"
 
@@ -142,17 +141,14 @@ cp "$BUILD_DIR/DDRUserToolCLI"    "$BUNDLE_DIR/Contents/MacOS/"
 cp "$PROJECT_DIR/scripts/Info.plist" "$BUNDLE_DIR/Contents/"
 printf "APPL????" > "$BUNDLE_DIR/Contents/PkgInfo"
 
-# ── Step 5: Bundle runtime data ──
+# ── Step 5: Bundle DDR test files ──
 
-echo "=== Copying runtime data ==="
-if [ -d "$DATA_SOURCE" ]; then
-    mkdir -p "$BUNDLE_DIR/Contents/Resources/RuntimeData"
-    [ -d "$DATA_SOURCE/TestFiles" ] && cp -R "$DATA_SOURCE/TestFiles" "$BUNDLE_DIR/Contents/Resources/RuntimeData/TestFiles"
-    [ -d "$DATA_SOURCE/resource" ]  && cp -R "$DATA_SOURCE/resource"  "$BUNDLE_DIR/Contents/Resources/RuntimeData/resource"
-    find "$BUNDLE_DIR/Contents/Resources/RuntimeData" \( -name '.DS_Store' -o -name '*.exe' \) -delete
+echo "=== Copying DDRTestFiles ==="
+if [ -d "$PROJECT_DIR/DDRTestFiles" ]; then
+    cp -R "$PROJECT_DIR/DDRTestFiles" "$BUNDLE_DIR/Contents/Resources/DDRTestFiles"
+    find "$BUNDLE_DIR/Contents/Resources/DDRTestFiles" \( -name '.DS_Store' -o -name '*.exe' \) -delete
 else
-    echo "WARNING: Runtime data not found at $DATA_SOURCE"
-    echo "Set DDR_USERTOOL_ROOT to the Windows tool data directory."
+    echo "WARNING: DDRTestFiles directory not found"
 fi
 
 # ── Step 6: Bundle libusb ──

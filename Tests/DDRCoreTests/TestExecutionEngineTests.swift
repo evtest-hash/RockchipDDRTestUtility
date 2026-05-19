@@ -58,9 +58,9 @@ final class TestExecutionEngineTests: XCTestCase {
     }
 
     private func rk3588Fixture() -> String {
-        let base = ProcessInfo.processInfo.environment["DDR_USERTOOL_ROOT"]
-            ?? "/Users/kevin.zhuang/DDR_UserTool/DDR_UserTool_v1.41"
-        return "\(base)/TestFiles/RK3588/16GB LPDDR5(用2片颗粒 每片颗粒2个CS 每个CS有32Gb).cfg"
+        let repoRoot = URL(fileURLWithPath: #file)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        return repoRoot.appendingPathComponent("DDRTestFiles/RK3588/16GB LPDDR5(用2片颗粒 每片颗粒2个CS 每个CS有32Gb).cfg").path
     }
 }
 

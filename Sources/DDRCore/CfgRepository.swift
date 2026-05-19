@@ -8,31 +8,30 @@ public final class CfgRepository {
     }
 
     public static func makeDefaultRootURL() -> URL {
-        // Check inside app bundle Resources/RuntimeData
+        // Bundled app: DDRTestFiles is in Resources/
         if let resourceURL = Bundle.main.resourceURL {
-            let bundled = resourceURL.appendingPathComponent("RuntimeData")
+            let bundled = resourceURL.appendingPathComponent("DDRTestFiles")
             if FileManager.default.fileExists(atPath: bundled.path) {
                 return bundled
             }
         }
-        // Walk up from executable to find DDR_UserTool_v1.41 sibling
+        // CLI / development: DDRTestFiles sibling to executable
         if let exeURL = Bundle.main.executableURL ?? ExecutableHelper.executableURL {
-            var dir = exeURL.deletingLastPathComponent()
-            for _ in 0..<6 {
-                let candidate = dir.appendingPathComponent("DDR_UserTool_v1.41")
-                if FileManager.default.fileExists(atPath: candidate.path) {
-                    return candidate.standardizedFileURL
-                }
-                dir = dir.deletingLastPathComponent()
+            let candidate = exeURL.deletingLastPathComponent().appendingPathComponent("DDRTestFiles")
+            if FileManager.default.fileExists(atPath: candidate.path) {
+                return candidate.standardizedFileURL
             }
         }
-        // Fallback: relative to CWD
-        let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-        return cwd.appendingPathComponent("../DDR_UserTool_v1.41").standardizedFileURL
+        // Final fallback: CWD relative
+        return URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("DDRTestFiles").standardizedFileURL
     }
 
     public func loadSettings() throws -> (settings: ConfigSettings, languages: [AppLanguage], selectedLanguageTag: String) {
         let configURL = rootURL.appendingPathComponent("resource/config.ini")
+        guard FileManager.default.fileExists(atPath: configURL.path) else {
+            return (.default, [], "ENG")
+        }
         let ini = try IniParser.parse(url: configURL)
         let language = ini.section("Language")
         let system = ini.section("System")
@@ -86,12 +85,11 @@ public final class CfgRepository {
         var entries: [TestFileEntry] = []
         let rootPath = rootURL.path
 
-        let directory = rootURL.appendingPathComponent("TestFiles")
-        guard manager.fileExists(atPath: directory.path) else {
+        guard manager.fileExists(atPath: rootPath) else {
             return entries
         }
         let enumerator = manager.enumerator(
-            at: directory,
+            at: rootURL,
             includingPropertiesForKeys: [.isRegularFileKey],
             options: [.skipsHiddenFiles]
         )

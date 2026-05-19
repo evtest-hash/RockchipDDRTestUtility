@@ -47,9 +47,7 @@ final class CfgBinaryParserTests: XCTestCase {
     }
 
     func testRK3588CapturedCfgPayloads() throws {
-        let base = ProcessInfo.processInfo.environment["DDR_USERTOOL_ROOT"]
-            ?? "/Users/kevin.zhuang/DDR_UserTool/DDR_UserTool_v1.41"
-        let path = "\(base)/TestFile/RK3588/8GB LPDDR4X(2pcs x 2CS x 16Gb)soldering check.cfg"
+        let path = repoRoot().appendingPathComponent("DDRTestFiles/RK3588/8GB LPDDR4X(2pcs x 2CS x 16Gb)soldering check.cfg").path
 
         guard FileManager.default.fileExists(atPath: path) else {
             throw XCTSkip("Captured RK3588 cfg fixture not found: \(path)")
@@ -72,8 +70,11 @@ final class CfgBinaryParserTests: XCTestCase {
     }
 
     private func fixturePath(soc: String, fileName: String) -> String {
-        let base = ProcessInfo.processInfo.environment["DDR_USERTOOL_ROOT"]
-            ?? "/Users/kevin.zhuang/DDR_UserTool/DDR_UserTool_v1.41"
-        return "\(base)/TestFiles/\(soc)/\(fileName)"
+        return repoRoot().appendingPathComponent("DDRTestFiles/\(soc)/\(fileName)").path
+    }
+
+    private func repoRoot() -> URL {
+        URL(fileURLWithPath: #file)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
     }
 }
