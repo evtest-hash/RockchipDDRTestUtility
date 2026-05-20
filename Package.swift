@@ -2,7 +2,7 @@
 import PackageDescription
 
 let package = Package(
-    name: "DDRUserToolMac",
+    name: "RockchipDDRTestUtility",
     platforms: [
         .macOS(.v12),
     ],
@@ -16,12 +16,12 @@ let package = Package(
             targets: ["DDRUSB"]
         ),
         .executable(
-            name: "DDRUserToolMacApp",
-            targets: ["DDRUserToolMacApp"]
+            name: "RockchipDDRTestUtility",
+            targets: ["RockchipDDRTestUtility"]
         ),
         .executable(
-            name: "DDRUserToolCLI",
-            targets: ["DDRUserToolCLI"]
+            name: "RockchipDDRTestUtilityCLI",
+            targets: ["RockchipDDRTestUtilityCLI"]
         ),
     ],
     targets: [
@@ -44,20 +44,20 @@ let package = Package(
             ]
         ),
         .executableTarget(
-            name: "DDRUserToolMacApp",
+            name: "RockchipDDRTestUtility",
             dependencies: [
                 "DDRCore",
                 "DDRUSB",
             ],
-            path: "Sources/DDRUserToolMacApp"
+            path: "Sources/RockchipDDRTestUtility"
         ),
         .executableTarget(
-            name: "DDRUserToolCLI",
+            name: "RockchipDDRTestUtilityCLI",
             dependencies: [
                 "DDRCore",
                 "DDRUSB",
             ],
-            path: "Sources/DDRUserToolCLI"
+            path: "Sources/RockchipDDRTestUtilityCLI"
         ),
         .testTarget(
             name: "DDRCoreTests",

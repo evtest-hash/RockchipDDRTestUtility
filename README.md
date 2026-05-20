@@ -29,10 +29,10 @@ A macOS native tool for testing DDR memory soldering quality on Rockchip SoCs vi
 
 ## Download
 
-Download the latest `DDRUserToolMac.dmg` from [Releases](../../releases).
+Download the latest `RockchipDDRTestUtility.dmg` from [Releases](../../releases).
 
 1. Open the DMG
-2. Drag **DDRUserToolMac.app** to **Applications**
+2. Drag **Rockchip DDR Test Utility.app** to **Applications**
 3. Launch the app — test configuration files are bundled inside the app
 
 ## Build from Source
@@ -45,14 +45,14 @@ swift build -c release
 ### Run GUI (development)
 
 ```bash
-swift run DDRUserToolMacApp
+swift run RockchipDDRTestUtility
 ```
 
 ### Run CLI
 
 ```bash
-swift run DDRUserToolCLI --list
-swift run DDRUserToolCLI --cfg "/path/to/test.cfg"
+swift run RockchipDDRTestUtilityCLI --list
+swift run RockchipDDRTestUtilityCLI --cfg "/path/to/test.cfg"
 ```
 
 ### Build Universal DMG
@@ -100,8 +100,8 @@ At runtime, `CfgRepository` discovers files from:
 |--------|-------------|
 | `DDRCore` | Config parsing, binary `.cfg` parser, test execution engine, result writer |
 | `DDRUSB` | USB transport via libusb (Rockchip protocol) |
-| `DDRUserToolMacApp` | SwiftUI GUI application |
-| `DDRUserToolCLI` | Command-line interface |
+| `RockchipDDRTestUtility` | SwiftUI GUI application |
+| `RockchipDDRTestUtilityCLI` | Command-line interface |
 
 ### Test Flow
 

@@ -2,10 +2,10 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-BUNDLE_NAME="DDRUserToolMac.app"
+BUNDLE_NAME="Rockchip DDR Test Utility.app"
 STAGING_DIR="$PROJECT_DIR/.staging"
 BUNDLE_DIR="$STAGING_DIR/$BUNDLE_NAME"
-DMG_NAME="DDRUserToolMac"
+DMG_NAME="RockchipDDRTestUtility"
 DMG_DIR="$STAGING_DIR/dmg"
 
 # Detect host arch and decide which arches to build
@@ -116,7 +116,7 @@ done
 if [ ${#ARCHES[@]} -gt 1 ]; then
     echo "=== Creating universal binaries ==="
     mkdir -p "$PROJECT_DIR/.build/universal"
-    for exe in DDRUserToolMacApp DDRUserToolCLI; do
+    for exe in RockchipDDRTestUtility RockchipDDRTestUtilityCLI; do
         lipo -create \
             "$PROJECT_DIR/.build/arm64-apple-macosx/release/$exe" \
             "$PROJECT_DIR/.build/x86_64-apple-macosx/release/$exe" \
@@ -135,8 +135,8 @@ mkdir -p "$BUNDLE_DIR/Contents/MacOS"
 mkdir -p "$BUNDLE_DIR/Contents/Frameworks"
 mkdir -p "$BUNDLE_DIR/Contents/Resources"
 
-cp "$BUILD_DIR/DDRUserToolMacApp" "$BUNDLE_DIR/Contents/MacOS/"
-cp "$BUILD_DIR/DDRUserToolCLI"    "$BUNDLE_DIR/Contents/MacOS/"
+cp "$BUILD_DIR/RockchipDDRTestUtility" "$BUNDLE_DIR/Contents/MacOS/"
+cp "$BUILD_DIR/RockchipDDRTestUtilityCLI" "$BUNDLE_DIR/Contents/MacOS/"
 
 cp "$PROJECT_DIR/scripts/Info.plist" "$BUNDLE_DIR/Contents/"
 printf "APPL????" > "$BUNDLE_DIR/Contents/PkgInfo"
@@ -163,7 +163,7 @@ cp "$UNIVERSAL_LIBUSB" "$BUNDLE_DIR/Contents/Frameworks/libusb-1.0.0.dylib"
 install_name_tool -id "@rpath/libusb-1.0.0.dylib" \
     "$BUNDLE_DIR/Contents/Frameworks/libusb-1.0.0.dylib"
 
-for exe in DDRUserToolMacApp DDRUserToolCLI; do
+for exe in RockchipDDRTestUtility RockchipDDRTestUtilityCLI; do
     # Rewrite both Homebrew paths (arm64 /opt/homebrew and Intel /usr/local)
     install_name_tool -change \
         /opt/homebrew/opt/libusb/lib/libusb-1.0.0.dylib \
@@ -182,12 +182,12 @@ done
 
 echo "=== Verifying bundle ==="
 echo "Architectures:"
-lipo -info "$BUNDLE_DIR/Contents/MacOS/DDRUserToolMacApp"
+lipo -info "$BUNDLE_DIR/Contents/MacOS/RockchipDDRTestUtility"
 lipo -info "$BUNDLE_DIR/Contents/Frameworks/libusb-1.0.0.dylib"
 echo "Dynamic libraries:"
-otool -L "$BUNDLE_DIR/Contents/MacOS/DDRUserToolMacApp" | grep -E "libusb|rpath"
+otool -L "$BUNDLE_DIR/Contents/MacOS/RockchipDDRTestUtility" | grep -E "libusb|rpath"
 echo "Rpaths:"
-otool -l "$BUNDLE_DIR/Contents/MacOS/DDRUserToolMacApp" | grep -A2 LC_RPATH
+otool -l "$BUNDLE_DIR/Contents/MacOS/RockchipDDRTestUtility" | grep -A2 LC_RPATH
 
 # ── Step 8: Create DMG ──
 

@@ -1,7 +1,7 @@
 import SwiftUI
 
 @main
-struct DDRUserToolMacApp: App {
+struct RockchipDDRTestUtilityApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()

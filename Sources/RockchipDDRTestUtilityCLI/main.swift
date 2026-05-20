@@ -55,25 +55,25 @@ struct CLIArguments {
 
 func printUsageAndExit() -> Never {
     let usage = """
-    DDRUserToolCLI
+    Rockchip DDR Test Utility CLI
       --list
       --probe-bulk [--device-id <id>]
       --reset-usb [--device-id <id>]
       --cfg <cfg_path> [--device-id <id>] [--output-log <txt_path>]
 
     Examples:
-      swift run DDRUserToolCLI --list
-      swift run DDRUserToolCLI --probe-bulk
-      swift run DDRUserToolCLI --reset-usb
-      swift run DDRUserToolCLI --cfg "/path/to/test.cfg"
-      swift run DDRUserToolCLI --cfg "/path/to/test.cfg" --output-log "/tmp/ddr_result.txt"
+      swift run RockchipDDRTestUtilityCLI --list
+      swift run RockchipDDRTestUtilityCLI --probe-bulk
+      swift run RockchipDDRTestUtilityCLI --reset-usb
+      swift run RockchipDDRTestUtilityCLI --cfg "/path/to/test.cfg"
+      swift run RockchipDDRTestUtilityCLI --cfg "/path/to/test.cfg" --output-log "/tmp/ddr_result.txt"
     """
     print(usage)
     Foundation.exit(0)
 }
 
 @main
-struct DDRUserToolCLI {
+struct RockchipDDRTestUtilityCLI {
     static func main() async {
         do {
             let args = try CLIArguments.parse(CommandLine.arguments)

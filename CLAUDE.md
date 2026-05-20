@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-macOS Swift port of Rockchip's DDR_UserTool — a utility for testing DDR memory soldering quality on Rockchip SoCs (RK3588, RK3568, etc.) via USB.
+**Rockchip DDR Test Utility** — a macOS native tool for testing DDR memory soldering quality on Rockchip SoCs (RK3588, RK3568, etc.) via USB. Ported from Rockchip's original DDR_UserTool.
 
 ## Build & Run
 
@@ -14,11 +14,11 @@ swift build                  # debug build
 swift build -c release       # release build
 
 # Run GUI app (requires USB device plugged in for real testing)
-swift run DDRUserToolMacApp
+swift run RockchipDDRTestUtility
 
 # Run CLI
-swift run DDRUserToolCLI --list
-swift run DDRUserToolCLI --cfg "/path/to/test.cfg"
+swift run RockchipDDRTestUtilityCLI --list
+swift run RockchipDDRTestUtilityCLI --cfg "/path/to/test.cfg"
 
 # Build universal DMG
 bash scripts/package.sh
@@ -40,8 +40,8 @@ Tests cover CfgBinaryParser, CfgRepository (SoC name extraction), TestExecutionE
 
 - **DDRCore** — Shared library: config/INI parsing, binary `.cfg` parser, test execution engine, result log writer, models.
 - **DDRUSB** — USB transport layer: `RkUsbTransportLibusb` implements `UsbTransport` protocol using libusb. Handles control transfers (boot download), bulk transfers (command/data), ACK validation, and printf polling.
-- **DDRUserToolMacApp** — SwiftUI desktop app. `MainViewModel` orchestrates the workflow: load config → discover test files → discover USB devices → run test → save result.
-- **DDRUserToolCLI** — Command-line interface with `--list`, `--probe-bulk`, `--reset-usb`, `--cfg` modes.
+- **RockchipDDRTestUtility** — SwiftUI desktop app. `MainViewModel` orchestrates the workflow: load config → discover test files → discover USB devices → run test → save result.
+- **RockchipDDRTestUtilityCLI** — Command-line interface with `--list`, `--probe-bulk`, `--reset-usb`, `--cfg` modes.
 
 ### Key Data Flow
 
