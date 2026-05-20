@@ -91,10 +91,24 @@ struct ContentView: View {
     private var logArea: some View {
         ZStack(alignment: .bottomTrailing) {
             if viewModel.testSteps.isEmpty && !viewModel.isRunning {
-                Text("就绪")
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .font(.title3)
-                    .foregroundStyle(.tertiary)
+                VStack(spacing: 16) {
+                    Image(systemName: "memorychip")
+                        .font(.system(size: 36))
+                        .foregroundStyle(.quaternary)
+                    VStack(spacing: 8) {
+                        Text("DDR 焊接质量测试")
+                            .font(.headline)
+                            .foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Label("连接 Rockchip 设备（Maskrom 状态）", systemImage: "1.circle")
+                            Label("在左侧选择对应的测试配置文件", systemImage: "2.circle")
+                            Label("点击「开始测试」或开启「自动测试」", systemImage: "3.circle")
+                        }
+                        .font(.callout)
+                        .foregroundStyle(.tertiary)
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ScrollViewReader { proxy in
                     ScrollView {
