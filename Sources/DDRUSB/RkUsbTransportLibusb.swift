@@ -78,16 +78,7 @@ public final class RkUsbTransportLibusb: UsbTransport {
             if descriptor.iSerialNumber != 0 {
                 var handleForSerial: OpaquePointer?
                 if libusb_open(dev, &handleForSerial) == 0, let handleForSerial {
-                    var serialBuf = [CChar](repeating: 0, count: 256)
-                    let len = libusb_get_string_descriptor_ascii(
-                        handleForSerial,
-                        descriptor.iSerialNumber,
-                        &serialBuf,
-                        Int32(serialBuf.count)
-                    )
-                    if len > 0 {
-                        serialNumber = String(cString: serialBuf)
-                    }
+                    serialNumber = readSerialNumber(handle: handleForSerial, index: descriptor.iSerialNumber)
                     libusb_close(handleForSerial)
                 }
             }
@@ -378,6 +369,22 @@ public final class RkUsbTransportLibusb: UsbTransport {
     }
 
     // MARK: - Core USB helpers
+
+    private func readSerialNumber(handle: OpaquePointer, index: UInt8) -> String? {
+        var buf = [UInt8](repeating: 0, count: 256)
+        let len = buf.withUnsafeMutableBufferPointer { ptr in
+            libusb_get_string_descriptor_ascii(
+                handle,
+                index,
+                ptr.baseAddress,
+                Int32(ptr.count)
+            )
+        }
+        guard len > 0 else { return nil }
+        let safeLen = min(Int(len), buf.count - 1)
+        return String(bytes: buf[..<safeLen], encoding: .ascii)
+            ?? String(bytes: buf[..<safeLen], encoding: .utf8)
+    }
 
     private func initializeContext() throws {
         var newContext: OpaquePointer?
