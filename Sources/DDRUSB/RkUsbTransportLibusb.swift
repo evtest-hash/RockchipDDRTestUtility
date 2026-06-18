@@ -20,6 +20,20 @@ public final class RkUsbTransportLibusb: UsbTransport {
     private static let gb18030Encoding: UInt32 = 0x0632
     private static let fallbackParameterAddress: UInt32 = 0xFF0F_FF00
 
+    /// PIDs whose boot transfer must NOT be RC4-encrypted. Values mirror Windows'
+    /// config.ini `CLOSE_RC4_LIST = 350A|350B|350C|350D|350E|110F`
+    /// (RK3568/RK3566, RK3588, RK3562, RK3576, RV1126B). Every other (older) SoC
+    /// gets the boot blob RC4-encrypted before chunking. Mirrors DDR_UserTool
+    /// `sub_40A3C0` flag `a4`.
+    ///
+    /// Mac is open-box and does not read config.ini for this, so this constant is
+    /// the single source of truth (the parsed `ConfigSettings.closeRC4List` is
+    /// unused on Mac). MAINTENANCE: when adding a new SoC, update BOTH this set
+    /// (if its boot must skip RC4) AND `RockchipPidMap.pidToSoc` in DDRCore.
+    private static let closeRC4PIDs: Set<UInt16> = [
+        0x350A, 0x350B, 0x350C, 0x350D, 0x350E, 0x110F,
+    ]
+
     private var context: OpaquePointer?
     private var handle: OpaquePointer?
     private var claimedInterface: Int32 = -1
@@ -188,8 +202,16 @@ public final class RkUsbTransportLibusb: UsbTransport {
             throw DDRToolError.transportError("Boot payload is empty")
         }
 
-        let bootPayload = bootPayloadWithCRC(payload)
-        debug("downloadBoot bytes=\(bootPayload.count)")
+        // CRC is embedded first (already present in the cfg payload, verified by
+        // bootPayloadWithCRC), then the whole blob is RC4-encrypted on SoCs that
+        // are not in CLOSE_RC4_LIST — matching Windows' order in sub_40A3C0
+        // (`if (a4) sub_4015C0(v17, v15)` applied to the full buffer post-CRC).
+        var bootPayload = bootPayloadWithCRC(payload)
+        let useRC4 = shouldRC4BootForCurrentDevice
+        if useRC4 {
+            bootPayload = RC4.cipher(key: RC4.rockchipKey, data: bootPayload)
+        }
+        debug("downloadBoot bytes=\(bootPayload.count) rc4=\(useRC4)")
 
         var offset = 0
         while offset < bootPayload.count {
@@ -201,6 +223,15 @@ public final class RkUsbTransportLibusb: UsbTransport {
                 usleep(bootChunkDelayUs)
             }
         }
+    }
+
+    /// True when the opened device's PID is NOT in CLOSE_RC4_LIST — i.e. the
+    /// boot transfer must be RC4-encrypted. Defaults to false when no device is
+    /// open, which preserves the previously-verified (RC4-less) flow for modern
+    /// SoCs and avoids encrypting the boot blob unexpectedly.
+    private var shouldRC4BootForCurrentDevice: Bool {
+        guard let pid = openedDevice?.productID else { return false }
+        return !Self.closeRC4PIDs.contains(pid)
     }
 
     public func downloadItem(item: CfgItem, payload: Data, address: UInt32) throws {
@@ -257,6 +288,11 @@ public final class RkUsbTransportLibusb: UsbTransport {
     public func runItem(item: CfgItem, address: UInt32) throws {
         try ensureOpened()
 
+        // RKU_RunMemory (opcode 3): hand control to the downloaded test code.
+        // The device acks with the echoed token; we only validate that here.
+        // Pass/fail is determined afterwards by polling testDeviceReady() —
+        // mirroring Windows, which loops RKU_TestDeviceReady after RunMemory
+        // (sub_406420) rather than trusting a single handshake response.
         let runToken = nextToken()
         let runCommand = makeCommand(
             opcode: Self.runOpcode,
@@ -269,19 +305,37 @@ public final class RkUsbTransportLibusb: UsbTransport {
             throw DDRToolError.transportError("runItem ack timeout")
         }
         try validateAck(runAck, expectedToken: runToken, stage: "runItem")
+    }
 
-        let handshakeToken = nextToken()
-        let handshakeCommand = makeCommand(
+    public func testDeviceReady() throws -> DeviceReadyStatus {
+        try ensureOpened()
+
+        // RKU_TestDeviceReady (opcode 0). The 16-byte response:
+        //   word0 = echoed token, word1 = status (0=done, 1=error, 2=running),
+        //   word2 = result code of the test code (0 = pass).
+        // Matches DDR_UserTool sub_416B70.
+        let token = nextToken()
+        let command = makeCommand(
             opcode: Self.handshakeOpcode,
             address: 0,
             length: 0,
-            token: handshakeToken
+            token: token
         )
-        try bulkWrite(handshakeCommand)
-        guard let handshakeAck = try bulkRead(requiredBytes: 16, timeoutMs: transferTimeoutMs) else {
-            throw DDRToolError.transportError("runItem handshake ack timeout")
+        try bulkWrite(command)
+        guard let ack = try bulkRead(requiredBytes: 16, timeoutMs: transferTimeoutMs) else {
+            throw DDRToolError.transportError("testDeviceReady ack timeout")
         }
-        try validateAck(handshakeAck, expectedToken: handshakeToken, stage: "runItemHandshake")
+        try validateAck(ack, expectedToken: token, stage: "testDeviceReady")
+
+        let statusWord = decodeUInt32LE(ack, at: 4)
+        let resultCode = decodeUInt32LE(ack, at: 8)
+        let phase: DeviceReadyStatus.Phase
+        switch statusWord {
+        case 1: phase = .error
+        case 2: phase = .running
+        default: phase = .finished
+        }
+        return DeviceReadyStatus(phase: phase, resultCode: resultCode)
     }
 
     public func readPrintf() throws -> String? {

@@ -248,18 +248,50 @@ public struct ExecutionLogEntry: Hashable, Sendable {
     public let level: LogLevel
     public let code: String
     public let message: String
+    /// Structured item identity for item-scoped entries (boot/forceinit/connect/…).
+    /// Carries the item name directly so consumers don't have to re-parse it out of
+    /// `message` prose. `nil` for non-item entries (init, device, printf, …).
+    public let itemName: String?
 
-    public init(timestamp: Date = Date(), level: LogLevel, code: String, message: String) {
+    public init(timestamp: Date = Date(), level: LogLevel, code: String, message: String, itemName: String? = nil) {
         self.timestamp = timestamp
         self.level = level
         self.code = code
         self.message = message
+        self.itemName = itemName
     }
 }
 
 public enum TestOutcome: String, Sendable {
     case passed = "PASS"
     case failed = "FAIL"
+}
+
+/// Outcome of a single `RKU_TestDeviceReady` (opcode 0) poll.
+///
+/// Mirrors DDR_UserTool's `sub_416B70`: the 16-byte response carries the echoed
+/// token in word0, a status in word1, and a result code in word2. Pass/fail is
+/// derived from these words — NOT from printf text (printf is display-only).
+public struct DeviceReadyStatus: Sendable {
+    public enum Phase: Sendable {
+        /// word1 == 2 — the device is still executing the downloaded test code.
+        case running
+        /// word1 == 0 — the device finished; inspect `resultCode`.
+        case finished
+        /// word1 == 1 — the device reported an error.
+        case error
+    }
+
+    /// word1 mapped to a phase.
+    public let phase: Phase
+    /// word2 — return code of the downloaded test code. Only meaningful once
+    /// `phase == .finished`: 0 → pass, anything else → fail.
+    public let resultCode: UInt32
+
+    public init(phase: Phase, resultCode: UInt32) {
+        self.phase = phase
+        self.resultCode = resultCode
+    }
 }
 
 public enum StepState: Sendable {

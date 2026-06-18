@@ -104,7 +104,8 @@ final class MainViewModel: ObservableObject {
             let result = await engine.run(cfgPath: selected.absolutePath, selectedDeviceID: selectedDeviceID)
             lastResult = result
 
-            // Device printf may report FAIL even if the engine completes without error
+            // If any step ended in failure, the overall outcome is failure
+            // regardless (its verdict came from the device's status/result).
             if testSteps.contains(where: { $0.state == .failed }) {
                 overallOutcome = .failed
             } else {
@@ -165,30 +166,31 @@ final class MainViewModel: ObservableObject {
             appendStepMessage("Boot", message)
 
         case "INFO_DOWNLOADITEM_START":
-            if let name = extractItemName(from: message) {
+            if let name = entry.itemName ?? extractItemName(from: message) {
                 ensureStep(name)
                 setStepState(name, .downloading)
                 appendStepMessage(name, message)
             }
 
         case "INFO_DOWNLOADITEM_OK":
-            if let name = extractItemName(from: message) {
+            if let name = entry.itemName ?? extractItemName(from: message) {
                 appendStepMessage(name, message)
             }
 
         case "INFO_DOWNLOADITEMPARAM_START":
-            if let name = extractItemName(from: message) {
+            if let name = entry.itemName ?? extractItemName(from: message) {
                 appendStepMessage(name, message)
             }
 
         case "INFO_RUNITEM_START":
-            if let name = extractItemName(from: message) {
+            if let name = entry.itemName ?? extractItemName(from: message) {
                 setStepState(name, .running)
                 appendStepMessage(name, message)
             }
 
         case "INFO_RUNITEM_OK":
-            if let name = extractItemName(from: message) {
+            if let name = entry.itemName ?? extractItemName(from: message) {
+                setStepState(name, .passed)
                 appendStepMessage(name, message)
             }
 
@@ -224,32 +226,31 @@ final class MainViewModel: ObservableObject {
         }
     }
 
+    /// Fallback item-name recovery from log prose. Prefer the structured
+    /// `entry.itemName` (set by the engine for item-scoped codes); this is kept
+    /// only as a safety net for entries without it.
     private func extractItemName(from message: String) -> String? {
         // "Start to download test item forceinit..." → "forceinit"
-        // "Start to run test item connect" → "connect"
+        // "Start to run test item connect"          → "connect"
+        // "Running test item forceinit ok"          → "forceinit"
         guard let range = message.range(of: "test item ") else { return nil }
         let rest = message[range.upperBound...]
-        let name = rest.replacingOccurrences(of: "...", with: "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return name.isEmpty ? nil : name
+        // Item name = the leading run of non-space, non-dot characters, so both
+        // "forceinit ok" and "forceinit..." resolve to "forceinit".
+        let name = rest.prefix { !$0.isWhitespace && $0 != "." }
+        let trimmed = String(name).trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     private func handlePrintf(_ message: String) {
-        let upper = message.uppercased()
-        // Prefer running step, then downloading step, then last step
+        // Printf is display-only. Step pass/fail is driven by the engine's
+        // INFO_RUNITEM_OK / ERROR_RUNITEM_FAIL / INFO_TESTDDR_OK codes (which
+        // come from the device's RKU_TestDeviceReady status/result), not from
+        // scanning this text — matching DDR_UserTool's failure detection.
         let idx = testSteps.lastIndex(where: { $0.state == .running })
             ?? testSteps.lastIndex(where: { $0.state == .downloading })
             ?? testSteps.indices.last
         guard let idx else { return }
-
-        // Detect failure indicators first (higher priority than pass)
-        if upper.contains("FAIL") || message.contains("错误!") || message.contains("Force init DDR fail") {
-            testSteps[idx].state = .failed
-        } else if upper.contains("PASS") || upper.contains("SUCCESS") || message.contains("通过") {
-            if testSteps[idx].state != .failed {
-                testSteps[idx].state = .passed
-            }
-        }
 
         // Strip protocol tags and display all lines
         let cleaned = message

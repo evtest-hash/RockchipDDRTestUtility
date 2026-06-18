@@ -9,10 +9,8 @@ public actor TestExecutionEngine {
         static let connect = "connect"
     }
 
-    private let maxPrintfReadsPerItem = 256
-    private let maxConsecutiveEmptyPrintfReads = 8
     private let defaultBootSettleDelayMs: UInt64 = 800
-    private let printfPollDelayMs: UInt64 = 20
+    private let statusPollDelayMs: UInt64 = 200
 
     private let parser: CfgBinaryParser
     private let transport: UsbTransport
@@ -30,15 +28,15 @@ public actor TestExecutionEngine {
         var state: ExecutionState = .idle
         var selectedDevice: UsbDevice?
 
-        func append(_ level: LogLevel, _ code: String, _ message: String) {
-            let entry = ExecutionLogEntry(level: level, code: code, message: message)
+        func append(_ level: LogLevel, _ code: String, _ message: String, itemName: String? = nil) {
+            let entry = ExecutionLogEntry(level: level, code: code, message: message, itemName: itemName)
             logs.append(entry)
             logHandler?(entry)
         }
 
-        func fail(_ code: String, _ message: String, device: UsbDevice?) -> ExecutionResult {
+        func fail(_ code: String, _ message: String, device: UsbDevice?, itemName: String? = nil) -> ExecutionResult {
             state = .failed
-            append(.error, code, message)
+            append(.error, code, message, itemName: itemName)
             try? transport.close()
             return ExecutionResult(
                 outcome: .failed,
@@ -102,12 +100,12 @@ public actor TestExecutionEngine {
 
                 // Download item — equivalent to RKU_WriteMemory
                 state = .downloading
-                append(.info, "INFO_DOWNLOADITEM_START", "Start to download test item \(item.name)...")
+                append(.info, "INFO_DOWNLOADITEM_START", "Start to download test item \(item.name)...", itemName: item.name)
                 do {
                     try transport.downloadItem(item: item, payload: payload, address: plan.downloadBaseAddress)
-                    append(.info, "INFO_DOWNLOADITEM_OK", "Download test item \(item.name) ok")
+                    append(.info, "INFO_DOWNLOADITEM_OK", "Download test item \(item.name) ok", itemName: item.name)
                 } catch {
-                    return fail("ERROR_DOWNLOADITEM_FAIL", "Download test item \(item.name) failed: \(error.localizedDescription)", device: selectedDevice)
+                    return fail("ERROR_DOWNLOADITEM_FAIL", "Download test item \(item.name) failed: \(error.localizedDescription)", device: selectedDevice, itemName: item.name)
                 }
 
                 if let preParamPrintf = try transport.readPrintf(), !preParamPrintf.isEmpty {
@@ -116,11 +114,11 @@ public actor TestExecutionEngine {
 
                 // Download params — equivalent to RKU_WriteMemory
                 if shouldDownloadParam(for: item) {
-                    append(.info, "INFO_DOWNLOADITEMPARAM_START", "Start to download parameter of \(item.name)")
+                    append(.info, "INFO_DOWNLOADITEMPARAM_START", "Start to download parameter of \(item.name)", itemName: item.name)
                     do {
                         try transport.downloadParam(item: item, address: plan.address, params: plan.params)
                     } catch {
-                        return fail("ERROR_DOWNLOADITEMPARAM_FAIL", "Download parameter failed: \(error.localizedDescription)", device: selectedDevice)
+                        return fail("ERROR_DOWNLOADITEMPARAM_FAIL", "Download parameter failed: \(error.localizedDescription)", device: selectedDevice, itemName: item.name)
                     }
 
                     if let preRunPrintf = try transport.readPrintf(), !preRunPrintf.isEmpty {
@@ -128,48 +126,34 @@ public actor TestExecutionEngine {
                     }
                 }
 
-                // Run item — equivalent to RKU_RunMemory
+                // Run item — equivalent to RKU_RunMemory (opcode 3)
                 state = .running
-                append(.info, "INFO_RUNITEM_START", "Start to run test item \(item.name)")
+                append(.info, "INFO_RUNITEM_START", "Start to run test item \(item.name)", itemName: item.name)
                 do {
                     try transport.runItem(item: item, address: plan.downloadBaseAddress)
-                    append(.info, "INFO_RUNITEM_OK", "Running test item \(item.name) ok")
                 } catch {
-                    return fail("ERROR_RUNITEM_FAIL", "Run test item \(item.name) failed: \(error.localizedDescription)", device: selectedDevice)
+                    return fail("ERROR_RUNITEM_FAIL", "Run test item \(item.name) failed: \(error.localizedDescription)", device: selectedDevice, itemName: item.name)
                 }
 
-                // Poll printf — equivalent to RKU_TestDeviceReady + RKU_Printf
-                // Collect device output; abort if device reports failure
+                // Wait for the item to finish — equivalent to Windows' RKU_TestDeviceReady
+                // loop in sub_406420. Pass/fail is taken from the device's status/result
+                // words (testDeviceReady), NOT from printf text. Printf is drained via the
+                // callback purely so the UI shows live device output.
                 state = .collectingLog
-                var printfReadCount = 0
-                var emptyReadCount = 0
-                var itemLogText = ""
-                var itemFailed = false
-                while printfReadCount < maxPrintfReadsPerItem,
-                      emptyReadCount < maxConsecutiveEmptyPrintfReads {
-                    let printf = try transport.readPrintf()
-                    if let printf, !printf.isEmpty {
-                        emptyReadCount = 0
-                        itemLogText += printf
-                        append(.info, "INFO_PRINTF", printf)
-                        printfReadCount += 1
-
-                        if deviceReportedFailure(item: item, text: printf) {
-                            itemFailed = true
-                            break
-                        }
-                        if isItemLogComplete(item: item, text: itemLogText) {
-                            break
-                        }
-                    } else {
-                        emptyReadCount += 1
-                        printfReadCount += 1
+                let completion: ItemCompletion
+                do {
+                    completion = try await waitForItemCompletion(item: item) { printf in
+                        append(.info, "INFO_PRINTF", printf, itemName: item.name)
                     }
-                    try await Task.sleep(nanoseconds: printfPollDelayMs * 1_000_000)
+                } catch {
+                    return fail("ERROR_RUNITEM_FAIL", "Polling test item \(item.name) failed: \(error.localizedDescription)", device: selectedDevice, itemName: item.name)
                 }
 
-                if itemFailed {
-                    return fail("ERROR_ITEM_FAILED", "Test item \(item.name) failed, aborting.", device: selectedDevice)
+                switch completion {
+                case .passed:
+                    append(.info, "INFO_RUNITEM_OK", "Running test item \(item.name) ok", itemName: item.name)
+                case .failed(let reason):
+                    return fail("ERROR_RUNITEM_FAIL", "Run test item \(item.name) failed: \(reason)", device: selectedDevice, itemName: item.name)
                 }
             }
 
@@ -195,40 +179,48 @@ public actor TestExecutionEngine {
         item.name.caseInsensitiveCompare(ItemName.forceinit) == .orderedSame
     }
 
-    /// Check if the device's printf output indicates the current stage completed.
-    private func isItemLogComplete(item: CfgItem, text: String) -> Bool {
-        if item.name.caseInsensitiveCompare(ItemName.forceinit) == .orderedSame {
-            return text.contains("Force init DDR pass.")
-                || text.contains("Force init DDR fail")
-                || text.contains("sdram_init_all_channel end.")
-        }
-        if item.name.caseInsensitiveCompare(ItemName.connect) == .orderedSame {
-            let upper = text.uppercased()
-            return upper.contains("RESULT: PASS")
-                || upper.contains("RESULT: FAIL")
-                || text.contains("Summary: PASS")
-                || text.contains("Summary: FAIL")
-                || text.contains("汇总:")
-                || text.contains("汇总：")
-        }
-        return false
+    /// Per-item completion verdict, derived from `RKU_TestDeviceReady`.
+    private enum ItemCompletion {
+        case passed
+        case failed(String)
     }
 
-    /// Check if the device explicitly reported failure — equivalent to RKU_TestDeviceReady returning FALSE.
-    /// Uses specific patterns from the DDR firmware output to avoid false positives.
-    private func deviceReportedFailure(item: CfgItem, text: String) -> Bool {
-        let upper = text.uppercased()
-
-        // English "FAIL" keyword — appears in "Result: FAIL!", "Check X fail", etc.
-        if upper.contains("FAIL") { return true }
-
-        // Chinese error with exclamation mark — "DQS0 错误!", "Training 错误!", "强制初始化 DDR 错误!", etc.
-        // The "!" distinguishes real errors from "no error" messages like "未检测到错误状态。"
-        if text.contains("错误!") { return true }
-
-        // English forceinit explicit failure
-        if text.contains("Force init DDR fail") { return true }
-
-        return false
+    /// Poll `RKU_TestDeviceReady` (opcode 0) until the item finishes, mirroring
+    /// DDR_UserTool `sub_406420`: the device's status/result words decide the
+    /// verdict; printf is drained only for live display (Windows drains printf
+    /// on a separate thread for the same purpose). Windows loops with a 200ms
+    /// cadence and NO iteration cap — it trusts the device to eventually report
+    /// done/error — so we do the same; a device that stops responding is caught
+    /// by `testDeviceReady`'s USB transfer timeout rather than a poll counter.
+    private func waitForItemCompletion(
+        item: CfgItem,
+        onPrintf: (String) -> Void
+    ) async throws -> ItemCompletion {
+        while true {
+            // Status first: the verdict never waits on printf (mirrors Windows,
+            // whose loop body is just TestDeviceReady + Sleep(0xC8)).
+            let status = try transport.testDeviceReady()
+            switch status.phase {
+            case .error:
+                return .failed("device reported error (status=1)")
+            case .finished:
+                // One last display drain for the trailing summary line, then
+                // decide on the result code (word2) — exactly as Windows checks
+                // the result word after TestDeviceReady returns 'done'.
+                if let printf = try transport.readPrintf(), !printf.isEmpty {
+                    onPrintf(printf)
+                }
+                return status.resultCode == 0
+                    ? .passed
+                    : .failed("device returned result \(status.resultCode)")
+            case .running:
+                // Display-only drain while the device works; never affects the
+                // verdict.
+                if let printf = try transport.readPrintf(), !printf.isEmpty {
+                    onPrintf(printf)
+                }
+                try await Task.sleep(nanoseconds: statusPollDelayMs * 1_000_000)
+            }
+        }
     }
 }

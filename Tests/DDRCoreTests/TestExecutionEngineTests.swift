@@ -48,13 +48,50 @@ final class TestExecutionEngineTests: XCTestCase {
         let devices = [
             UsbDevice(deviceID: "A", vendorID: 0x2207, productID: 0x0001, productName: "RK-A", serialNumber: nil),
         ]
-        let transport = MockUsbTransport(devices: devices, failPrintf: "DQS0 错误!")
+        // The device reports failure through the RKU_TestDeviceReady result code
+        // (mirrors Windows sub_406420), not via printf text.
+        let transport = MockUsbTransport(devices: devices, failRunResult: true)
         let engine = TestExecutionEngine(parser: CfgBinaryParser(), transport: transport)
 
         let result = await engine.run(cfgPath: rk3588Fixture())
 
         XCTAssertEqual(result.outcome, .failed)
-        XCTAssertTrue(result.logs.contains(where: { $0.code == "ERROR_ITEM_FAILED" }))
+        XCTAssertTrue(result.logs.contains(where: { $0.code == "ERROR_RUNITEM_FAIL" }))
+    }
+
+    func testRunningPhaseThenPasses() async {
+        let devices = [
+            UsbDevice(deviceID: "A", vendorID: 0x2207, productID: 0x0001, productName: "RK-A", serialNumber: nil),
+        ]
+        // Device reports .running for a few polls then .finished with result 0 —
+        // exercises the polling loop's running→finished transition (previously
+        // untested because the mock short-circuited to .finished on poll 1).
+        let transport = MockUsbTransport(devices: devices, runningPollsBeforeFinish: 3)
+        let engine = TestExecutionEngine(parser: CfgBinaryParser(), transport: transport)
+
+        let result = await engine.run(cfgPath: rk3588Fixture())
+
+        XCTAssertEqual(result.outcome, .passed)
+        // The item-scoped OK entry carries the structured item name (not re-parsed
+        // from prose).
+        XCTAssertTrue(result.logs.contains(where: {
+            $0.code == "INFO_RUNITEM_OK" && $0.itemName == "forceinit"
+        }))
+    }
+
+    func testDeviceErrorStatusFails() async {
+        let devices = [
+            UsbDevice(deviceID: "A", vendorID: 0x2207, productID: 0x0001, productName: "RK-A", serialNumber: nil),
+        ]
+        // Device reports status 1 (error) on every poll — mirrors Windows
+        // sub_406420 treating a TestDeviceReady error as ERROR_RUNITEM_FAIL.
+        let transport = MockUsbTransport(devices: devices, reportError: true)
+        let engine = TestExecutionEngine(parser: CfgBinaryParser(), transport: transport)
+
+        let result = await engine.run(cfgPath: rk3588Fixture())
+
+        XCTAssertEqual(result.outcome, .failed)
+        XCTAssertTrue(result.logs.contains(where: { $0.code == "ERROR_RUNITEM_FAIL" }))
     }
 
     private func rk3588Fixture() -> String {
@@ -64,24 +101,29 @@ final class TestExecutionEngineTests: XCTestCase {
     }
 }
 
-/// Mock transport that simulates device printf responses.
-/// For each item, the engine calls readPrintf before run (pre-param) and after run (polling loop).
-/// We return the completion marker in the polling loop phase so `deviceReportedFailure`
-/// and `isItemLogComplete` see it in `itemLogText`.
+/// Mock transport that simulates device responses.
+/// Per-item pass/fail is driven by `testDeviceReady()`'s result code, mirroring
+/// Windows' RKU_TestDeviceReady loop. `readPrintf` returns nothing — device
+/// printf is display-only and never affects the verdict.
 private final class MockUsbTransport: UsbTransport {
     let devices: [UsbDevice]
     let failPhase: String?
-    let failPrintf: String?
+    let failRunResult: Bool
+    /// Number of `.running` responses before the device reports `.finished`.
+    let runningPollsBeforeFinish: Int
+    /// When true, `testDeviceReady` reports `.error` (status word 1) forever.
+    let reportError: Bool
     var calledPhases: [String] = []
     private var opened = false
-    private var currentItemName: String?
-    // Track whether we've returned the "run" printf for each item
-    private var returnedRunPrintf: [String: Bool] = [:]
+    private var readyCallCount = 0
 
-    init(devices: [UsbDevice], failPhase: String? = nil, failPrintf: String? = nil) {
+    init(devices: [UsbDevice], failPhase: String? = nil, failRunResult: Bool = false,
+         runningPollsBeforeFinish: Int = 0, reportError: Bool = false) {
         self.devices = devices
         self.failPhase = failPhase
-        self.failPrintf = failPrintf
+        self.failRunResult = failRunResult
+        self.runningPollsBeforeFinish = runningPollsBeforeFinish
+        self.reportError = reportError
     }
 
     func discoverDevices() throws -> [UsbDevice] {
@@ -97,7 +139,6 @@ private final class MockUsbTransport: UsbTransport {
     }
 
     func downloadItem(item: CfgItem, payload: Data, address: UInt32) throws {
-        currentItemName = item.name
         try phase("downloadItem")
     }
 
@@ -109,35 +150,23 @@ private final class MockUsbTransport: UsbTransport {
         try phase("runItem")
     }
 
+    func testDeviceReady() throws -> DeviceReadyStatus {
+        // Mirrors Windows sub_416B70 status mapping: status 1 → error,
+        // status 2 → running, else → finished (result code in word2).
+        if reportError {
+            return DeviceReadyStatus(phase: .error, resultCode: 0)
+        }
+        readyCallCount += 1
+        if readyCallCount <= runningPollsBeforeFinish {
+            return DeviceReadyStatus(phase: .running, resultCode: 0)
+        }
+        return DeviceReadyStatus(phase: .finished, resultCode: failRunResult ? 1 : 0)
+    }
+
     func readPrintf() throws -> String? {
-        guard let name = currentItemName else { return nil }
-
-        // Pre-run readPrintf calls (before runItem) return nil
-        // Post-run calls return the completion text
-        if returnedRunPrintf[name] == nil {
-            // First call for this item = pre-run, return nil
-            returnedRunPrintf[name] = false
-            return nil
-        }
-
-        if returnedRunPrintf[name] == false {
-            // Second call phase = post-run, return completion text
-            returnedRunPrintf[name] = true
-
-            if let failPrintf {
-                return failPrintf
-            }
-            if name.caseInsensitiveCompare("forceinit") == .orderedSame {
-                return "Force init DDR pass."
-            }
-            if name.caseInsensitiveCompare("connect") == .orderedSame {
-                return "Summary: PASS."
-            }
-            return nil
-        }
-
-        // Already returned completion, return nil
-        return nil
+        // Device printf is display-only; the mock emits nothing. Pass/fail
+        // comes entirely from testDeviceReady() above.
+        nil
     }
 
     func close() throws {

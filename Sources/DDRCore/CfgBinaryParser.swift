@@ -1,11 +1,6 @@
 import Foundation
 
 public final class CfgBinaryParser {
-    private static let cfgRC4Key = Data([
-        0x7C, 0x4E, 0x03, 0x04, 0x55, 0x05, 0x09, 0x07,
-        0x2D, 0x2C, 0x7B, 0x38, 0x17, 0x0D, 0x17, 0x11
-    ])
-
     private static let recordSpacing = 0x2C3
     private static let firstRecordOffset = 0x41
     private static let bootPayloadMinimumBytes = 10_242
@@ -144,7 +139,7 @@ public final class CfgBinaryParser {
             if isBoot {
                 payload = Data(rawPayload)
             } else {
-                payload = rc4Decrypt(key: Self.cfgRC4Key, data: Data(rawPayload))
+                payload = RC4.cipher(key: RC4.rockchipKey, data: Data(rawPayload))
             }
 
             if !payload.isEmpty {
@@ -153,28 +148,6 @@ public final class CfgBinaryParser {
         }
 
         return bins
-    }
-
-    // MARK: - RC4
-
-    private func rc4Decrypt(key: Data, data: Data) -> Data {
-        var S = [UInt8](0...255)
-        var j: UInt8 = 0
-        for i in 0..<256 {
-            j = j &+ S[i] &+ key[i % key.count]
-            S.swapAt(i, Int(j))
-        }
-
-        var result = [UInt8](repeating: 0, count: data.count)
-        var ii: UInt8 = 0
-        var jj: UInt8 = 0
-        for k in 0..<data.count {
-            ii = ii &+ 1
-            jj = jj &+ S[Int(ii)]
-            S.swapAt(Int(ii), Int(jj))
-            result[k] = data[k] ^ S[Int(S[Int(ii)] &+ S[Int(jj)])]
-        }
-        return Data(result)
     }
 
     // MARK: - Address Parsing
