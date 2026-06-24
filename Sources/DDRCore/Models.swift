@@ -323,6 +323,11 @@ public struct ExecutionResult: Sendable {
     public let logs: [ExecutionLogEntry]
     public let startedAt: Date
     public let finishedAt: Date
+    /// True only when a boot download was actually performed AND succeeded this
+    /// run. Lets the caller (MainViewModel) clear its "device needs boot" latch —
+    /// mirroring DDR_UserTool's `this+0x4B8`, which is cleared solely after a
+    /// successful boot. False when boot was skipped (already booted) or failed.
+    public let bootSucceeded: Bool
 
     public init(
         outcome: TestOutcome,
@@ -330,7 +335,8 @@ public struct ExecutionResult: Sendable {
         selectedDevice: UsbDevice?,
         logs: [ExecutionLogEntry],
         startedAt: Date,
-        finishedAt: Date
+        finishedAt: Date,
+        bootSucceeded: Bool = false
     ) {
         self.outcome = outcome
         self.state = state
@@ -338,6 +344,7 @@ public struct ExecutionResult: Sendable {
         self.logs = logs
         self.startedAt = startedAt
         self.finishedAt = finishedAt
+        self.bootSucceeded = bootSucceeded
     }
 }
 

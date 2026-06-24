@@ -28,6 +28,7 @@ final class TestExecutionEngineTests: XCTestCase {
         XCTAssertEqual(result.state, .completed)
         XCTAssertTrue(transport.calledPhases.contains("downloadBoot"))
         XCTAssertTrue(transport.calledPhases.contains("runItem"))
+        XCTAssertTrue(result.bootSucceeded)
     }
 
     func testDownloadFailure() async {
@@ -94,6 +95,81 @@ final class TestExecutionEngineTests: XCTestCase {
         XCTAssertTrue(result.logs.contains(where: { $0.code == "ERROR_RUNITEM_FAIL" }))
     }
 
+    func testSkipBootSkipsBootDownload() async {
+        let devices = [
+            UsbDevice(deviceID: "A", vendorID: 0x2207, productID: 0x0001, productName: "RK-A", serialNumber: nil),
+        ]
+        // Caller signals the device is already booted (skipBoot=true) → the engine
+        // must SKIP the control-transfer downloadBoot and go straight to bulk test
+        // items, without reporting boot success. Mirrors DDR_UserTool's `this+0x4B8`
+        // flag, which is cleared after the first boot so repeated "start test" runs
+        // skip boot — that's what lets Windows keep clicking start.
+        let transport = MockUsbTransport(devices: devices)
+        let engine = TestExecutionEngine(parser: CfgBinaryParser(), transport: transport)
+
+        let result = await engine.run(cfgPath: rk3588Fixture(), skipBoot: true)
+
+        XCTAssertEqual(result.outcome, .passed)
+        XCTAssertFalse(transport.calledPhases.contains("downloadBoot"))
+        XCTAssertTrue(transport.calledPhases.contains("runItem"))
+        XCTAssertFalse(result.bootSucceeded)
+    }
+
+    func testKeepTransportOpenHoldsHandleAcrossRuns() async {
+        let devices = [
+            UsbDevice(deviceID: "A", vendorID: 0x2207, productID: 0x0001, productName: "RK-A", serialNumber: nil),
+        ]
+        let transport = MockUsbTransport(devices: devices)
+        let engine = TestExecutionEngine(parser: CfgBinaryParser(), transport: transport)
+
+        // Run 1: device needs boot → opens the transport (once), boots, and —
+        // because keepTransportOpen is set — LEAVES it open. This mirrors Windows,
+        // which opens its device handle once when the device is detected and holds
+        // it across every "start test" click (the 3-repeat Windows capture has zero
+        // SET_CONFIGURATION / SET_INTERFACE between clicks).
+        let r1 = await engine.run(cfgPath: rk3588Fixture(), keepTransportOpen: true)
+        XCTAssertEqual(r1.outcome, .passed)
+        XCTAssertEqual(transport.openCount, 1, "run 1 should open exactly once")
+        XCTAssertEqual(transport.closeCount, 0, "run 1 should leave the handle open")
+        XCTAssertTrue(transport.isOpen)
+
+        // Run 2: device already booted → must NOT re-open (a re-open would reissue
+        // SET_CONFIGURATION, which stalls the running test firmware's bulk endpoint).
+        // Reuse the held handle and go straight to bulk.
+        let r2 = await engine.run(cfgPath: rk3588Fixture(), skipBoot: true, keepTransportOpen: true)
+        XCTAssertEqual(r2.outcome, .passed)
+        XCTAssertEqual(transport.openCount, 1, "run 2 must not re-open the already-open transport")
+        XCTAssertEqual(transport.closeCount, 0)
+        XCTAssertTrue(transport.isOpen)
+
+        // Run 3: final run (keepTransportOpen defaults to false) → closes the handle.
+        let r3 = await engine.run(cfgPath: rk3588Fixture(), skipBoot: true)
+        XCTAssertEqual(r3.outcome, .passed)
+        XCTAssertEqual(transport.openCount, 1, "run 3 must not re-open")
+        XCTAssertEqual(transport.closeCount, 1, "run 3 should close the handle")
+        XCTAssertFalse(transport.isOpen)
+    }
+
+    func testKeepTransportOpenKeepsHandleOnFailure() async {
+        let devices = [
+            UsbDevice(deviceID: "A", vendorID: 0x2207, productID: 0x0001, productName: "RK-A", serialNumber: nil),
+        ]
+        // A test-item failure (e.g. DDR result != 0) leaves the USB pipe healthy —
+        // the device is still booted and its bulk endpoint still alive. With
+        // keepTransportOpen the engine must NOT close the handle on failure, so the
+        // next "start test" reuses the same claimed interface (skip boot + bulk)
+        // instead of reopening (SET_CONFIGURATION) and stalling. Mirrors Windows,
+        // which never closes its device handle between clicks.
+        let transport = MockUsbTransport(devices: devices, failPhase: "downloadItem")
+        let engine = TestExecutionEngine(parser: CfgBinaryParser(), transport: transport)
+
+        let result = await engine.run(cfgPath: rk3588Fixture(), keepTransportOpen: true)
+
+        XCTAssertEqual(result.outcome, .failed)
+        XCTAssertTrue(transport.isOpen, "keepTransportOpen should hold the handle even on failure")
+        XCTAssertEqual(transport.closeCount, 0)
+    }
+
     private func rk3588Fixture() -> String {
         let repoRoot = URL(fileURLWithPath: #file)
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
@@ -114,7 +190,10 @@ private final class MockUsbTransport: UsbTransport {
     /// When true, `testDeviceReady` reports `.error` (status word 1) forever.
     let reportError: Bool
     var calledPhases: [String] = []
+    private(set) var openCount = 0
+    private(set) var closeCount = 0
     private var opened = false
+    var isOpen: Bool { opened }
     private var readyCallCount = 0
 
     init(devices: [UsbDevice], failPhase: String? = nil, failRunResult: Bool = false,
@@ -132,6 +211,7 @@ private final class MockUsbTransport: UsbTransport {
 
     func open(device: UsbDevice) throws {
         opened = true
+        openCount += 1
     }
 
     func downloadBoot(item: CfgItem, payload: Data) throws {
@@ -171,6 +251,7 @@ private final class MockUsbTransport: UsbTransport {
 
     func close() throws {
         opened = false
+        closeCount += 1
     }
 
     private func phase(_ name: String) throws {

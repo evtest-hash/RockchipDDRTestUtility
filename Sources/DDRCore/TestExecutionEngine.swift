@@ -9,7 +9,7 @@ public actor TestExecutionEngine {
         static let connect = "connect"
     }
 
-    private let defaultBootSettleDelayMs: UInt64 = 800
+    private let defaultBootSettleDelayMs: UInt64 = 1000
     private let statusPollDelayMs: UInt64 = 200
 
     private let parser: CfgBinaryParser
@@ -22,11 +22,15 @@ public actor TestExecutionEngine {
         self.logHandler = logHandler
     }
 
-    public func run(cfgPath: String, selectedDeviceID: String? = nil) async -> ExecutionResult {
+    public func run(cfgPath: String, selectedDeviceID: String? = nil, skipBoot: Bool = false, keepTransportOpen: Bool = false) async -> ExecutionResult {
         let startedAt = Date()
         var logs: [ExecutionLogEntry] = []
         var state: ExecutionState = .idle
         var selectedDevice: UsbDevice?
+        /// Set true only after a real boot download succeeds this run; surfaced
+        /// via ExecutionResult so the caller can clear its "needs boot" latch.
+        /// Mirrors DDR_UserTool `this+0x4B8`, cleared solely after a good boot.
+        var bootSucceeded = false
 
         func append(_ level: LogLevel, _ code: String, _ message: String, itemName: String? = nil) {
             let entry = ExecutionLogEntry(level: level, code: code, message: message, itemName: itemName)
@@ -37,7 +41,14 @@ public actor TestExecutionEngine {
         func fail(_ code: String, _ message: String, device: UsbDevice?, itemName: String? = nil) -> ExecutionResult {
             state = .failed
             append(.error, code, message, itemName: itemName)
-            try? transport.close()
+            // Hold the handle on failure too when keepTransportOpen is set: a
+            // DDR-result failure leaves the pipe healthy, so the next run should
+            // reuse it (Windows never closes its handle). A genuine USB error
+            // leaves a dead handle, but that self-heals when the caller tears the
+            // transport down on device change.
+            if !keepTransportOpen {
+                try? transport.close()
+            }
             return ExecutionResult(
                 outcome: .failed,
                 state: state,
@@ -70,26 +81,46 @@ public actor TestExecutionEngine {
             }
 
             append(.info, "INFO_DEVICE", "Using device \(selectedDevice.productName)")
-            try transport.open(device: selectedDevice)
+            // Only open (which reissues SET_CONFIGURATION + claim) when a handle
+            // isn't already held open — mirroring Windows, which opens its device
+            // handle once and reuses it for every "start test" click. Re-opening
+            // after the device is booted reconfigures the pipe, which the running
+            // test firmware can't service → the first bulk OUT stalls
+            // (LIBUSB_ERROR_TIMEOUT). See keepTransportOpen / UsbTransport.isOpen.
+            if !transport.isOpen {
+                try transport.open(device: selectedDevice)
+            }
 
             guard !plan.items.isEmpty else {
                 throw DDRToolError.parseFailure("No test items found in cfg")
             }
 
             // ── Stage 1: Boot ──
+            // `skipBoot` mirrors DDR_UserTool's `this+0x4B8` flag: the caller
+            // sets it once the current device connection has already been booted,
+            // so repeated "start test" runs skip the control-transfer boot and go
+            // straight to bulk test items. The flag is cleared by the caller only
+            // after a real boot succeeds (see ExecutionResult.bootSucceeded),
+            // matching Windows which clears 0x4B8 solely after a good boot.
             let bootItem = plan.items.first { $0.name.caseInsensitiveCompare(ItemName.boot) == .orderedSame }
             if let bootItem {
-                let bootPayload = plan.embeddedBins[bootItem.name] ?? Data()
-                state = .downloading
-                append(.info, "INFO_DOWNLOADBOOT_START", "Start to download boot...")
-                do {
-                    try transport.downloadBoot(item: bootItem, payload: bootPayload)
-                    append(.info, "INFO_DOWNLOADBOOT_OK", "Download boot ok")
-                } catch {
-                    return fail("ERROR_DOWNLOADBOOT_FAIL", "Download boot failed: \(error.localizedDescription)", device: selectedDevice)
-                }
+                if skipBoot {
+                    append(.info, "INFO_DOWNLOADBOOT_START", "Skip boot: device already booted")
+                    append(.info, "INFO_DOWNLOADBOOT_OK", "Boot skipped (device already booted)")
+                } else {
+                    let bootPayload = plan.embeddedBins[bootItem.name] ?? Data()
+                    state = .downloading
+                    append(.info, "INFO_DOWNLOADBOOT_START", "Start to download boot...")
+                    do {
+                        try transport.downloadBoot(item: bootItem, payload: bootPayload)
+                        append(.info, "INFO_DOWNLOADBOOT_OK", "Download boot ok")
+                        bootSucceeded = true
+                    } catch {
+                        return fail("ERROR_DOWNLOADBOOT_FAIL", "Download boot failed: \(error.localizedDescription)", device: selectedDevice)
+                    }
 
-                try await Task.sleep(nanoseconds: defaultBootSettleDelayMs * 1_000_000)
+                    try await Task.sleep(nanoseconds: defaultBootSettleDelayMs * 1_000_000)
+                }
             }
 
             // ── Stage 2+: Test items (forceinit, connect, ...) ──
@@ -157,7 +188,12 @@ public actor TestExecutionEngine {
                 }
             }
 
-            try transport.close()
+            // Hold the handle open across runs when asked (keepTransportOpen), so a
+            // repeat "start test" reuses the same claimed interface instead of
+            // re-opening → no SET_CONFIGURATION between runs. Mirrors Windows.
+            if !keepTransportOpen {
+                try transport.close()
+            }
             state = .completed
             append(.info, "INFO_TESTDDR_OK", "Testing DDR Success.")
             return ExecutionResult(
@@ -166,7 +202,8 @@ public actor TestExecutionEngine {
                 selectedDevice: selectedDevice,
                 logs: logs,
                 startedAt: startedAt,
-                finishedAt: Date()
+                finishedAt: Date(),
+                bootSucceeded: bootSucceeded
             )
         } catch {
             return fail("ERROR", error.localizedDescription, device: selectedDevice)

@@ -42,8 +42,19 @@ public final class RkUsbTransportLibusb: UsbTransport {
     private var bulkOutEndpoint: UInt8 = 0x02
     private var bulkInEndpoint: UInt8 = 0x81
     private var openedDevice: UsbDevice?
+    public var isOpen: Bool { handle != nil }
     private var tokenSeed: UInt32 = 0x13572468
     private let debugEnabled = false
+
+    /// Serializes every device-command I/O on the handle. Required because the
+    /// idle keep-alive reader (MainViewModel.startKeepAlive) and the test engine
+    /// both drive this same libusb handle from different execution contexts. The
+    /// Rockchip protocol pairs each 32-byte command with a token-echoed ack, so
+    /// interleaving two operations would desync the response stream. Mirrors
+    /// DDR_UserTool's CRKUsbComm critical section (sub_403050), which serializes
+    /// its permanent printf-reader thread against the per-click test orchestrator
+    /// thread. Recursive because `open` calls `close` internally.
+    private let ioLock = NSRecursiveLock()
     private let bootChunkDelayUs: useconds_t = 60_000
     private let transferTimeoutMs: UInt32 = RkUsbTransportLibusb.timeoutMs
 
@@ -121,6 +132,7 @@ public final class RkUsbTransportLibusb: UsbTransport {
     }
 
     public func open(device: UsbDevice) throws {
+        ioLock.lock(); defer { ioLock.unlock() }
         try ensureContext()
         try close()
 
@@ -197,6 +209,7 @@ public final class RkUsbTransportLibusb: UsbTransport {
     }
 
     public func downloadBoot(item: CfgItem, payload: Data) throws {
+        ioLock.lock(); defer { ioLock.unlock() }
         try ensureOpened()
         guard payload.count > 0 else {
             throw DDRToolError.transportError("Boot payload is empty")
@@ -235,6 +248,7 @@ public final class RkUsbTransportLibusb: UsbTransport {
     }
 
     public func downloadItem(item: CfgItem, payload: Data, address: UInt32) throws {
+        ioLock.lock(); defer { ioLock.unlock() }
         try ensureOpened()
         guard payload.count > 0 else {
             throw DDRToolError.transportError("Payload is empty for \(item.name)")
@@ -265,6 +279,7 @@ public final class RkUsbTransportLibusb: UsbTransport {
     }
 
     public func downloadParam(item: CfgItem, address: UInt32?, params: [CfgParameter]) throws {
+        ioLock.lock(); defer { ioLock.unlock() }
         try ensureOpened()
         let payload = makeParameterPayload(params: params)
         let targetAddress = address ?? Self.fallbackParameterAddress
@@ -286,6 +301,7 @@ public final class RkUsbTransportLibusb: UsbTransport {
     }
 
     public func runItem(item: CfgItem, address: UInt32) throws {
+        ioLock.lock(); defer { ioLock.unlock() }
         try ensureOpened()
 
         // RKU_RunMemory (opcode 3): hand control to the downloaded test code.
@@ -308,6 +324,7 @@ public final class RkUsbTransportLibusb: UsbTransport {
     }
 
     public func testDeviceReady() throws -> DeviceReadyStatus {
+        ioLock.lock(); defer { ioLock.unlock() }
         try ensureOpened()
 
         // RKU_TestDeviceReady (opcode 0). The 16-byte response:
@@ -339,17 +356,10 @@ public final class RkUsbTransportLibusb: UsbTransport {
     }
 
     public func readPrintf() throws -> String? {
+        ioLock.lock(); defer { ioLock.unlock() }
         try ensureOpened()
 
-        let poll = makeCommand(
-            opcode: Self.pollOpcode,
-            address: 0,
-            length: Self.pollReadLength,
-            token: 0
-        )
-        try bulkWrite(poll)
-
-        guard let data = try bulkRead(requiredBytes: nil, timeoutMs: 100) else {
+        guard let data = try sendPrintfPoll(timeoutMs: 100) else {
             return nil
         }
         guard !data.isEmpty else {
@@ -395,7 +405,36 @@ public final class RkUsbTransportLibusb: UsbTransport {
         return trimmed.map { String(format: "%02x", $0) }.joined(separator: " ")
     }
 
+    /// Lightweight liveness probe used by the idle keep-alive reader. Returns
+    /// whether the device answered the printf poll within the window: `bulkRead`
+    /// yields nil on timeout, so a non-nil result (even an empty/short packet)
+    /// means alive; nil means gone/unreachable. The 400ms window accommodates
+    /// the device's ~150–260ms idle response latency — a shorter timeout
+    /// false-negatives a healthy idle device. The periodic transfer also keeps
+    /// the USB pipe active, preventing macOS idle suspend.
+    public func probeAlive() -> Bool {
+        ioLock.lock(); defer { ioLock.unlock() }
+        guard handle != nil else { return false }
+        let data = try? sendPrintfPoll(timeoutMs: 400)
+        return data != nil
+    }
+
+    /// Send the opcode-0x80 (RKU_ReadPrintf) poll and return the raw response
+    /// (nil on timeout). Shared by `readPrintf` (decodes the bytes) and
+    /// `probeAlive` (liveness). Caller must hold `ioLock`.
+    private func sendPrintfPoll(timeoutMs: UInt32) throws -> Data? {
+        let poll = makeCommand(
+            opcode: Self.pollOpcode,
+            address: 0,
+            length: Self.pollReadLength,
+            token: 0
+        )
+        try bulkWrite(poll)
+        return try bulkRead(requiredBytes: nil, timeoutMs: timeoutMs)
+    }
+
     public func close() throws {
+        ioLock.lock(); defer { ioLock.unlock() }
         if let handle {
             if interfaceClaimed, claimedInterface >= 0 {
                 _ = libusb_release_interface(handle, claimedInterface)
@@ -407,19 +446,6 @@ public final class RkUsbTransportLibusb: UsbTransport {
         claimedInterface = -1
         claimedAltSetting = 0
         interfaceClaimed = false
-    }
-
-    public func reset(device: UsbDevice) throws {
-        try open(device: device)
-        guard let handle else {
-            throw DDRToolError.transportError("USB handle missing")
-        }
-        let rc = libusb_reset_device(handle)
-        // After reset, the handle may be invalidated — always close and clear state.
-        try close()
-        if rc != 0 {
-            throw makeUSBError("libusb_reset_device failed", code: rc)
-        }
     }
 
     // MARK: - Core USB helpers

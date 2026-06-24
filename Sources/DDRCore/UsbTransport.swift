@@ -1,6 +1,12 @@
 import Foundation
 
 public protocol UsbTransport {
+    /// True while a device handle is held open. Used by the engine to decide
+    /// whether `run()` needs to open the device (which reissues
+    /// SET_CONFIGURATION) or can reuse an already-open handle — mirroring
+    /// Windows, which opens its device handle once and holds it across every
+    /// "start test" click so repeated bulk tests never re-configure the pipe.
+    var isOpen: Bool { get }
     func discoverDevices() throws -> [UsbDevice]
     func open(device: UsbDevice) throws
     func downloadBoot(item: CfgItem, payload: Data) throws

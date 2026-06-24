@@ -71,6 +71,31 @@ and never influences the verdict — Windows reads printf in a separate thread
 for the same purpose. Each stage (boot → forceinit → connect) must pass before
 the next begins.
 
+### Repeat Testing
+
+The tool mirrors Windows DDR_UserTool so "start test" can be clicked repeatedly
+without re-plugging. Two mechanisms (both required, hardware-verified on RK3568):
+
+1. **Boot-skip latch** — `MainViewModel.deviceNeedsBoot` (the `this+0x4B8`
+   equivalent), set on any device-set change in `pollDevices`, cleared only after
+   a real boot succeeds. Passed as `skipBoot` to `engine.run`; when true the
+   engine emits the boot log codes but skips the control-transfer download.
+   `ExecutionResult.bootSucceeded` reports whether a real boot ran.
+2. **Persistent transport** — the USB handle must stay claimed across clicks.
+   `UsbTransport.isOpen` + `engine.run(..., keepTransportOpen:)`: the engine
+   opens only when `!isOpen` and closes only when `!keepTransportOpen`.
+   `MainViewModel.activeTransport` (bound to the selected device) is held open
+   via `keepTransportOpen: true` and torn down on device-set change. **Why:**
+   re-opening re-issues `libusb_set_configuration(1)`, which the already-booted
+   test firmware can't service → the first bulk OUT stalls
+   (`LIBUSB_ERROR_TIMEOUT`). Windows holds its device handle open across every
+   click (its 3-repeat capture has zero control transfers between clicks).
+   The CLI `--repeat N` mode exercises this path (boot once, then skip-boot +
+   reuse the handle for runs 2..N).
+
+Re-booting an already-booted device fails (`expected 512 got -1`), so run 1 of a
+fresh connection needs a real bootrom (physical replug after the prior session).
+
 ### USB Protocol
 
 `RkUsbTransportLibusb` implements Rockchip's proprietary USB protocol:
