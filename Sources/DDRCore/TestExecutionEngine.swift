@@ -120,6 +120,19 @@ public actor TestExecutionEngine {
                     }
 
                     try await Task.sleep(nanoseconds: defaultBootSettleDelayMs * 1_000_000)
+
+                    // Post-boot handshake: send a single opcode-0 poll to verify
+                    // the booted firmware is responding to US (not another process).
+                    // `testDeviceReady()` validates the token echo, so a mismatch
+                    // or timeout here catches contention before we invest in bulk
+                    // payload downloads (downloadItem can be 64KiB+).
+                    do {
+                        _ = try transport.testDeviceReady()
+                    } catch {
+                        return fail("ERROR_DOWNLOADBOOT_FAIL",
+                            "Boot handshake failed: \(error.localizedDescription)",
+                            device: selectedDevice)
+                    }
                 }
             }
 
@@ -147,7 +160,7 @@ public actor TestExecutionEngine {
                 if shouldDownloadParam(for: item) {
                     append(.info, "INFO_DOWNLOADITEMPARAM_START", "Start to download parameter of \(item.name)", itemName: item.name)
                     do {
-                        try transport.downloadParam(item: item, address: plan.address, params: plan.params)
+                        try transport.downloadParam(item: item, address: item.paramAddress ?? plan.address, params: item.params)
                     } catch {
                         return fail("ERROR_DOWNLOADITEMPARAM_FAIL", "Download parameter failed: \(error.localizedDescription)", device: selectedDevice, itemName: item.name)
                     }
@@ -212,8 +225,12 @@ public actor TestExecutionEngine {
 
     // MARK: - Private
 
+    /// Returns `true` when `item` carries a non-empty parameter block — matching
+    /// Windows DDR_UserTool's per-item param guard (`sub_460E30` + `sub_40B260`),
+    /// which checks whether this specific item has associated parameters to
+    /// download, rather than hardcoding a particular item name.
     private func shouldDownloadParam(for item: CfgItem) -> Bool {
-        item.name.caseInsensitiveCompare(ItemName.forceinit) == .orderedSame
+        !item.params.isEmpty
     }
 
     /// Per-item completion verdict, derived from `RKU_TestDeviceReady`.

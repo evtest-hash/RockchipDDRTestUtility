@@ -215,15 +215,29 @@ public final class RkUsbTransportLibusb: UsbTransport {
             throw DDRToolError.transportError("Boot payload is empty")
         }
 
-        // CRC is embedded first (already present in the cfg payload, verified by
-        // bootPayloadWithCRC), then the whole blob is RC4-encrypted on SoCs that
-        // are not in CLOSE_RC4_LIST — matching Windows' order in sub_40A3C0
-        // (`if (a4) sub_4015C0(v17, v15)` applied to the full buffer post-CRC).
-        var bootPayload = bootPayloadWithCRC(payload)
+        // Boot format, verified byte-for-byte against a captured Windows run on
+        // RK3288 (RC4 SoC): the captured control transfer's 4096-byte body and
+        // trailing 2-byte CRC both matched this exact construction.
+        //   1. zero-pad the loader to a multiple of 2048 bytes
+        //   2. RC4-encrypt the whole padded buffer (unless the SoC PID is in
+        //      CLOSE_RC4_LIST)
+        //   3. append a 2-byte big-endian CRC16-CCITT of the result
+        //   4. send in 4096-byte vendor control chunks (request 0x0C, index
+        //      0x0471); the CRC forms a trailing 2-byte chunk.
+        // Mirrors Windows sub_40A3C0 (pad + RC4) then sub_40A910 (append CRC,
+        // chunk into 4096-byte DeviceIoControl transfers).
+        var bootPayload = payload
+        let paddedLen = ((bootPayload.count + 0x7FF) / 0x800) * 0x800
+        if paddedLen > bootPayload.count {
+            bootPayload.append(Data(repeating: 0, count: paddedLen - bootPayload.count))
+        }
         let useRC4 = shouldRC4BootForCurrentDevice
         if useRC4 {
             bootPayload = RC4.cipher(key: RC4.rockchipKey, data: bootPayload)
         }
+        let crc = crcCCITT(bootPayload)
+        bootPayload.append(UInt8((crc >> 8) & 0xFF))
+        bootPayload.append(UInt8(crc & 0xFF))
         debug("downloadBoot bytes=\(bootPayload.count) rc4=\(useRC4)")
 
         var offset = 0
@@ -815,25 +829,6 @@ public final class RkUsbTransportLibusb: UsbTransport {
             end -= 1
         }
         return data.prefix(end)
-    }
-
-    private func bootPayloadWithCRC(_ payload: Data) -> Data {
-        guard payload.count >= 2 else {
-            return payload
-        }
-
-        let body = payload.dropLast(2)
-        let expectedCRC = UInt16(payload[payload.count - 2]) << 8 | UInt16(payload[payload.count - 1])
-        let actualCRC = crcCCITT(Data(body))
-        if expectedCRC == actualCRC {
-            return payload
-        }
-
-        // Embed CRC in the last 2 bytes (MASKROM expects fixed payload size)
-        var withCRC = payload
-        withCRC[withCRC.count - 2] = UInt8((actualCRC >> 8) & 0xFF)
-        withCRC[withCRC.count - 1] = UInt8(actualCRC & 0xFF)
-        return withCRC
     }
 
     private func crcCCITT(_ data: Data) -> UInt16 {

@@ -152,49 +152,65 @@ public struct CfgItem: Hashable, Sendable {
     public let nameOffset: Int
     public let payloadOffset: Int
     public let payloadLength: Int
+    /// Per-item `[ADDRESS]` value from the item's embedded INI section.
+    /// `nil` when this item has no parameter block.
+    public let paramAddress: UInt32?
+    /// Parameters belonging to this item; empty when the item has none.
+    public let params: [CfgParameter]
 
-    public init(name: String, pathHint: String?, nameOffset: Int, payloadOffset: Int, payloadLength: Int) {
+    public init(name: String, pathHint: String? = nil, nameOffset: Int = 0,
+                payloadOffset: Int, payloadLength: Int,
+                paramAddress: UInt32? = nil, params: [CfgParameter] = []) {
         self.name = name
         self.pathHint = pathHint
         self.nameOffset = nameOffset
         self.payloadOffset = payloadOffset
         self.payloadLength = payloadLength
+        self.paramAddress = paramAddress
+        self.params = params
     }
 }
 
 public struct CfgTestPlan: Sendable {
     public let sourcePath: String
+    /// First `[ADDRESS]` value from the cfg. Used as the fallback parameter-write
+    /// address when an item has no per-item `paramAddress` of its own.
     public let address: UInt32?
     public let downloadBaseAddress: UInt32
     public let items: [CfgItem]
-    public let params: [CfgParameter]
     public let embeddedBins: [String: Data]
 
-    public init(sourcePath: String, address: UInt32?, downloadBaseAddress: UInt32 = 0xFF00_4000, items: [CfgItem], params: [CfgParameter], embeddedBins: [String: Data]) {
+    public init(sourcePath: String, address: UInt32?, downloadBaseAddress: UInt32 = 0xFF00_4000,
+                items: [CfgItem], embeddedBins: [String: Data]) {
         self.sourcePath = sourcePath
         self.address = address
         self.downloadBaseAddress = downloadBaseAddress
         self.items = items
-        self.params = params
         self.embeddedBins = embeddedBins
     }
 }
 
 /// Maps Rockchip USB PID (VID 0x2207) to TestFiles directory name.
-/// Source: rockchip-flash-tool chip_db.py + TestFiles/ directory names.
+/// Source: linux-usb.org usb.ids (authoritative Rockchip maskrom PIDs, up to
+/// RK3399) + rockchip-flash-tool chip_db.py (modern SoCs) + TestFiles/ dir names.
 public enum RockchipPidMap {
     public static let pidToSoc: [UInt16: String] = [
-        // From rockchip-flash-tool chip_db.py
+        // From linux-usb.org usb.ids — authoritative maskrom PIDs.
+        0x290A: "RK29",
+        0x292A: "RK2926&RK2928",   // usb.ids: "RK2928"
+        0x292C: "RK3026&3028A",    // usb.ids: "RK3026"
         0x300A: "RK3066_RK3066A",
+        0x300B: "RK3168",          // usb.ids: "RK3168"
         0x301A: "RK3036",
         0x310B: "RK3188",
-        0x310C: "RK3128",
+        0x310C: "RK3128",          // usb.ids: "RK3126/RK3128"
         0x310D: "RK3126&RK3126C",
         0x320A: "RK3288",
-        0x320B: "RK322X",
+        0x320B: "RK322X",          // usb.ids: "RK3228/RK3229"
         0x320C: "rk322xh&RK3328",
         0x330A: "RK3368",
         0x330C: "RK3399",
+        // Modern SoCs — not in usb.ids; from rockchip-flash-tool chip_db.py.
         0x330D: "RK3326 & PX30 & RK3326S & PX30S",
         0x350A: "RK3568&RK3566",
         0x350B: "RK3588",
@@ -202,9 +218,6 @@ public enum RockchipPidMap {
         0x350E: "RK3576",
         0x350F: "RK3506",
         0x110C: "RV1126",
-        // From rkdeveloptool RKScan.cpp (older SoCs, no exact TestFiles match)
-        0x300B: "RK3026&3028A",
-        0x300C: "RK3028",
         0x3308: "RK3308",
     ]
 }
