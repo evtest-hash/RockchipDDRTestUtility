@@ -119,12 +119,15 @@ struct ContentView: View {
                         }
                         .padding(16)
                     }
-                    .onChange(of: viewModel.testSteps.count) { _ in
-                        if let last = viewModel.testSteps.last {
-                            withAnimation {
-                                proxy.scrollTo(last.id, anchor: .bottom)
-                            }
-                        }
+                    // Auto-scroll on any new content: a new step or printf
+                    // appended to an existing step both bump totalMessageCount
+                    // (new steps are always created with a first message), so
+                    // one observer covers both. Snap-scroll, no animation —
+                    // printf streams every ~100ms and animating each chunk
+                    // thrashes the main thread.
+                    .onChange(of: viewModel.totalMessageCount) { _ in
+                        guard let last = viewModel.testSteps.last else { return }
+                        proxy.scrollTo(last.id, anchor: .bottom)
                     }
                 }
             }

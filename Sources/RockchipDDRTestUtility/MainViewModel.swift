@@ -11,6 +11,14 @@ final class MainViewModel: ObservableObject {
     @Published var isRunning = false
     @Published var statusMessage: String = ""
     @Published var testSteps: [TestStep] = []
+    /// Monotonic count of messages appended across all steps. Bumped at every
+    /// `messages.append` site, so it changes for both new steps (always created
+    /// with a first message) and printf appended to an existing step. The UI
+    /// observes this single O(1) value to auto-scroll — cheaper than recomputing
+    /// a reduce on every body evaluation, and it doesn't thrash the main thread
+    /// on the streaming printf path.
+    @Published var totalMessageCount = 0
+
     @Published var overallOutcome: TestOutcome?
     @Published var selectedSoc: String?
     @Published var autoTestEnabled = false
@@ -115,6 +123,7 @@ final class MainViewModel: ObservableObject {
 
         isRunning = true
         testSteps = []
+        totalMessageCount = 0
         overallOutcome = nil
         // The engine owns the transport while a test runs — stop the idle
         // keep-alive so the two never contend (the engine's own 200ms
@@ -276,6 +285,7 @@ final class MainViewModel: ObservableObject {
     private func appendStepMessage(_ name: String, _ message: String) {
         if let idx = testSteps.firstIndex(where: { $0.name == name }) {
             testSteps[idx].messages.append(message)
+            totalMessageCount += 1
         }
     }
 
@@ -313,6 +323,7 @@ final class MainViewModel: ObservableObject {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             guard !trimmed.isEmpty else { continue }
             testSteps[idx].messages.append(trimmed)
+            totalMessageCount += 1
         }
     }
 
@@ -321,6 +332,7 @@ final class MainViewModel: ObservableObject {
         if let idx = testSteps.lastIndex(where: { $0.state == .downloading || $0.state == .running }) {
             testSteps[idx].state = .failed
             testSteps[idx].messages.append(message)
+            totalMessageCount += 1
         }
     }
 
@@ -447,6 +459,7 @@ final class MainViewModel: ObservableObject {
                     deviceNeedsBoot = true
                     // Clear previous test results when new device detected
                     testSteps = []
+                    totalMessageCount = 0
                     overallOutcome = nil
                     lastResult = nil
                     statusMessage = ""
