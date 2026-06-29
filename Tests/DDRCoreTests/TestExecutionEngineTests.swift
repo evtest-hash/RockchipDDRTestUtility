@@ -170,6 +170,22 @@ final class TestExecutionEngineTests: XCTestCase {
         XCTAssertEqual(transport.closeCount, 0)
     }
 
+    func testBootSuccessSurvivesLaterFailure() async {
+        let devices = [
+            UsbDevice(deviceID: "A", vendorID: 0x2207, productID: 0x0001, productName: "RK-A", serialNumber: nil),
+        ]
+        // Mirrors the GUI repro: the control-transfer boot succeeds, then a later
+        // bulk stage fails. The caller must still learn that the device is now
+        // booted so the next click can skip boot and reuse the held handle.
+        let transport = MockUsbTransport(devices: devices, failPhase: "downloadItem")
+        let engine = TestExecutionEngine(parser: CfgBinaryParser(), transport: transport)
+
+        let result = await engine.run(cfgPath: rk3588Fixture(), keepTransportOpen: true)
+
+        XCTAssertEqual(result.outcome, .failed)
+        XCTAssertTrue(result.bootSucceeded, "post-boot failures must preserve the boot-succeeded latch")
+    }
+
     private func rk3588Fixture() -> String {
         let repoRoot = URL(fileURLWithPath: #file)
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()

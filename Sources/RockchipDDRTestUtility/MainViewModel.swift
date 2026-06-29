@@ -143,16 +143,18 @@ final class MainViewModel: ObservableObject {
                 activeTransport = try makeTransport()
                 activeTransportDeviceID = selectedDeviceID
             }
+            let skipBoot = !deviceNeedsBoot
             let engine = TestExecutionEngine(parser: parser, transport: activeTransport!) { [weak self] entry in
-                Task { @MainActor in
-                    self?.updateStepsFromLog(entry)
-                }
+                // Preserve engine log order in the UI. A detached Task per entry
+                // can reorder Boot / forceinit / connect updates under load.
+                guard let self else { return }
+                await self.handleExecutionLog(entry)
             }
 
             let result = await engine.run(
                 cfgPath: selected.absolutePath,
                 selectedDeviceID: selectedDeviceID,
-                skipBoot: !deviceNeedsBoot,
+                skipBoot: skipBoot,
                 keepTransportOpen: true
             )
             lastResult = result
@@ -160,7 +162,7 @@ final class MainViewModel: ObservableObject {
             // leaves it set so the next run retries (matches Windows, which
             // clears 0x4B8 solely after a good boot).
             if result.bootSucceeded {
-                deviceNeedsBoot = false
+                setDeviceNeedsBoot(false)
             }
 
             // If any step ended in failure, the overall outcome is failure
@@ -268,6 +270,10 @@ final class MainViewModel: ObservableObject {
         default:
             break
         }
+    }
+
+    private func handleExecutionLog(_ entry: ExecutionLogEntry) {
+        updateStepsFromLog(entry)
     }
 
     private func ensureStep(_ name: String) {
@@ -406,7 +412,7 @@ final class MainViewModel: ObservableObject {
     /// `pollDevices`' device-removal branch) so the two can't drift.
     private func resetConnectionState() {
         tearDownActiveTransport()
-        deviceNeedsBoot = true
+        setDeviceNeedsBoot(true)
         selectedDeviceID = nil
         hasRunAutoTestForCurrentDevice = false
         // Launch-suppression ("don't auto-test devices present at launch") ends
@@ -456,7 +462,7 @@ final class MainViewModel: ObservableObject {
                     // New device arrived → it needs boot. (The transport is
                     // already released — pollDevices only runs while none is
                     // held — so just arm the boot latch and select it.)
-                    deviceNeedsBoot = true
+                    setDeviceNeedsBoot(true)
                     // Clear previous test results when new device detected
                     testSteps = []
                     totalMessageCount = 0
@@ -499,5 +505,9 @@ final class MainViewModel: ObservableObject {
         } catch {
             // Silently ignore — device enumeration can fail transiently
         }
+    }
+
+    private func setDeviceNeedsBoot(_ newValue: Bool) {
+        deviceNeedsBoot = newValue
     }
 }

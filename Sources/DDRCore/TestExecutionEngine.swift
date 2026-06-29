@@ -1,7 +1,19 @@
 import Foundation
 
 public actor TestExecutionEngine {
-    public typealias LogHandler = (ExecutionLogEntry) -> Void
+    public typealias LogHandler = @Sendable (ExecutionLogEntry) async -> Void
+
+    private final class RunContext {
+        let startedAt: Date
+        var logs: [ExecutionLogEntry] = []
+        var state: ExecutionState = .idle
+        var selectedDevice: UsbDevice?
+        var bootSucceeded = false
+
+        init(startedAt: Date) {
+            self.startedAt = startedAt
+        }
+    }
 
     private enum ItemName {
         static let boot = "Boot"
@@ -23,45 +35,11 @@ public actor TestExecutionEngine {
     }
 
     public func run(cfgPath: String, selectedDeviceID: String? = nil, skipBoot: Bool = false, keepTransportOpen: Bool = false) async -> ExecutionResult {
-        let startedAt = Date()
-        var logs: [ExecutionLogEntry] = []
-        var state: ExecutionState = .idle
-        var selectedDevice: UsbDevice?
-        /// Set true only after a real boot download succeeds this run; surfaced
-        /// via ExecutionResult so the caller can clear its "needs boot" latch.
-        /// Mirrors DDR_UserTool `this+0x4B8`, cleared solely after a good boot.
-        var bootSucceeded = false
-
-        func append(_ level: LogLevel, _ code: String, _ message: String, itemName: String? = nil) {
-            let entry = ExecutionLogEntry(level: level, code: code, message: message, itemName: itemName)
-            logs.append(entry)
-            logHandler?(entry)
-        }
-
-        func fail(_ code: String, _ message: String, device: UsbDevice?, itemName: String? = nil) -> ExecutionResult {
-            state = .failed
-            append(.error, code, message, itemName: itemName)
-            // Hold the handle on failure too when keepTransportOpen is set: a
-            // DDR-result failure leaves the pipe healthy, so the next run should
-            // reuse it (Windows never closes its handle). A genuine USB error
-            // leaves a dead handle, but that self-heals when the caller tears the
-            // transport down on device change.
-            if !keepTransportOpen {
-                try? transport.close()
-            }
-            return ExecutionResult(
-                outcome: .failed,
-                state: state,
-                selectedDevice: device,
-                logs: logs,
-                startedAt: startedAt,
-                finishedAt: Date()
-            )
-        }
+        let context = RunContext(startedAt: Date())
 
         do {
-            state = .initializing
-            append(.info, "INFO_INIT", "Loading cfg: \(cfgPath)")
+            context.state = .initializing
+            await append(context, .info, "INFO_INIT", "Loading cfg: \(cfgPath)")
             let plan = try parser.parse(url: URL(fileURLWithPath: cfgPath))
 
             let devices = try transport.discoverDevices()
@@ -71,16 +49,16 @@ public actor TestExecutionEngine {
 
             if let selectedDeviceID,
                let matched = devices.first(where: { $0.deviceID == selectedDeviceID }) {
-                selectedDevice = matched
+                context.selectedDevice = matched
             } else {
-                selectedDevice = devices.first
+                context.selectedDevice = devices.first
             }
 
-            guard let selectedDevice else {
+            guard let selectedDevice = context.selectedDevice else {
                 throw DDRToolError.noDevice
             }
 
-            append(.info, "INFO_DEVICE", "Using device \(selectedDevice.productName)")
+            await append(context, .info, "INFO_DEVICE", "Using device \(selectedDevice.productName)")
             // Only open (which reissues SET_CONFIGURATION + claim) when a handle
             // isn't already held open — mirroring Windows, which opens its device
             // handle once and reuses it for every "start test" click. Re-opening
@@ -105,18 +83,24 @@ public actor TestExecutionEngine {
             let bootItem = plan.items.first { $0.name.caseInsensitiveCompare(ItemName.boot) == .orderedSame }
             if let bootItem {
                 if skipBoot {
-                    append(.info, "INFO_DOWNLOADBOOT_START", "Skip boot: device already booted")
-                    append(.info, "INFO_DOWNLOADBOOT_OK", "Boot skipped (device already booted)")
+                    await append(context, .info, "INFO_DOWNLOADBOOT_START", "Skip boot: device already booted")
+                    await append(context, .info, "INFO_DOWNLOADBOOT_OK", "Boot skipped (device already booted)")
                 } else {
                     let bootPayload = plan.embeddedBins[bootItem.name] ?? Data()
-                    state = .downloading
-                    append(.info, "INFO_DOWNLOADBOOT_START", "Start to download boot...")
+                    context.state = .downloading
+                    await append(context, .info, "INFO_DOWNLOADBOOT_START", "Start to download boot...")
                     do {
                         try transport.downloadBoot(item: bootItem, payload: bootPayload)
-                        append(.info, "INFO_DOWNLOADBOOT_OK", "Download boot ok")
-                        bootSucceeded = true
+                        await append(context, .info, "INFO_DOWNLOADBOOT_OK", "Download boot ok")
+                        context.bootSucceeded = true
                     } catch {
-                        return fail("ERROR_DOWNLOADBOOT_FAIL", "Download boot failed: \(error.localizedDescription)", device: selectedDevice)
+                        return await fail(
+                            context,
+                            "ERROR_DOWNLOADBOOT_FAIL",
+                            "Download boot failed: \(error.localizedDescription)",
+                            device: selectedDevice,
+                            keepTransportOpen: keepTransportOpen
+                        )
                     }
 
                     try await Task.sleep(nanoseconds: defaultBootSettleDelayMs * 1_000_000)
@@ -129,9 +113,13 @@ public actor TestExecutionEngine {
                     do {
                         _ = try transport.testDeviceReady()
                     } catch {
-                        return fail("ERROR_DOWNLOADBOOT_FAIL",
+                        return await fail(
+                            context,
+                            "ERROR_DOWNLOADBOOT_FAIL",
                             "Boot handshake failed: \(error.localizedDescription)",
-                            device: selectedDevice)
+                            device: selectedDevice,
+                            keepTransportOpen: keepTransportOpen
+                        )
                     }
                 }
             }
@@ -143,61 +131,96 @@ public actor TestExecutionEngine {
                 let payload = plan.embeddedBins[item.name] ?? Data()
 
                 // Download item — equivalent to RKU_WriteMemory
-                state = .downloading
-                append(.info, "INFO_DOWNLOADITEM_START", "Start to download test item \(item.name)...", itemName: item.name)
+                context.state = .downloading
+                await append(context, .info, "INFO_DOWNLOADITEM_START", "Start to download test item \(item.name)...", itemName: item.name)
                 do {
                     try transport.downloadItem(item: item, payload: payload, address: plan.downloadBaseAddress)
-                    append(.info, "INFO_DOWNLOADITEM_OK", "Download test item \(item.name) ok", itemName: item.name)
+                    await append(context, .info, "INFO_DOWNLOADITEM_OK", "Download test item \(item.name) ok", itemName: item.name)
                 } catch {
-                    return fail("ERROR_DOWNLOADITEM_FAIL", "Download test item \(item.name) failed: \(error.localizedDescription)", device: selectedDevice, itemName: item.name)
+                    return await fail(
+                        context,
+                        "ERROR_DOWNLOADITEM_FAIL",
+                        "Download test item \(item.name) failed: \(error.localizedDescription)",
+                        device: selectedDevice,
+                        keepTransportOpen: keepTransportOpen,
+                        itemName: item.name
+                    )
                 }
 
                 if let preParamPrintf = try transport.readPrintf(), !preParamPrintf.isEmpty {
-                    append(.info, "INFO_PRINTF", preParamPrintf)
+                    await append(context, .info, "INFO_PRINTF", preParamPrintf)
                 }
 
                 // Download params — equivalent to RKU_WriteMemory
                 if shouldDownloadParam(for: item) {
-                    append(.info, "INFO_DOWNLOADITEMPARAM_START", "Start to download parameter of \(item.name)", itemName: item.name)
+                    await append(context, .info, "INFO_DOWNLOADITEMPARAM_START", "Start to download parameter of \(item.name)", itemName: item.name)
                     do {
                         try transport.downloadParam(item: item, address: item.paramAddress ?? plan.address, params: item.params)
                     } catch {
-                        return fail("ERROR_DOWNLOADITEMPARAM_FAIL", "Download parameter failed: \(error.localizedDescription)", device: selectedDevice, itemName: item.name)
+                        return await fail(
+                            context,
+                            "ERROR_DOWNLOADITEMPARAM_FAIL",
+                            "Download parameter failed: \(error.localizedDescription)",
+                            device: selectedDevice,
+                            keepTransportOpen: keepTransportOpen,
+                            itemName: item.name
+                        )
                     }
 
                     if let preRunPrintf = try transport.readPrintf(), !preRunPrintf.isEmpty {
-                        append(.info, "INFO_PRINTF", preRunPrintf)
+                        await append(context, .info, "INFO_PRINTF", preRunPrintf)
                     }
                 }
 
                 // Run item — equivalent to RKU_RunMemory (opcode 3)
-                state = .running
-                append(.info, "INFO_RUNITEM_START", "Start to run test item \(item.name)", itemName: item.name)
+                context.state = .running
+                await append(context, .info, "INFO_RUNITEM_START", "Start to run test item \(item.name)", itemName: item.name)
                 do {
                     try transport.runItem(item: item, address: plan.downloadBaseAddress)
                 } catch {
-                    return fail("ERROR_RUNITEM_FAIL", "Run test item \(item.name) failed: \(error.localizedDescription)", device: selectedDevice, itemName: item.name)
+                    return await fail(
+                        context,
+                        "ERROR_RUNITEM_FAIL",
+                        "Run test item \(item.name) failed: \(error.localizedDescription)",
+                        device: selectedDevice,
+                        keepTransportOpen: keepTransportOpen,
+                        itemName: item.name
+                    )
                 }
 
                 // Wait for the item to finish — equivalent to Windows' RKU_TestDeviceReady
                 // loop in sub_406420. Pass/fail is taken from the device's status/result
                 // words (testDeviceReady), NOT from printf text. Printf is drained via the
                 // callback purely so the UI shows live device output.
-                state = .collectingLog
+                context.state = .collectingLog
                 let completion: ItemCompletion
                 do {
                     completion = try await waitForItemCompletion(item: item) { printf in
-                        append(.info, "INFO_PRINTF", printf, itemName: item.name)
+                        await self.append(context, .info, "INFO_PRINTF", printf, itemName: item.name)
                     }
                 } catch {
-                    return fail("ERROR_RUNITEM_FAIL", "Polling test item \(item.name) failed: \(error.localizedDescription)", device: selectedDevice, itemName: item.name)
+                    return await fail(
+                        context,
+                        "ERROR_RUNITEM_FAIL",
+                        "Polling test item \(item.name) failed: \(error.localizedDescription)",
+                        device: selectedDevice,
+                        keepTransportOpen: keepTransportOpen,
+                        itemName: item.name
+                    )
                 }
 
                 switch completion {
                 case .passed:
-                    append(.info, "INFO_RUNITEM_OK", "Running test item \(item.name) ok", itemName: item.name)
+                    await append(context, .info, "INFO_RUNITEM_OK", "Running test item \(item.name) ok", itemName: item.name)
                 case .failed(let reason):
-                    return fail("ERROR_RUNITEM_FAIL", "Run test item \(item.name) failed: \(reason)", device: selectedDevice, itemName: item.name)
+                    return await fail(
+                        context,
+                        "ERROR_RUNITEM_FAIL",
+                        "Run test item \(item.name) failed: \(reason)",
+                        device: selectedDevice,
+                        keepTransportOpen: keepTransportOpen,
+                        itemName: item.name
+                    )
                 }
             }
 
@@ -207,23 +230,70 @@ public actor TestExecutionEngine {
             if !keepTransportOpen {
                 try transport.close()
             }
-            state = .completed
-            append(.info, "INFO_TESTDDR_OK", "Testing DDR Success.")
+            context.state = .completed
+            await append(context, .info, "INFO_TESTDDR_OK", "Testing DDR Success.")
             return ExecutionResult(
                 outcome: .passed,
-                state: state,
+                state: context.state,
                 selectedDevice: selectedDevice,
-                logs: logs,
-                startedAt: startedAt,
+                logs: context.logs,
+                startedAt: context.startedAt,
                 finishedAt: Date(),
-                bootSucceeded: bootSucceeded
+                bootSucceeded: context.bootSucceeded
             )
         } catch {
-            return fail("ERROR", error.localizedDescription, device: selectedDevice)
+            return await fail(
+                context,
+                "ERROR",
+                error.localizedDescription,
+                device: context.selectedDevice,
+                keepTransportOpen: keepTransportOpen
+            )
         }
     }
 
     // MARK: - Private
+
+    private func append(
+        _ context: RunContext,
+        _ level: LogLevel,
+        _ code: String,
+        _ message: String,
+        itemName: String? = nil
+    ) async {
+        let entry = ExecutionLogEntry(level: level, code: code, message: message, itemName: itemName)
+        context.logs.append(entry)
+        await logHandler?(entry)
+    }
+
+    private func fail(
+        _ context: RunContext,
+        _ code: String,
+        _ message: String,
+        device: UsbDevice?,
+        keepTransportOpen: Bool,
+        itemName: String? = nil
+    ) async -> ExecutionResult {
+        context.state = .failed
+        await append(context, .error, code, message, itemName: itemName)
+        // Hold the handle on failure too when keepTransportOpen is set: a
+        // DDR-result failure leaves the pipe healthy, so the next run should
+        // reuse it (Windows never closes its handle). A genuine USB error
+        // leaves a dead handle, but that self-heals when the caller tears the
+        // transport down on device change.
+        if !keepTransportOpen {
+            try? transport.close()
+        }
+        return ExecutionResult(
+            outcome: .failed,
+            state: context.state,
+            selectedDevice: device,
+            logs: context.logs,
+            startedAt: context.startedAt,
+            finishedAt: Date(),
+            bootSucceeded: context.bootSucceeded
+        )
+    }
 
     /// Returns `true` when `item` carries a non-empty parameter block — matching
     /// Windows DDR_UserTool's per-item param guard (`sub_460E30` + `sub_40B260`),
@@ -248,7 +318,7 @@ public actor TestExecutionEngine {
     /// by `testDeviceReady`'s USB transfer timeout rather than a poll counter.
     private func waitForItemCompletion(
         item: CfgItem,
-        onPrintf: (String) -> Void
+        onPrintf: @Sendable (String) async -> Void
     ) async throws -> ItemCompletion {
         while true {
             // Status first: the verdict never waits on printf (mirrors Windows,
@@ -262,7 +332,7 @@ public actor TestExecutionEngine {
                 // decide on the result code (word2) — exactly as Windows checks
                 // the result word after TestDeviceReady returns 'done'.
                 if let printf = try transport.readPrintf(), !printf.isEmpty {
-                    onPrintf(printf)
+                    await onPrintf(printf)
                 }
                 return status.resultCode == 0
                     ? .passed
@@ -271,7 +341,7 @@ public actor TestExecutionEngine {
                 // Display-only drain while the device works; never affects the
                 // verdict.
                 if let printf = try transport.readPrintf(), !printf.isEmpty {
-                    onPrintf(printf)
+                    await onPrintf(printf)
                 }
                 try await Task.sleep(nanoseconds: statusPollDelayMs * 1_000_000)
             }

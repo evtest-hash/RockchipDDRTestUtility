@@ -419,18 +419,24 @@ public final class RkUsbTransportLibusb: UsbTransport {
         return trimmed.map { String(format: "%02x", $0) }.joined(separator: " ")
     }
 
-    /// Lightweight liveness probe used by the idle keep-alive reader. Returns
-    /// whether the device answered the printf poll within the window: `bulkRead`
-    /// yields nil on timeout, so a non-nil result (even an empty/short packet)
-    /// means alive; nil means gone/unreachable. The 400ms window accommodates
-    /// the device's ~150–260ms idle response latency — a shorter timeout
-    /// false-negatives a healthy idle device. The periodic transfer also keeps
-    /// the USB pipe active, preventing macOS idle suspend.
+    /// Lightweight liveness probe used by the idle keep-alive reader.
+    ///
+    /// Prefer the Windows-like printf poll first (opcode 0x80), because that is
+    /// what naturally keeps the pipe active during idle. But some cfg flows leave
+    /// the resident firmware in a state where printf polling can time out while
+    /// the bulk command loop is still healthy; in that case, fall back to a
+    /// status poll (opcode 0x00). A response on either path means the device is
+    /// still alive and the current booted session must be preserved — otherwise
+    /// the GUI wrongly re-arms `deviceNeedsBoot` and attempts to boot again on
+    /// the next click, which fails on an already-booted device.
     public func probeAlive() -> Bool {
         ioLock.lock(); defer { ioLock.unlock() }
         guard handle != nil else { return false }
-        let data = try? sendPrintfPoll(timeoutMs: 400)
-        return data != nil
+        if let _ = try? sendPrintfPoll(timeoutMs: 400) {
+            return true
+        }
+        let status = try? sendStatusPoll(timeoutMs: 400)
+        return status != nil
     }
 
     /// Send the opcode-0x80 (RKU_ReadPrintf) poll and return the raw response
@@ -445,6 +451,35 @@ public final class RkUsbTransportLibusb: UsbTransport {
         )
         try bulkWrite(poll)
         return try bulkRead(requiredBytes: nil, timeoutMs: timeoutMs)
+    }
+
+    /// Send opcode-0 status poll and return the decoded result, or nil on
+    /// timeout. Shared by `probeAlive` as a fallback when printf polling is too
+    /// strict for the current post-test firmware state. Caller must hold
+    /// `ioLock`.
+    private func sendStatusPoll(timeoutMs: UInt32) throws -> DeviceReadyStatus? {
+        let token = nextToken()
+        let command = makeCommand(
+            opcode: Self.handshakeOpcode,
+            address: 0,
+            length: 0,
+            token: token
+        )
+        try bulkWrite(command)
+        guard let ack = try bulkRead(requiredBytes: 16, timeoutMs: timeoutMs, allowTimeout: true) else {
+            return nil
+        }
+        try validateAck(ack, expectedToken: token, stage: "probeAlive")
+
+        let statusWord = decodeUInt32LE(ack, at: 4)
+        let resultCode = decodeUInt32LE(ack, at: 8)
+        let phase: DeviceReadyStatus.Phase
+        switch statusWord {
+        case 1: phase = .error
+        case 2: phase = .running
+        default: phase = .finished
+        }
+        return DeviceReadyStatus(phase: phase, resultCode: resultCode)
     }
 
     public func close() throws {
@@ -679,7 +714,7 @@ public final class RkUsbTransportLibusb: UsbTransport {
         }
     }
 
-    private func bulkRead(requiredBytes: Int?, timeoutMs: UInt32) throws -> Data? {
+    private func bulkRead(requiredBytes: Int?, timeoutMs: UInt32, allowTimeout: Bool = false) throws -> Data? {
         guard let handle else {
             throw DDRToolError.transportError("USB handle missing")
         }
@@ -700,7 +735,7 @@ public final class RkUsbTransportLibusb: UsbTransport {
         }
 
         if rc == LIBUSB_ERROR_TIMEOUT.rawValue {
-            if requiredBytes == nil {
+            if allowTimeout || requiredBytes == nil {
                 return nil
             }
             throw makeUSBError("bulk IN timeout", code: rc)
