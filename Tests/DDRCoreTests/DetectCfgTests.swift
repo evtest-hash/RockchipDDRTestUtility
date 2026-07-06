@@ -49,4 +49,18 @@ final class DetectCfgTests: XCTestCase {
             XCTAssertGreaterThan(bin?.count ?? 0, 0, "empty/missing payload \(name)")
         }
     }
+
+    /// RK3576 detect cfg: same 4-payload packaging, item download base 0x3FF84000.
+    func testRK3576DetectCfgPackagesAllPayloads() throws {
+        let path = FileManager.default.currentDirectoryPath + "/DDRTestFiles/RK3576/DDR自动探测.cfg"
+        try XCTSkipUnless(FileManager.default.fileExists(atPath: path))
+        let plan = try CfgBinaryParser().parse(url: URL(fileURLWithPath: path))
+        XCTAssertEqual(plan.downloadBaseAddress, 0x3FF8_4000)
+        let names = plan.items.map { $0.name.lowercased() }
+        XCTAssertEqual(names.count, 4)
+        for name in ["Boot", "ddrbin", "osregdump", "reboot"] {
+            let bin = plan.embeddedBins.first { $0.key.caseInsensitiveCompare(name) == .orderedSame }?.value
+            XCTAssertGreaterThan(bin?.count ?? 0, 0, "empty/missing payload \(name)")
+        }
+    }
 }

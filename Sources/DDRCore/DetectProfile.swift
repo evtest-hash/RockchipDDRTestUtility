@@ -55,6 +55,23 @@ public enum DetectProfiles {
             maskromMagic: 0xEF08_A53C,
             cruResetReg: 0xFD7C_0C08,
             cruResetValue: 0x0000_FDB9),
+        // RK3576 — same AArch64 DDR Test Tool Boot as RK356x/RK3588. Addresses:
+        //   item base 0xFF... no — cfg @0x5B6 = 0x3FF84000; Boot links 0x3FF81000
+        //   → puts vector +4. PMU1_GRF_BASE 0x26026000, os_reg0 @+0x200 → 0x26026200
+        //   (U-Boot rk3576.c; RE-confirmed: DDR bin MOVK #0x2602 + STR os_reg2/3).
+        //   reset_misc writes BOOT_BROM_DOWNLOAD to os_reg0. TOP_CRU_BASE 0x27200000
+        //   + GLB_SRST_FST 0xC08 → 0x27200C08, value 0xFDB9.
+        //   NOTE: geometry decode + reboot pending real-hardware verification.
+        0x350E: DetectProfile(
+            soc: "RK3576",
+            detectCfgName: "DDR自动探测.cfg",
+            downloadBase: 0x3FF8_4000,
+            usbPutsVector: 0x3FF8_1004,
+            osRegBase: 0x2602_6200,
+            bootModeReg: 0x2602_6200,
+            maskromMagic: 0xEF08_A53C,
+            cruResetReg: 0x2720_0C08,
+            cruResetValue: 0x0000_FDB9),
     ]
     public static func forPID(_ pid: UInt16) -> DetectProfile? { all[pid] }
 }
