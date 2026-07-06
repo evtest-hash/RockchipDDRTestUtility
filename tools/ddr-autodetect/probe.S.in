@@ -1,0 +1,80 @@
+/*
+ * OS_REG probe template — DDR auto-detect, parameterized by profile.
+ *
+ * Assemble with: -DUSB_PUTS=<Boot's USB-ring puts vector> -DOSREG_BASE=<PMU_GRF OS_REG0>
+ * (the download base itself is implied: the item runs in place at the cfg's
+ * download-base address, entry at offset 0).
+ *
+ * Runs as a DDR Test Tool "test item": downloaded via bulk (opcode 0x02) to the
+ * cfg download base and entered via RunMemory (opcode 0x03). Runs IN PLACE (no
+ * self-relocation). Reads the 12 PMU_GRF OS_REG words the rkbin DDR bin
+ * populated during auto-detect and prints them so the host can read them back
+ * over the USB printf channel (opcode 0x80).
+ *
+ * IMPORTANT — two output channels (confirmed by RE of rk3568 Boot; see
+ * README.md). USB_PUTS MUST be the vector that feeds the RAM ring buffer the
+ * host's 0x80 reads back (NOT the UART-only puts/putc/hex vectors).
+ */
+    .text
+    .globl _start
+    .align 2
+_start:
+    stp     x29, x30, [sp, #-48]!
+    mov     x29, sp
+    str     x19, [sp, #16]              // callee-saved: our loop index
+                                        // [sp+24 .. sp+40] = hex string scratch
+
+    adr     x0, .Lbegin
+    bl      .Lputs
+
+    mov     w19, #0
+.Lloop:
+    movz    x9, #(OSREG_BASE & 0xFFFF)
+    movk    x9, #((OSREG_BASE >> 16) & 0xFFFF), lsl #16
+    add     x10, x9, x19, lsl #2
+    ldr     w0, [x10]                   // w0 = OS_REG[i]
+    add     x1, sp, #24                 // hex scratch buffer
+    bl      .Lhex8                      // format 8 hex chars + NUL at [sp+24]
+    add     x0, sp, #24
+    bl      .Lputs                      // puts(hex) via USB ring
+    adr     x0, .Lnl
+    bl      .Lputs
+    add     w19, w19, #1
+    cmp     w19, #12
+    b.lt    .Lloop
+
+    adr     x0, .Lend
+    bl      .Lputs
+
+    mov     w0, #0                      // result = 0 (pass)
+    ldr     x19, [sp, #16]
+    ldp     x29, x30, [sp], #48
+    ret
+
+/* puts(x0) via the USB-ring puts vector; tail-call (RETs to our caller). */
+.Lputs:
+    movz    x8, #(USB_PUTS & 0xFFFF)
+    movk    x8, #((USB_PUTS >> 16) & 0xFFFF), lsl #16
+    br      x8
+
+/* .Lhex8: write value w0 as 8 lowercase hex chars to [x1], then a NUL.
+   Leaf; clobbers w2,w4,w5,w6 and x1. Preserves x19. */
+.Lhex8:
+    mov     w4, #28                     // start at the most-significant nibble
+.Lhexloop:
+    lsr     w5, w0, w4
+    and     w5, w5, #0xF
+    cmp     w5, #10
+    add     w6, w5, #48                 // '0' + nib
+    add     w5, w5, #87                 // 'a' - 10 + nib
+    csel    w5, w5, w6, ge              // nib >= 10 -> letter, else digit
+    strb    w5, [x1], #1
+    subs    w4, w4, #4
+    b.ge    .Lhexloop
+    strb    wzr, [x1]                   // NUL terminate
+    ret
+
+    .align 3
+.Lbegin: .asciz "\nOSREG_BEGIN\n"
+.Lnl:    .asciz "\n"
+.Lend:   .asciz "OSREG_END\n"
