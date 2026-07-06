@@ -204,11 +204,12 @@ struct RockchipDDRTestUtilityCLI {
     ///      Test Tool Boot (0x471) + the probe item (bulk 0x02 / RunMemory 0x03).
     ///   ③ the probe reads OS_REG and prints it over the 0x80 printf channel.
     ///   ④ decode SYS_REG → geometry, shortlist the matching soldering-test cfg.
+    /// Thin CLI wrapper around `DdrDetector`: pick a device, discover the SoC's
+    /// candidate soldering-test cfgs, hand off to the detector for the full
+    /// probe → decode → rank → reboot-to-maskrom flow, then print the result.
+    /// All retry/orchestration logic now lives in `DdrDetector` (Task 4) — this
+    /// is the single call site, replacing the old inline spike.
     static func runDetect(args: CLIArguments) async throws {
-        let ddrBin = args.ddrBinPath ?? "../rkbin/bin/rk35/rk3568_ddr_1560MHz_v1.25.bin"
-        let detectCfg = args.detectCfgPath ?? "tools/ddr-autodetect/rk3568_osregdump.cfg"
-        let ddrBinData = try Data(contentsOf: URL(fileURLWithPath: ddrBin))
-
         let transport = try RkUsbTransportLibusb()
         let devices = try transport.discoverDevices()
         guard let device = chooseDevice(from: devices, selectedDeviceID: args.selectedDeviceID) else {
@@ -216,86 +217,30 @@ struct RockchipDDRTestUtilityCLI {
         }
         print("Device: \(device.productName) soc=\(device.socName ?? "?") pid=0x\(hex16(device.productID))")
 
-        // ① rkbin DDR bin via 0x471 (RC4 auto-decided by PID; RK3568 0x350A skips RC4)
-        try transport.open(device: device)
-        let ddrItem = CfgItem(name: "ddrbin", payloadOffset: 0, payloadLength: ddrBinData.count)
-        print("① download rkbin DDR bin \(ddrBinData.count)B via 0x471: \(ddrBin)")
-        try transport.downloadBoot(item: ddrItem, payload: ddrBinData)
-        try await Task.sleep(nanoseconds: 1_500_000_000)   // settle: auto-detect + OS_REG write
+        let root = CfgRepository.makeDefaultRootURL()
+        let socFiles = ((try? CfgRepository(rootURL: root).discoverTestFiles()) ?? [])
+            .filter { $0.socName == (device.socName ?? "") }
 
-        // ②③ run the probe cfg on the same open handle (engine won't re-open)
-        print("②③ run probe cfg: \(detectCfg)")
-        let engine = TestExecutionEngine(parser: CfgBinaryParser(), transport: transport) { entry in
-            print("[\(entry.level.rawValue)] \(entry.code) \(entry.message)")
-        }
-        let result = await engine.run(
-            cfgPath: detectCfg,
-            selectedDeviceID: device.deviceID,
-            skipBoot: false,
-            keepTransportOpen: true            // keep handle open to drain trailing printf
-        )
+        // resourcesDir holds both the detect cfg and the standalone reboot bin
+        // (tools/ddr-autodetect); rkbinDir holds the rkbin DDR bin, derived from
+        // --ddr-bin if given, else defaulting alongside the repo's rkbin checkout.
+        let resourcesDir = args.detectCfgPath.map { URL(fileURLWithPath: ($0 as NSString).deletingLastPathComponent) }
+            ?? URL(fileURLWithPath: "tools/ddr-autodetect")
+        let rkbinDir = args.ddrBinPath.map { URL(fileURLWithPath: ($0 as NSString).deletingLastPathComponent) }
+            ?? URL(fileURLWithPath: "../rkbin/bin/rk35")
 
-        // The probe returns in microseconds, so the engine's single end-of-item
-        // drain can race the probe's OS_REG output landing in Boot's printf
-        // buffer. The output is buffered, so poll the 0x80 channel a few more
-        // times after the run to collect whatever the engine's drain missed.
-        var drained = ""
-        var emptyStreak = 0
-        for _ in 0..<25 {
-            if let s = try? transport.readPrintf(), !s.isEmpty {
-                drained += "\n" + s
-                emptyStreak = 0
-            } else {
-                emptyStreak += 1
-                if emptyStreak >= 5 { break }
-            }
-            try? await Task.sleep(nanoseconds: 50_000_000)
-        }
-        var captured = result.logs.filter { $0.code == "INFO_PRINTF" }.map { $0.message }.joined(separator: "\n") + drained
-        var words = OsRegDecoder.parseProbeOutput(captured)
+        let detector = DdrDetector(resourcesDir: resourcesDir, rkbinDir: rkbinDir)
+        let out = try await detector.detect(transport: transport, device: device, socFiles: socFiles)
 
-        // The probe's printf races Boot's buffer flush/clear, so a single run can
-        // miss it. Re-run the osregdump item — the resident Boot is reused, so no
-        // maskrom reset is needed between retries — until the OS_REG block lands.
-        let plan = try CfgBinaryParser().parse(url: URL(fileURLWithPath: detectCfg))
-        let probeItem = plan.items.first { $0.name.caseInsensitiveCompare("osregdump") == .orderedSame }
-        let probePayload = plan.embeddedBins["osregdump"]
-        var tries = 0
-        while words == nil, tries < 20, let item = probeItem, let pay = probePayload {
-            tries += 1
-            do {
-                try transport.downloadItem(item: item, payload: pay, address: plan.downloadBaseAddress)
-                try transport.runItem(item: item, address: plan.downloadBaseAddress)
-            } catch { break }
-            for _ in 0..<12 {
-                if let s = try? transport.readPrintf(), !s.isEmpty { captured += "\n" + s }
-                try? await Task.sleep(nanoseconds: 40_000_000)
-            }
-            words = OsRegDecoder.parseProbeOutput(captured)
-        }
-        if tries > 0 { print("(OS_REG captured after \(tries) retr\(tries == 1 ? "y" : "ies"))") }
-        try? transport.close()
-
-        guard let words else {
-            fputs("No OSREG block after \(tries) retries. Raw printf:\n\(captured)\n", stderr)
-            Foundation.exit(2)
-        }
-
-        // ④ decode + shortlist
         print("\n=== OS_REG (raw) ===")
-        for (i, w) in words.enumerated() {
+        for (i, w) in out.rawOsReg.enumerated() {
             print(String(format: "  OS_REG%-2d = 0x%08X", i, w))
         }
-        let geo = OsRegDecoder.decode(words)
         print("\n=== Detected geometry (best-effort — validate vs board) ===")
-        print("  \(geo.summary())")
+        print("  \(out.geometry.summary())  rebootedToMaskrom: \(out.rebootedToMaskrom)")
 
-        let root = CfgRepository.makeDefaultRootURL()
-        let files = (try? CfgRepository(rootURL: root).discoverTestFiles()) ?? []
-        let socFiles = files.filter { $0.socName == (device.socName ?? "") }
-        let cands = CfgAutoSelect.rank(geometry: geo, socFiles: socFiles)
         print("\n=== Candidate soldering-test cfgs (\(device.socName ?? "?")), best first ===")
-        for c in cands.prefix(6) {
+        for c in out.candidates.prefix(6) {
             let t = c.dramType?.displayName ?? "?"
             let cs = c.csCount != 0 ? "\(c.csCount)CS" : "?CS"
             print(String(format: "  [score %3d] %@  (%@ %dMB %@)", c.score, c.entry.displayName, t, c.sizeMB, cs))
@@ -303,10 +248,10 @@ struct RockchipDDRTestUtilityCLI {
         // Auto-select only on a clear, unique winner (type+size+CS all matched and
         // strictly ahead of the runner-up). Otherwise shortlist for confirmation —
         // detect assists, it never silently runs the wrong cfg.
-        let lead = cands.count >= 2 ? cands[0].score - cands[1].score : (cands.first?.score ?? 0)
-        if let best = cands.first, best.score >= 250, lead >= 20 {
+        let lead = out.candidates.count >= 2 ? out.candidates[0].score - out.candidates[1].score : (out.candidates.first?.score ?? 0)
+        if let best = out.candidates.first, best.score >= 250, lead >= 20 {
             print("\nAuto-select: \(best.entry.relativePath)")
-        } else if let best = cands.first, best.score >= 150 {
+        } else if let best = out.candidates.first, best.score >= 150 {
             print("\nTop candidate: \(best.entry.relativePath)")
             print("Ambiguous (e.g. LPDDR4 vs LPDDR4X, or CS layout) — confirm from the list above.")
         } else {
