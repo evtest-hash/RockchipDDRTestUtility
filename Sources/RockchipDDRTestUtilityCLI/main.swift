@@ -236,26 +236,29 @@ struct RockchipDDRTestUtilityCLI {
         for (i, w) in out.rawOsReg.enumerated() {
             print(String(format: "  OS_REG%-2d = 0x%08X", i, w))
         }
-        print("\n=== Detected geometry (best-effort — validate vs board) ===")
+        print("\n=== Detected geometry ===")
         print("  \(out.geometry.summary())  rebootedToMaskrom: \(out.rebootedToMaskrom)")
 
-        print("\n=== Candidate soldering-test cfgs (\(device.socName ?? "?")), best first ===")
-        for c in out.candidates.prefix(6) {
-            let t = c.dramType?.displayName ?? "?"
-            let cs = c.csCount != 0 ? "\(c.csCount)CS" : "?CS"
-            print(String(format: "  [score %3d] %@  (%@ %dMB %@)", c.score, c.entry.displayName, t, c.sizeMB, cs))
-        }
-        // Auto-select only on a clear, unique winner (type+size+CS all matched and
-        // strictly ahead of the runner-up). Otherwise shortlist for confirmation —
-        // detect assists, it never silently runs the wrong cfg.
-        let lead = out.candidates.count >= 2 ? out.candidates[0].score - out.candidates[1].score : (out.candidates.first?.score ?? 0)
-        if let best = out.candidates.first, best.score >= 250, lead >= 20 {
-            print("\nAuto-select: \(best.entry.relativePath)")
-        } else if let best = out.candidates.first, best.score >= 150 {
-            print("\nTop candidate: \(best.entry.relativePath)")
-            print("Ambiguous (e.g. LPDDR4 vs LPDDR4X, or CS layout) — confirm from the list above.")
+        // Detection succeeds ONLY on an exact (type + capacity + CS) match. Empty
+        // ⇒ no cfg matches the geometry (config not in library, or DDR init failed
+        // and the geometry is garbage) ⇒ NOT a successful detection.
+        let cands = out.candidates
+        print("\n=== Exact-match soldering-test cfgs (\(device.socName ?? "?")) ===")
+        if cands.isEmpty {
+            print("  (none)\n\nDetection FAILED: no cfg exactly matches the detected geometry.")
+            print("DDR may be uninitialized/defective, or this config isn't in the library — select a cfg manually.")
         } else {
-            print("\nNo confident match — fall back to manual selection.")
+            for c in cands.prefix(6) {
+                let t = c.dramType?.displayName ?? "?"
+                print(String(format: "  %@  (%@ %dMB %dCS)%@", c.entry.displayName, t, c.sizeMB, c.csCount,
+                             c.score == 2 ? " [exact type]" : " [LP4/LP4X family]"))
+            }
+            if cands.count == 1 {
+                print("\nAuto-select: \(cands[0].entry.relativePath)")
+            } else {
+                print("\nTop: \(cands[0].entry.relativePath)")
+                print("Multiple cfgs share this geometry (LPDDR4 vs LPDDR4X — SYS_REG can't distinguish) — confirm from the list.")
+            }
         }
     }
 

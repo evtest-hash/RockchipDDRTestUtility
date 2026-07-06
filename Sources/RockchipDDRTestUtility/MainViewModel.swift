@@ -611,32 +611,34 @@ final class MainViewModel: ObservableObject {
             let transport = try makeTransport()
             let det = DdrDetector(resourcesDir: detectResourcesDir(), rkbinDir: rkbinDir())
             let out = try await det.detect(transport: transport, device: device, socFiles: filesForSelectedSoc)
+            // Detection succeeds ONLY on an exact (type + capacity + CS) match.
+            // `out.candidates` is already the exact-match set (empty ⇒ no match).
             let matched = applyDetectCandidates(out.candidates) != nil
-            Self.dlog("detect ok: \(out.geometry.summary()) rebootedToMaskrom=\(out.rebootedToMaskrom) matched=\(matched) selected=\(selectedFileID ?? "nil")")
-            if !matched {
-                selectedFileID = filesForSelectedSoc.first?.id
-            }
-            // Re-arm the boot latch on every outcome here: whether or not the
-            // device is actually back in MASKROM, the *next* boot attempt must
-            // not be skipped — either it's a real boot onto a device that just
-            // reached MASKROM (rebootedToMaskrom == true), or the user is about
-            // to replug and needs a real boot on the fresh connection anyway.
+            Self.dlog("detect done: \(out.geometry.summary()) rebooted=\(out.rebootedToMaskrom) matches=\(out.candidates.count) selected=\(selectedFileID ?? "nil")")
+            // The next boot must always run (never skip-boot after a probe/reboot).
             setDeviceNeedsBoot(true)
-            if out.rebootedToMaskrom {
-                statusMessage = matched
-                    ? "检测到 \(out.geometry.summary()) — 已预选 cfg"
-                    : "检测到 \(out.geometry.summary()),但无匹配 cfg — 请手动选择"
-                // TODO(hw联调): reboot-to-maskrom re-enumerates the device over
-                // USB, which may assign it a new deviceID on some hosts/hubs —
-                // needs real RK3568 hardware to characterize. maybeAutoTest()
-                // (and the startTest() it schedules) still use the
-                // `selectedDeviceID` captured before this probe ran; if the ID
-                // changed, that boot attempt targets a now-stale device path.
-                Self.dlog("rebooted to MASKROM; autoTestEnabled=\(autoTestEnabled) → maybeAutoTest()")
-                maybeAutoTest()
+
+            if !matched {
+                // No cfg exactly matches — DDR uninitialized/defective, or config
+                // not in the library. Do NOT auto-test; require manual selection.
+                selectedFileID = filesForSelectedSoc.first?.id
+                statusMessage = "DDR 探测未匹配到 cfg(\(out.geometry.summary()))— 可能未初始化/坏板,或不在库中,请手动选择"
+                Self.dlog("no exact match → manual selection, no auto-test")
+            } else if !out.rebootedToMaskrom {
+                // Matched, but the device isn't back in MASKROM → the next boot
+                // would fail; require a replug before testing.
+                statusMessage = "检测到 \(out.geometry.summary())(已预选 cfg),但设备未回到 MASKROM,请重新插拔后再测"
+                Self.dlog("matched but not rebooted → skip auto-test; user must replug")
             } else {
-                statusMessage = "检测到 \(out.geometry.summary()),但设备未回到 MASKROM,请重新插拔设备后再测"
-                Self.dlog("NOT rebooted to MASKROM — skipping auto-test; user must replug")
+                let ambiguous = out.candidates.count > 1   // LP4/LP4X share geometry
+                statusMessage = ambiguous
+                    ? "检测到 \(out.geometry.summary()) — 已预选 cfg(LPDDR4/LPDDR4X 同几何,可改选)"
+                    : "检测到 \(out.geometry.summary()) — 已预选 cfg"
+                // TODO(hw联调): reboot re-enumerates the device (deviceID may
+                // change); startTest falls back to devices.first when the saved
+                // selectedDeviceID is gone, so single-device auto-test still works.
+                Self.dlog("matched + rebooted; autoTestEnabled=\(autoTestEnabled) → maybeAutoTest()")
+                maybeAutoTest()
             }
         } catch {
             selectedFileID = filesForSelectedSoc.first?.id

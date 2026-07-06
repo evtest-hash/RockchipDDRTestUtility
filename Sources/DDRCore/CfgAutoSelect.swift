@@ -63,26 +63,28 @@ public enum CfgAutoSelect {
         return 0
     }
 
-    /// Rank soldering-test cfgs (filenames containing 焊接) for a SoC against the
-    /// detected geometry. Returns candidates sorted best-first.
+    /// Returns ONLY the soldering-test cfgs (filenames containing 焊接) whose
+    /// **(capacity, CS count, DRAM type) all EXACTLY match** the detected geometry
+    /// — this exact three-way match is the definition of a successful detection.
+    /// An empty result means detection did NOT identify a cfg: either the board's
+    /// config isn't in the library, or DDR init failed and the geometry is garbage
+    /// (e.g. all-zero SYS_REG decodes to a bogus part that matches nothing here).
+    ///
+    /// Capacity and CS come straight from the decoded geometry. Type matches by
+    /// family: SYS_REG reports LPDDR4 for both LPDDR4 and LPDDR4X (it cannot tell
+    /// them apart — see `OsRegDecoder`), so an LPDDR4 detection matches both and
+    /// the caller resolves that tie (results are ordered exact-type first).
     public static func rank(geometry: DetectedGeometry, socFiles: [TestFileEntry]) -> [Candidate] {
+        guard let g = geometry.dramType, geometry.totalSizeMB > 0, geometry.totalCS > 0 else { return [] }
         let solder = socFiles.filter { $0.displayName.contains("焊接") }
         let pool = solder.isEmpty ? socFiles : solder
         var out: [Candidate] = []
         for e in pool {
-            let t = dramType(fromFilename: e.displayName)
+            guard let t = dramType(fromFilename: e.displayName) else { continue }
             let sz = sizeMB(fromFilename: e.displayName)
             let cs = csCount(fromFilename: e.displayName)
-            var score = 0
-            if let t, let g = geometry.dramType {
-                if t == g { score += 100 }                    // exact type
-                else if sameFamily(t, g) { score += 80 }      // LPDDR4 ≈ LPDDR4X
-            }
-            if sz != 0, sz == geometry.totalSizeMB { score += 100 }
-            else if sz != 0, geometry.totalSizeMB != 0 {
-                score += max(0, 40 - abs(sz - geometry.totalSizeMB) / 64)
-            }
-            if cs != 0, cs == geometry.totalCS { score += 50 } // CS layout disambiguator
+            guard sz == geometry.totalSizeMB, cs == geometry.totalCS, sameFamily(t, g) else { continue }
+            let score = (t == g) ? 2 : 1   // exact type ranks above LP4/LP4X family
             out.append(Candidate(entry: e, dramType: t, sizeMB: sz, csCount: cs, score: score))
         }
         return out.sorted { $0.score > $1.score }

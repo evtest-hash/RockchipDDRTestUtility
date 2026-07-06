@@ -88,9 +88,8 @@ final class DdrGeometryTests: XCTestCase {
 extension DdrGeometryTests {
     // Real OS_REG captured from the board (RK3568, v1.25 DDR bin):
     //   OS_REG2=0x1000EAF1, OS_REG3=0x30000001.
-    // Locks the decode: SYS_REG v3, LPDDR4-family, 4 GB, dual-CS, 32-bit bus,
-    // x16 die, col=10, 8 banks, 16 row bits. (LPDDR4X via the SYS_REG3 bit0
-    // hypothesis — see decode().)
+    // Locks the authoritative SYS_REG V3 decode: LPDDR4 (type 7, reg3 high bits 0),
+    // 4 GB, dual-CS, 32-bit bus, x16 die, col=10, 8 banks, 16 row bits.
     func testDecodeRealCapture() {
         let words: [UInt32] = [0,0,0x1000EAF1,0x30000001,0,0,0,0,0x34B02204,0x8210A088,0x49068440,0x0040285A]
         let g = OsRegDecoder.decode(words)
@@ -110,8 +109,8 @@ extension DdrGeometryTests {
         XCTAssertEqual(g.dramType, .lpddr4)
     }
 
-    // End-to-end: the real decode must shortlist the 4GB / 2-CS / LPDDR4-family
-    // soldering cfg at the top when run against the real RK3568 folder.
+    // End-to-end against the real RK3568 folder: the LPDDR4 4GB/2-CS decode must
+    // return ONLY exact (4096 MB + 2 CS + LPDDR4-family) matches, exact-type first.
     func testRealCaptureRanksAgainstRK3568Folder() throws {
         let root = FileManager.default.currentDirectoryPath + "/DDRTestFiles"
         guard FileManager.default.fileExists(atPath: root) else { throw XCTSkip("no DDRTestFiles") }
@@ -120,11 +119,31 @@ extension DdrGeometryTests {
         try XCTSkipIf(soc.isEmpty, "no RK3568 cfgs")
         let g = OsRegDecoder.decode([0,0,0x1000EAF1,0x30000001,0,0,0,0,0,0,0,0])
         let cands = CfgAutoSelect.rank(geometry: g, socFiles: soc)
-        print(">>> TOP CANDIDATES:")
-        for c in cands.prefix(4) { print("   [\(c.score)] \(c.entry.displayName)") }
-        let top = try XCTUnwrap(cands.first)
-        XCTAssertTrue(top.entry.displayName.contains("4GB"))
-        XCTAssertEqual(top.csCount, 2)
-        XCTAssertTrue(top.dramType == .lpddr4 || top.dramType == .lpddr4x)
+        print(">>> EXACT MATCHES:")
+        for c in cands { print("   [\(c.score)] \(c.entry.displayName)") }
+        XCTAssertFalse(cands.isEmpty)
+        // every returned candidate is an EXACT geometry match
+        for c in cands {
+            XCTAssertEqual(c.sizeMB, 4096)
+            XCTAssertEqual(c.csCount, 2)
+            XCTAssertTrue(c.dramType == .lpddr4 || c.dramType == .lpddr4x)
+        }
+        // exact-type (LPDDR4) ranks first
+        XCTAssertEqual(cands.first?.dramType, .lpddr4)
+        XCTAssertTrue(cands.first!.entry.displayName.contains("4GB"))
+    }
+
+    // A garbage geometry (all-zero SYS_REG, as a FAILED DDR init produces →
+    // decodes to a bogus DDR4 128MB 1CS) must match NOTHING: detection fails
+    // rather than confidently offering a wrong cfg.
+    func testGarbageGeometryMatchesNothing() throws {
+        let root = FileManager.default.currentDirectoryPath + "/DDRTestFiles"
+        guard FileManager.default.fileExists(atPath: root) else { throw XCTSkip("no DDRTestFiles") }
+        let soc = try CfgRepository(rootURL: URL(fileURLWithPath: root)).discoverTestFiles()
+            .filter { $0.socName == "RK3568&RK3566" }
+        try XCTSkipIf(soc.isEmpty, "no RK3568 cfgs")
+        let g = OsRegDecoder.decode([0, 0, 0, 0])   // all-zero → DDR4 128MB 1CS (bogus)
+        XCTAssertEqual(g.totalSizeMB, 128)          // no RK3568 cfg is 128 MB
+        XCTAssertTrue(CfgAutoSelect.rank(geometry: g, socFiles: soc).isEmpty)
     }
 }
