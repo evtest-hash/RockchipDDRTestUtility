@@ -22,6 +22,16 @@ clang --target=aarch64-linux-gnu -x assembler-with-cpp -ffreestanding -nostdlib 
   -DBOOT_MODE_REG=$BMR -DMASKROM_MAGIC=$MAGIC -DCRU_RESET_REG=$CRUR -DCRU_RESET_VAL=$CRUV \
   -c reboot.S.in -o "$TMP/reboot.o"
 python3 extract_text.py "$TMP/reboot.o" reboot.bin
+# Standalone per-SoC reboot payload (raw, NOT embedded in the detect cfg — see
+# DetectProfile.rebootBinName / DdrDetector.rebootToMaskrom). Loaded and run
+# explicitly by the host AFTER OS_REG capture, so it never auto-fires from
+# inside engine.run's item loop (which runs every non-Boot record in a cfg).
+cp reboot.bin rk3568_reboot.bin
 
+# The detect cfg carries ONLY Boot + osregdump. reboot must NOT be a record in
+# this cfg: TestExecutionEngine.run() executes every non-Boot item in file
+# order, so an embedded "reboot" record would fire immediately after
+# osregdump and reset the device to maskrom before DdrDetector's OS_REG
+# retry loop / explicit rebootToMaskrom() ever runs.
 python3 build_detect_cfg.py "$TPL" --from-template rk3568_osregdump.cfg \
-  --probe probe.bin --reboot reboot.bin --download-base $DL
+  --probe probe.bin --download-base $DL

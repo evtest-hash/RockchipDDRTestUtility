@@ -90,7 +90,7 @@ public struct ConfigSettings: Sendable {
     )
 }
 
-public struct TestFileEntry: Identifiable, Hashable {
+public struct TestFileEntry: Identifiable, Hashable, Sendable {
     public let id: String
     public let absolutePath: String
     public let relativePath: String

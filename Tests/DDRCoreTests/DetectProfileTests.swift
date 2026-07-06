@@ -12,6 +12,8 @@ final class DetectProfileTests: XCTestCase {
         XCTAssertEqual(p.bootModeReg, 0xFDC2_0200)
         XCTAssertEqual(p.maskromMagic, 0xEF08_A53C)
         XCTAssertEqual(p.ddrBinName, "rk3568_ddr_1560MHz_v1.25.bin")
+        XCTAssertEqual(p.detectCfgName, "rk3568_osregdump.cfg")
+        XCTAssertEqual(p.rebootBinName, "rk3568_reboot.bin")
     }
     func testUnsupportedPIDReturnsNil() {
         XCTAssertNil(DetectProfiles.forPID(0x350B))   // RK3588 not configured yet

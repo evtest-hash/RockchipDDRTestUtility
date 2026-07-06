@@ -90,16 +90,28 @@ public actor DdrDetector {
         let geo = OsRegDecoder.decode(words)
         let candidates = CfgAutoSelect.rank(geometry: geo, socFiles: socFiles)
 
-        // ④⑤ reboot to maskrom, then wait for re-enumeration
-        let rebooted = (try? await rebootToMaskrom(transport: transport, plan: plan, device: device)) ?? false
+        // ④⑤ reboot to maskrom, then wait for re-enumeration. Deliberately AFTER
+        // the OS_REG capture + retry loop above: reboot is a standalone payload
+        // (not a record in the detect cfg run through engine.run above), so it
+        // only ever fires here, explicitly — never mid-capture.
+        let rebooted = (try? await rebootToMaskrom(transport: transport, profile: profile,
+                                                    plan: plan, device: device)) ?? false
         return DetectOutcome(rawOsReg: words, geometry: geo, candidates: candidates,
                              rebootedToMaskrom: rebooted)
     }
 
-    private func rebootToMaskrom(transport: UsbTransport, plan: CfgTestPlan,
-                                 device: UsbDevice) async throws -> Bool {
-        guard let item = plan.items.first(where: { $0.name.caseInsensitiveCompare("reboot") == .orderedSame }),
-              let pay = plan.embeddedBins["reboot"] else { return false }
+    /// Loads the per-SoC standalone reboot-to-maskrom payload (raw, NOT part of
+    /// the detect cfg — see DetectProfile.rebootBinName) and runs it directly on
+    /// the already-booted device, then waits for the device to drop and
+    /// re-enumerate in maskrom. Kept as a distinct raw file so it can never be
+    /// auto-fired by TestExecutionEngine.run() (which executes every non-Boot
+    /// record of a cfg in file order) — it must run only once this function is
+    /// called explicitly, after OS_REG capture has succeeded.
+    private func rebootToMaskrom(transport: UsbTransport, profile: DetectProfile,
+                                 plan: CfgTestPlan, device: UsbDevice) async throws -> Bool {
+        let rebootURL = resourcesDir.appendingPathComponent(profile.rebootBinName)
+        guard let pay = try? Data(contentsOf: rebootURL) else { return false }
+        let item = CfgItem(name: "reboot", payloadOffset: 0, payloadLength: pay.count)
         try? transport.downloadItem(item: item, payload: pay, address: plan.downloadBaseAddress)
         try? transport.runItem(item: item, address: plan.downloadBaseAddress)   // device resets mid-transfer
         try? transport.close()

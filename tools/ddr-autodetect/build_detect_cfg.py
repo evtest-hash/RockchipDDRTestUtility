@@ -10,9 +10,17 @@ how to run:
                   RC4-decrypts on load and sends it via bulk 0x02 to the download
                   base, then RunMemory 0x03). It reads PMU_GRF OS_REG and prints
                   the words over the 0x80 channel.
-  - "reboot"    : (optional, via --reboot) writes the maskrom boot-mode magic
-                  and triggers a CRU global soft-reset. Same download/run path
-                  as osregdump, RC4-encrypted the same way. Does not return.
+  - "reboot"    : (optional, via --reboot; NOT used by build.sh) writes the
+                  maskrom boot-mode magic and triggers a CRU global soft-reset.
+                  Same download/run path as osregdump, RC4-encrypted the same
+                  way. Does not return. Left available for backward
+                  compatibility only: TestExecutionEngine.run() executes every
+                  non-Boot record in a cfg in file order, so embedding reboot
+                  here would fire it immediately after osregdump instead of
+                  after DdrDetector's OS_REG retry loop. The shipping build
+                  instead assembles reboot as a standalone raw payload
+                  (rk3568_reboot.bin, see build.sh) that the host loads and
+                  runs explicitly via DdrDetector.rebootToMaskrom.
 
 Layout mirrors a real cfg so the shipping CfgBinaryParser reads it unchanged:
   0x00      header (copied from a template RK3568 cfg)

@@ -7,7 +7,13 @@ import Foundation
 public struct DetectProfile: Sendable {
     public let soc: String            // must match CfgRepository socName / DDRTestFiles dir
     public let ddrBinName: String     // auto-probing rkbin DDR bin (basename)
-    public let detectCfgName: String  // generated detect cfg (basename)
+    public let detectCfgName: String  // generated detect cfg (basename): Boot + osregdump ONLY
+    /// Standalone raw reboot-to-maskrom payload (basename, alongside detectCfgName
+    /// in the same resources dir). NOT a record inside detectCfgName's cfg — see
+    /// DdrDetector.rebootToMaskrom: it must run only after the OS_REG capture
+    /// completes, and TestExecutionEngine.run() would otherwise fire it
+    /// immediately (it runs every non-Boot record in file order).
+    public let rebootBinName: String
     public let downloadBase: UInt32   // item download/run base
     public let usbPutsVector: UInt32  // Boot service vector: puts -> USB ring (0x80-readable)
     public let osRegBase: UInt32      // PMU_GRF OS_REG0 address
@@ -28,6 +34,7 @@ public enum DetectProfiles {
             soc: "RK3568&RK3566",
             ddrBinName: "rk3568_ddr_1560MHz_v1.25.bin",
             detectCfgName: "rk3568_osregdump.cfg",
+            rebootBinName: "rk3568_reboot.bin",
             downloadBase: 0xFDCC_4000,
             usbPutsVector: 0xFDCC_1004,
             osRegBase: 0xFDC2_0200,

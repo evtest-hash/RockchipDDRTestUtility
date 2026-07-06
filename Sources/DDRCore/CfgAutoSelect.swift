@@ -10,7 +10,7 @@ import Foundation
 /// and the caller always shows the ranked list rather than blindly running.
 public enum CfgAutoSelect {
 
-    public struct Candidate {
+    public struct Candidate: Sendable {
         public let entry: TestFileEntry
         public let dramType: DramType?
         public let sizeMB: Int
