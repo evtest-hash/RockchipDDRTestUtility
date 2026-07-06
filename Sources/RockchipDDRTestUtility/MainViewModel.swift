@@ -27,6 +27,16 @@ final class MainViewModel: ObservableObject {
     /// distinct from `isRunning` (which covers the actual test execution).
     @Published var isDetecting = false
     private var hasRunAutoTestForCurrentDevice = false
+    /// Mirrors `hasRunAutoTestForCurrentDevice` for the DDR auto-detect probe:
+    /// set the moment `runDetectThenMaybeTest` is launched for the current
+    /// device, so a subsequent `pollDevices` tick (the 1s timer) can't launch a
+    /// second, overlapping detect for the same connection — detect's own
+    /// reboot-to-maskrom step drops the device off USB and re-enumerates for up
+    /// to ~6s, during which two racing detects (or a reboot-induced re-enum
+    /// re-triggering detect) would otherwise loop. Cleared in
+    /// `resetConnectionState()` alongside `hasRunAutoTestForCurrentDevice` so a
+    /// genuine unplug re-arms it.
+    private var hasDetectedForCurrentDevice = false
     private var initialDeviceIDs: Set<String>?
     /// True until a boot download succeeds on the current device connection.
     /// Mirrors DDR_UserTool's `this+0x4B8` flag: set whenever the device set
@@ -437,6 +447,7 @@ final class MainViewModel: ObservableObject {
         setDeviceNeedsBoot(true)
         selectedDeviceID = nil
         hasRunAutoTestForCurrentDevice = false
+        hasDetectedForCurrentDevice = false
         // Launch-suppression ("don't auto-test devices present at launch") ends
         // once the user unplugs — a replug, even of the same deviceID, should
         // count as newly arrived and re-trigger auto-test.
@@ -466,6 +477,7 @@ final class MainViewModel: ObservableObject {
 
     private func pollDevices() {
         guard !isRunning else { return }
+        guard !isDetecting else { return }
         guard activeTransport == nil else { return }
         do {
             let transport = try makeTransport()
@@ -511,12 +523,20 @@ final class MainViewModel: ObservableObject {
                     // Devices with a DDR auto-detect profile (RK3568&RK3566 today —
                     // see DetectProfiles) get probed for DRAM geometry before any
                     // auto-test: runDetectThenMaybeTest preselects the best-matching
-                    // cfg (or falls back to the first one) and calls maybeAutoTest()
-                    // itself once detect finishes, either way. SoCs without a
-                    // profile keep the original immediate auto-test trigger.
+                    // cfg (or falls back to the first one) and only calls
+                    // maybeAutoTest() itself when the device actually made it back
+                    // to MASKROM. SoCs without a profile keep the original
+                    // immediate auto-test trigger. Guarded by
+                    // `hasDetectedForCurrentDevice` so this 1s timer can't launch a
+                    // second, overlapping detect while one is already in flight for
+                    // this connection (detect's own reboot-to-maskrom step drops
+                    // the device off USB and re-enumerates for up to ~6s).
                     if let device = devices.first(where: { $0.deviceID == selectedDeviceID }),
                        DetectProfiles.forPID(device.productID) != nil {
-                        Task { await runDetectThenMaybeTest(device) }
+                        if !hasDetectedForCurrentDevice {
+                            hasDetectedForCurrentDevice = true
+                            Task { await runDetectThenMaybeTest(device) }
+                        }
                     } else {
                         maybeAutoTest()
                     }
@@ -567,11 +587,18 @@ final class MainViewModel: ObservableObject {
     /// the first cfg for the SoC so the user can still test manually — detect
     /// only ever assists selection, it never blocks the flow.
     ///
-    /// `DdrDetector.detect` reboots the device back to MASKROM once it's done
-    /// (success or not, as long as the probe ran), so the boot latch is
-    /// re-armed unconditionally on the success path. `maybeAutoTest()` runs
-    /// last in both the success and failure paths so `autoTestEnabled` still
-    /// gates the actual test exactly like the non-detect path.
+    /// `DdrDetector.detect`'s `rebootedToMaskrom` flag tells us whether the
+    /// device actually made it back to MASKROM after the probe. If it didn't
+    /// (reboot payload failed, or re-enumeration timed out) — or if `detect`
+    /// threw before ever attempting the reboot (e.g. `.noOsReg`) — the device
+    /// is still running the probe firmware, NOT sitting in MASKROM. Booting it
+    /// again (auto-test or a manual Start click) would hit the same
+    /// already-booted-device failure this repo documents elsewhere
+    /// ("expected 512 got -1"). So `maybeAutoTest()` is only ever called when
+    /// `rebootedToMaskrom == true`; every other outcome (no match, reboot
+    /// failed, or detect threw) preselects/falls back a cfg, re-arms the boot
+    /// latch so the *next* successful boot is a real one, and leaves the user
+    /// to replug + retry manually.
     @MainActor
     private func runDetectThenMaybeTest(_ device: UsbDevice) async {
         isDetecting = true
@@ -582,21 +609,35 @@ final class MainViewModel: ObservableObject {
             let transport = try makeTransport()
             let det = DdrDetector(resourcesDir: detectResourcesDir(), rkbinDir: rkbinDir())
             let out = try await det.detect(transport: transport, device: device, socFiles: filesForSelectedSoc)
-            if applyDetectCandidates(out.candidates) != nil {
-                statusMessage = "检测到 \(out.geometry.summary()) — 已预选 cfg"
-            } else {
-                statusMessage = "检测到 \(out.geometry.summary()),但无匹配 cfg — 请手动选择"
+            let matched = applyDetectCandidates(out.candidates) != nil
+            if !matched {
                 selectedFileID = filesForSelectedSoc.first?.id
             }
-            // Detect always reboots to MASKROM at the end of a successful probe
-            // (fresh connection) — re-arm the boot latch so the next startTest()
-            // performs a real boot instead of assuming one already happened.
+            // Re-arm the boot latch on every outcome here: whether or not the
+            // device is actually back in MASKROM, the *next* boot attempt must
+            // not be skipped — either it's a real boot onto a device that just
+            // reached MASKROM (rebootedToMaskrom == true), or the user is about
+            // to replug and needs a real boot on the fresh connection anyway.
             setDeviceNeedsBoot(true)
+            if out.rebootedToMaskrom {
+                statusMessage = matched
+                    ? "检测到 \(out.geometry.summary()) — 已预选 cfg"
+                    : "检测到 \(out.geometry.summary()),但无匹配 cfg — 请手动选择"
+                // TODO(hw联调): reboot-to-maskrom re-enumerates the device over
+                // USB, which may assign it a new deviceID on some hosts/hubs —
+                // needs real RK3568 hardware to characterize. maybeAutoTest()
+                // (and the startTest() it schedules) still use the
+                // `selectedDeviceID` captured before this probe ran; if the ID
+                // changed, that boot attempt targets a now-stale device path.
+                maybeAutoTest()
+            } else {
+                statusMessage = "检测到 \(out.geometry.summary()),但设备未回到 MASKROM,请重新插拔设备后再测"
+            }
         } catch {
-            statusMessage = "DDR 自动检测失败(\(error)) — 请手动选择"
             selectedFileID = filesForSelectedSoc.first?.id
+            statusMessage = "DDR 自动检测失败(\(error)),设备可能需重新插拔;或手动选择 cfg"
+            setDeviceNeedsBoot(true)
         }
-        maybeAutoTest()
     }
 
     /// Directory holding the DDR auto-detect resources: the per-SoC detect cfg
