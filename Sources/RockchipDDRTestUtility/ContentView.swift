@@ -21,18 +21,38 @@ struct ContentView: View {
 
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // CFG file list
-            List(selection: $viewModel.selectedFileID) {
-                ForEach(viewModel.filesForSelectedSoc) { file in
-                    Text(file.displayName)
-                        .font(.system(size: 12))
+            if viewModel.isDetecting {
+                HStack(spacing: 6) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text(viewModel.statusMessage)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                         .lineLimit(1)
-                        .truncationMode(.tail)
-                        .tag(file.id)
-                        .help(file.displayName)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+            }
+
+            // CFG file list
+            ScrollViewReader { proxy in
+                List(selection: $viewModel.selectedFileID) {
+                    ForEach(viewModel.filesForSelectedSoc) { file in
+                        Text(file.displayName)
+                            .font(.system(size: 12))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .tag(file.id)
+                            .help(file.displayName)
+                    }
+                }
+                .listStyle(.sidebar)
+                .disabled(viewModel.isDetecting)
+                .onChange(of: viewModel.selectedFileID) { newValue in
+                    guard let newValue else { return }
+                    proxy.scrollTo(newValue, anchor: .center)
                 }
             }
-            .listStyle(.sidebar)
         }
         .frame(minWidth: 260, maxWidth: 320)
     }
@@ -80,7 +100,7 @@ struct ContentView: View {
                     .frame(minWidth: 80)
             }
             .keyboardShortcut(.return)
-            .disabled(viewModel.isRunning || viewModel.devices.isEmpty)
+            .disabled(viewModel.isRunning || viewModel.isDetecting || viewModel.devices.isEmpty)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
