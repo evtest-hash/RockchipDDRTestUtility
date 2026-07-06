@@ -22,6 +22,10 @@ final class MainViewModel: ObservableObject {
     @Published var overallOutcome: TestOutcome?
     @Published var selectedSoc: String?
     @Published var autoTestEnabled = false
+    /// True while a DDR auto-detect probe (DdrDetector.detect) is in flight for
+    /// a newly-arrived device. UI can use this to show a "detecting..." state
+    /// distinct from `isRunning` (which covers the actual test execution).
+    @Published var isDetecting = false
     private var hasRunAutoTestForCurrentDevice = false
     private var initialDeviceIDs: Set<String>?
     /// True until a boot download succeeds on the current device connection.
@@ -197,6 +201,24 @@ final class MainViewModel: ObservableObject {
         } catch {
             statusMessage = error.localizedDescription
         }
+    }
+
+    /// Applies DDR auto-detect results to selection state: preselects the
+    /// highest-ranked candidate that actually exists among the loaded
+    /// `testFiles` (a candidate can be ranked from a stale/partial file list),
+    /// setting both `selectedFileID` and `selectedSoc`. Returns the chosen file
+    /// id, or nil if none of the candidates are present (caller keeps the
+    /// current selection / falls back to manual).
+    ///
+    /// The actual "does this candidate exist" decision is delegated to
+    /// `CfgAutoSelect.firstAvailable` (DDRCore, pure, unit-tested) — this
+    /// wrapper only exists to apply the result to `@Published` state, since
+    /// this app target itself isn't unit-testable (executable, not a library).
+    func applyDetectCandidates(_ candidates: [CfgAutoSelect.Candidate]) -> String? {
+        guard let entry = CfgAutoSelect.firstAvailable(candidates, in: testFiles) else { return nil }
+        selectedFileID = entry.id
+        selectedSoc = entry.socName
+        return entry.id
     }
 
     func onDeviceSelectionChanged() {
@@ -486,19 +508,17 @@ final class MainViewModel: ObservableObject {
                         }
                     }
 
-                    // Auto-test: trigger only for newly arrived devices (not at launch)
-                    let newIDs = Set(devices.map(\.deviceID)).subtracting(initialDeviceIDs ?? [])
-                    if autoTestEnabled && !hasRunAutoTestForCurrentDevice && !newIDs.isEmpty {
-                        hasRunAutoTestForCurrentDevice = true
-                        initialDeviceIDs = nil
-                        // Settle: a freshly-(re)plugged bootrom needs a moment
-                        // before it reliably accepts the vendor control-transfer
-                        // boot. Without this, auto-test can fire within tens of
-                        // ms of detection, the boot stalls, and the device resets.
-                        Task {
-                            try? await Task.sleep(nanoseconds: 1_000_000_000)
-                            await startTest()
-                        }
+                    // Devices with a DDR auto-detect profile (RK3568&RK3566 today —
+                    // see DetectProfiles) get probed for DRAM geometry before any
+                    // auto-test: runDetectThenMaybeTest preselects the best-matching
+                    // cfg (or falls back to the first one) and calls maybeAutoTest()
+                    // itself once detect finishes, either way. SoCs without a
+                    // profile keep the original immediate auto-test trigger.
+                    if let device = devices.first(where: { $0.deviceID == selectedDeviceID }),
+                       DetectProfiles.forPID(device.productID) != nil {
+                        Task { await runDetectThenMaybeTest(device) }
+                    } else {
+                        maybeAutoTest()
                     }
                 }
             }
@@ -509,5 +529,111 @@ final class MainViewModel: ObservableObject {
 
     private func setDeviceNeedsBoot(_ newValue: Bool) {
         deviceNeedsBoot = newValue
+    }
+
+    // MARK: - Auto-Test Trigger
+
+    /// Fires the settle-then-`startTest` auto-test flow for a newly-arrived
+    /// device, exactly once per connection (guarded by
+    /// `hasRunAutoTestForCurrentDevice` / `initialDeviceIDs`). Extracted out of
+    /// `pollDevices` so both the plain (non-detect) path and the tail of
+    /// `runDetectThenMaybeTest` share the identical latch/settle logic instead
+    /// of risking drift between two copies.
+    private func maybeAutoTest() {
+        let newIDs = Set(devices.map(\.deviceID)).subtracting(initialDeviceIDs ?? [])
+        if autoTestEnabled && !hasRunAutoTestForCurrentDevice && !newIDs.isEmpty {
+            hasRunAutoTestForCurrentDevice = true
+            initialDeviceIDs = nil
+            // Settle: a freshly-(re)plugged bootrom needs a moment before it
+            // reliably accepts the vendor control-transfer boot. Without this,
+            // auto-test can fire within tens of ms of detection, the boot
+            // stalls, and the device resets.
+            Task {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                await startTest()
+            }
+        }
+    }
+
+    // MARK: - DDR Auto-Detect
+
+    /// Runs DDR auto-detect (`DdrDetector.detect`) on a newly-arrived device
+    /// whose PID has a `DetectProfile`: downloads the auto-probing rkbin DDR
+    /// bin, dumps OS_REG over the probe cfg's printf channel, decodes the DRAM
+    /// geometry, and preselects the best-matching soldering-test cfg via
+    /// `applyDetectCandidates`. On any failure (unsupported SoC, missing
+    /// resource files, no OS_REG captured, USB error, etc.) or when detect
+    /// succeeds but ranks no cfg present in the loaded file set, falls back to
+    /// the first cfg for the SoC so the user can still test manually — detect
+    /// only ever assists selection, it never blocks the flow.
+    ///
+    /// `DdrDetector.detect` reboots the device back to MASKROM once it's done
+    /// (success or not, as long as the probe ran), so the boot latch is
+    /// re-armed unconditionally on the success path. `maybeAutoTest()` runs
+    /// last in both the success and failure paths so `autoTestEnabled` still
+    /// gates the actual test exactly like the non-detect path.
+    @MainActor
+    private func runDetectThenMaybeTest(_ device: UsbDevice) async {
+        isDetecting = true
+        statusMessage = "正在检测 DDR…"
+        stopKeepAlive()
+        defer { isDetecting = false }
+        do {
+            let transport = try makeTransport()
+            let det = DdrDetector(resourcesDir: detectResourcesDir(), rkbinDir: rkbinDir())
+            let out = try await det.detect(transport: transport, device: device, socFiles: filesForSelectedSoc)
+            if applyDetectCandidates(out.candidates) != nil {
+                statusMessage = "检测到 \(out.geometry.summary()) — 已预选 cfg"
+            } else {
+                statusMessage = "检测到 \(out.geometry.summary()),但无匹配 cfg — 请手动选择"
+                selectedFileID = filesForSelectedSoc.first?.id
+            }
+            // Detect always reboots to MASKROM at the end of a successful probe
+            // (fresh connection) — re-arm the boot latch so the next startTest()
+            // performs a real boot instead of assuming one already happened.
+            setDeviceNeedsBoot(true)
+        } catch {
+            statusMessage = "DDR 自动检测失败(\(error)) — 请手动选择"
+            selectedFileID = filesForSelectedSoc.first?.id
+        }
+        maybeAutoTest()
+    }
+
+    /// Directory holding the DDR auto-detect resources: the per-SoC detect cfg
+    /// (`DetectProfile.detectCfgName`, e.g. `rk3568_osregdump.cfg`) and the
+    /// standalone reboot-to-maskrom payload (`DetectProfile.rebootBinName`,
+    /// e.g. `rk3568_reboot.bin`) — both must live in the same directory (see
+    /// `DdrDetector`). Mirrors `CfgRepository.makeDefaultRootURL()`'s
+    /// bundle-vs-dev probing: a packaged app would bundle these under
+    /// `Resources/ddr-autodetect`, while `swift run` / dev finds them
+    /// CWD-relative at `tools/ddr-autodetect` — the same default the CLI's
+    /// `--detect` mode falls back to (`RockchipDDRTestUtilityCLI/main.swift`).
+    /// NOTE: `scripts/package.sh` does not yet copy this directory into the
+    /// `.app` bundle; the bundle branch is forward-looking for when packaging
+    /// is updated, and is inert (falls through) until then.
+    private func detectResourcesDir() -> URL {
+        if let resourceURL = Bundle.main.resourceURL {
+            let bundled = resourceURL.appendingPathComponent("ddr-autodetect")
+            if FileManager.default.fileExists(atPath: bundled.path) {
+                return bundled
+            }
+        }
+        return URL(fileURLWithPath: "tools/ddr-autodetect")
+    }
+
+    /// Directory holding the per-SoC rkbin auto-probing DDR bins
+    /// (`DetectProfile.ddrBinName`, e.g. `rk3568_ddr_1560MHz_v1.25.bin`). Same
+    /// bundle-vs-dev probing as `detectResourcesDir()`; the dev/CWD-relative
+    /// default matches the CLI's `--detect` fallback (a sibling `rkbin`
+    /// checkout next to this repo). See the bundling caveat on
+    /// `detectResourcesDir()` — likewise inert until packaging is updated.
+    private func rkbinDir() -> URL {
+        if let resourceURL = Bundle.main.resourceURL {
+            let bundled = resourceURL.appendingPathComponent("rkbin")
+            if FileManager.default.fileExists(atPath: bundled.path) {
+                return bundled
+            }
+        }
+        return URL(fileURLWithPath: "../rkbin/bin/rk35")
     }
 }

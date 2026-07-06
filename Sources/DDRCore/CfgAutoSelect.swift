@@ -87,4 +87,21 @@ public enum CfgAutoSelect {
         }
         return out.sorted { $0.score > $1.score }
     }
+
+    /// Picks the best-ranked candidate that is actually present in `files`
+    /// (matched by `TestFileEntry.id`), skipping any ranked candidates whose
+    /// entry has since disappeared from the loaded file set. Returns nil if
+    /// none match, so the caller can fall back (e.g. to the first cfg for the
+    /// SoC) rather than silently keeping a stale selection.
+    ///
+    /// Kept as pure, dependency-free decision logic — separate from
+    /// `MainViewModel` (a `@MainActor` GUI class in the app target, which
+    /// isn't unit-testable) — so the actual preselect rule has test coverage.
+    public static func firstAvailable(_ candidates: [Candidate], in files: [TestFileEntry]) -> TestFileEntry? {
+        let ids = Set(files.map(\.id))
+        for c in candidates where ids.contains(c.entry.id) {
+            return c.entry
+        }
+        return nil
+    }
 }
