@@ -3,14 +3,17 @@ import XCTest
 
 final class DdrGeometryTests: XCTestCase {
 
-    // SYS_REG2 hand-encoded for: DDR4, 1 channel, 1 rank, col=10, 8 banks,
-    // cs0_row=16, 16-bit bus, 16-bit die. See DdrGeometryTests notes for the
-    // bit math. Decodes to a 1024 MB part.
-    //   reg2 = (4<<13)|(1<<9)|(3<<6)|(1<<2)|(1<<0) = 0x82C5
-    func testDecodeKnownSysReg2() {
-        let words: [UInt32] = [0, 0, 0x0000_82C5, 0]
+    // Hand-encoded per the SYS_REG **V3** macros for: LPDDR4X (type 8, which
+    // exercises the 5-bit split — low 3 bits in reg2[15:13]=0, high 2 bits in
+    // reg3[13:12]=1), 1 channel, 1 rank, col=10, 8 banks, cs0_row=16, 16-bit bus,
+    // 16-bit die. Decodes to a 1024 MB part.
+    //   reg2 = (1<<9)|(3<<6)|(1<<2)|(1<<0) = 0x2C5   (type-low bits = 0)
+    //   reg3 = (3<<28) | (1<<12) = 0x30001000        (version 3, type-high = 1)
+    func testDecodeV3TypeSplitLPDDR4X() {
+        let words: [UInt32] = [0, 0, 0x0000_02C5, 0x3000_1000]
         let g = OsRegDecoder.decode(words)
-        XCTAssertEqual(g.dramType, .ddr4)
+        XCTAssertEqual(g.dramType, .lpddr4x)   // 0 | (1<<3) = 8
+        XCTAssertEqual(g.sysRegVersion, 3)
         XCTAssertEqual(g.numChannels, 1)
         XCTAssertEqual(g.channels.count, 1)
         let c = g.channels[0]
@@ -21,6 +24,14 @@ final class DdrGeometryTests: XCTestCase {
         XCTAssertEqual(c.busWidthBits, 16)
         XCTAssertEqual(c.dieWidthBits, 16)
         XCTAssertEqual(g.totalSizeMB, 1024)
+    }
+
+    // DDR4 must decode to the authoritative code 0 (NOT 4).
+    func testDDR4TypeCodeIsZero() {
+        XCTAssertEqual(DramType(rawValue: 0), .ddr4)
+        // reg2/reg3 type bits all zero → type 0 → DDR4.
+        let g = OsRegDecoder.decode([0, 0, 0x0000_02C5, 0x3000_0000])
+        XCTAssertEqual(g.dramType, .ddr4)
     }
 
     func testParseProbeOutput() {
@@ -92,8 +103,11 @@ extension DdrGeometryTests {
         XCTAssertEqual(g.channels.first?.dieWidthBits, 16)
         XCTAssertEqual(g.channels.first?.col, 10)
         XCTAssertEqual(g.channels.first?.cs0Row, 16)
-        // Hardware-confirmed against the board's real spec: LPDDR4X.
-        XCTAssertEqual(g.dramType, .lpddr4x)
+        // Authoritative SYS_REG V3 decode: DDRTYPE = reg2[15:13]=7 | reg3[13:12]=0
+        // → LPDDR4 (7). (The DDR bin did not set the LP4X high type bits here; if
+        // the physical part is LP4X, SYS_REG readback still reports LPDDR4 — the
+        // two aren't separable from OS_REG, which is why CfgAutoSelect families them.)
+        XCTAssertEqual(g.dramType, .lpddr4)
     }
 
     // End-to-end: the real decode must shortlist the 4GB / 2-CS / LPDDR4-family

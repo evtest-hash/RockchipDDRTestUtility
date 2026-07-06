@@ -15,26 +15,31 @@ import Foundation
 /// is never lost; if a field is off, correct the constant here (or reverse the
 /// DDR bin's OS_REG *encode* function for the authoritative layout).
 
+/// DRAM type codes — VERBATIM from Rockchip U-Boot
+/// `arch/arm/include/asm/arch-rockchip/sdram.h` (`enum { DDR4 = 0, DDR2 = 2, ... }`).
+/// NOTE `DDR4 == 0` (not 4). These are the values the SYS_REG DDRTYPE field holds.
 public enum DramType: Int, Sendable, CaseIterable {
+    case ddr4 = 0
     case ddr2 = 2
     case ddr3 = 3
-    case ddr4 = 4
     case lpddr2 = 5
     case lpddr3 = 6
     case lpddr4 = 7
     case lpddr4x = 8
     case lpddr5 = 9
+    case ddr5 = 10
 
     public var displayName: String {
         switch self {
+        case .ddr4: return "DDR4"
         case .ddr2: return "DDR2"
         case .ddr3: return "DDR3"
-        case .ddr4: return "DDR4"
         case .lpddr2: return "LPDDR2"
         case .lpddr3: return "LPDDR3"
         case .lpddr4: return "LPDDR4"
         case .lpddr4x: return "LPDDR4X"
         case .lpddr5: return "LPDDR5"
+        case .ddr5: return "DDR5"
         }
     }
 }
@@ -114,57 +119,60 @@ public enum OsRegDecoder {
         Int((v >> UInt32(shift)) & mask)
     }
 
-    /// Decode OS_REG words into geometry. `osreg[2]` = SYS_REG2, `osreg[3]` =
-    /// SYS_REG3 (extension). Requires at least OS_REG0..OS_REG3.
+    /// Decode OS_REG words into geometry using Rockchip's SYS_REG **version-3**
+    /// layout (RK356x/RK3588), ported from the `_V3` macros in U-Boot
+    /// `arch/arm/include/asm/arch-rockchip/sdram_common.h`. `osreg[2]` = SYS_REG2,
+    /// `osreg[3]` = SYS_REG3. The DDR type is a 5-bit field split across both
+    /// registers; rank and CS row also draw high bits from SYS_REG3.
+    ///
+    /// LPDDR4 vs LPDDR4X: the SYS_REG DDRTYPE field distinguishes them ONLY if the
+    /// DDR bin encodes the high type bits (reg3[13:12]); many bins store LPDDR4 (7)
+    /// for both and distinguish LP4X via head-info elsewhere. So LP4/LP4X may not
+    /// be separable from OS_REG readback — CfgAutoSelect treats them as one family.
     public static func decode(_ osreg: [UInt32]) -> DetectedGeometry {
         let reg2 = osreg.count > 2 ? osreg[2] : 0
         let reg3 = osreg.count > 3 ? osreg[3] : 0
 
-        // SYS_REG version lives in SYS_REG3[31:28] (observed = 3 on RK3568 v1.25).
+        // VERSION: SYS_REG3[31:28].  DDRTYPE_V3: reg2[15:13] low3 | reg3[13:12] high2.
         let version = bits(reg3, 28, 0xf)
-        var dramType = DramType(rawValue: bits(reg2, 13, 0x7))
-        // LPDDR4 (type 7) vs LPDDR4X: the 3-bit type field can't hold 8, so the
-        // distinction rides an extension bit in SYS_REG3. HYPOTHESIS (confirm
-        // against a known LPDDR4X board): SYS_REG3 bit0 set → LPDDR4X. The raw
-        // OS_REG words are always printed, and the candidate list shows both
-        // LPDDR4/LPDDR4X, so a wrong guess here is recoverable.
-        if dramType == .lpddr4, (reg3 & 0x1) != 0 {
-            dramType = .lpddr4x
-        }
-        let numCh = 1 + bits(reg2, 12, 0x1)
+        let typeRaw = bits(reg2, 13, 0x7) | (bits(reg3, 12, 0x3) << 3)
+        let dramType = DramType(rawValue: typeRaw)
+        let numCh = 1 + bits(reg2, 12, 0x1)   // NUM_CH: reg2[12]
 
         var channels: [ChannelGeometry] = []
         var totalBytes: UInt64 = 0
         for ch in 0..<numCh {
             let s = ch * 16
-            let rank = 1 + bits(reg2, 11 + s, 0x1)
+            // RANK: ch0/2 take a high bit from reg3[14] (→ up to 4 ranks, V3);
+            // ch1/3 use the base 1-bit field.
+            let rank = ch == 0
+                ? (1 << (bits(reg2, 11, 0x1) | (bits(reg3, 14, 0x1) << 1)))
+                : (1 + bits(reg2, 11 + s, 0x1))
             let col = 9 + bits(reg2, 9 + s, 0x3)
             let bank = 3 - bits(reg2, 8 + s, 0x1)
-            var cs0Row = 13 + bits(reg2, 6 + s, 0x3)
-            var cs1Row = 13 + bits(reg2, 4 + s, 0x3)
-            // SYS_REG3 extension: high row bit (+1) for large parts (version >= 2)
-            if version >= 2 {
-                cs0Row += bits(reg3, 5 + s, 0x1) << 2      // row_3_4 / high bit
-                cs1Row += bits(reg3, 4 + s, 0x1) << 2
-            }
-            let bwCode = bits(reg2, 2 + s, 0x3)   // 2→32b, 1→16b, 0→8b
-            let dbwCode = bits(reg2, 0 + s, 0x3)
-            let busWidthBits = 8 << (2 - min(bwCode, 2))    // code2→32, 1→16, 0→8  (approx; validate)
-            let dieWidthBits = 8 << (2 - min(dbwCode, 2))
+            // CS0/CS1 ROW_V3: 2 low bits in reg2 + 1 high bit in reg3.
+            let cs0Row = (((bits(reg2, 6 + s, 0x3) | (bits(reg3, 5 + 2 * ch, 0x1) << 2)) + 1) & 0x7) + 12
+            let cs1Row = (((bits(reg2, 4 + s, 0x3) | (bits(reg3, 4 + 2 * ch, 0x1) << 2)) + 1) & 0x7) + 12
+            let cs1Col = 9 + bits(reg3, 2 * ch, 0x3)     // CS1_COL_V3 (reg3[1:0] for ch0)
+            let row34 = bits(reg2, 30 + ch, 0x1) != 0    // ROW_3_4: only 3/4 of rows populated
+            // BW/DBW_V3: DEC = 2 >> code; bus width bits = 8 << (that).
+            let busWidthBits = 8 << (2 >> bits(reg2, 2 + s, 0x3))
+            let dieWidthBits = 8 << (2 >> bits(reg2, 0 + s, 0x3))
 
             channels.append(ChannelGeometry(
                 rank: rank, col: col, bank: bank,
                 cs0Row: cs0Row, cs1Row: cs1Row,
                 busWidthBits: busWidthBits, dieWidthBits: dieWidthBits))
 
-            // Capacity per CS: 2^(row + col + bank) addresses * (busWidth/8) bytes.
+            // Capacity: each CS = 2^(row + col + bank) addresses * (bus bytes).
+            // CS1 uses its own column count; row_3_4 parts populate only 3/4.
             let busBytes = UInt64(busWidthBits / 8)
-            let cs0 = (UInt64(1) << UInt64(cs0Row + col + bank)) * busBytes
-            totalBytes += cs0
-            if rank == 2 {
-                let cs1 = (UInt64(1) << UInt64(cs1Row + col + bank)) * busBytes
-                totalBytes += cs1
+            var chBytes = (UInt64(1) << UInt64(cs0Row + col + bank)) * busBytes
+            if rank >= 2 {
+                chBytes += (UInt64(1) << UInt64(cs1Row + cs1Col + bank)) * busBytes
             }
+            if row34 { chBytes = chBytes / 4 * 3 }
+            totalBytes += chBytes
         }
 
         return DetectedGeometry(
