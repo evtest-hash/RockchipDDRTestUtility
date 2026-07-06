@@ -62,11 +62,13 @@ final class DdrGeometryTests: XCTestCase {
         XCTAssertEqual(CfgAutoSelect.sizeMB(fromFilename: "512MB DDR3(...).cfg"), 512)
     }
 
-    // The built detect cfg must parse cleanly with the shipping parser: Boot +
-    // one osregdump item, download base 0xFDCC4000, probe payload RC4-round-trips
-    // to the ARM64 entry (STP X29,X30 = 0xa9be7bfd little-endian: fd 7b be a9).
+    // The self-contained detect cfg must parse cleanly with the shipping parser:
+    // it packages ALL four payloads (Boot + ddrbin + osregdump + reboot), which
+    // DdrDetector pulls from embeddedBins and drives itself. Download base
+    // 0xFDCC4000; the osregdump payload RC4-round-trips to the ARM64 entry
+    // (STP X29,X30 = 0xa9be7bfd little-endian: fd 7b .. a9).
     func testDetectCfgParses() throws {
-        let path = FileManager.default.currentDirectoryPath + "/tools/ddr-autodetect/rk3568_osregdump.cfg"
+        let path = FileManager.default.currentDirectoryPath + "/DDRTestFiles/RK3568&RK3566/DDR自动探测.cfg"
         guard FileManager.default.fileExists(atPath: path) else {
             throw XCTSkip("detect cfg not present at \(path)")
         }
@@ -74,7 +76,14 @@ final class DdrGeometryTests: XCTestCase {
         XCTAssertEqual(plan.downloadBaseAddress, 0xFDCC_4000)
         let names = plan.items.map { $0.name.lowercased() }
         XCTAssertTrue(names.contains("boot"))
+        XCTAssertTrue(names.contains("ddrbin"))
         XCTAssertTrue(names.contains("osregdump"))
+        XCTAssertTrue(names.contains("reboot"))
+        // ddrbin (the auto-probing rkbin DDR bin) round-trips to real bytes.
+        let ddrbin = try XCTUnwrap(plan.embeddedBins["ddrbin"])
+        XCTAssertGreaterThan(ddrbin.count, 10_000)
+        // reboot payload is present and non-empty.
+        XCTAssertGreaterThan(try XCTUnwrap(plan.embeddedBins["reboot"]).count, 0)
         let probe = try XCTUnwrap(plan.embeddedBins["osregdump"])
         XCTAssertGreaterThan(probe.count, 0)
         // Entry is an AArch64 STP X29,X30,[SP,#-N]! prologue: bytes fd 7b .. a9
@@ -97,7 +106,7 @@ extension DdrGeometryTests {
         XCTAssertEqual(g.sysRegVersion, 3)
         XCTAssertEqual(g.totalSizeMB, 4096)
         XCTAssertEqual(g.numChannels, 1)
-        XCTAssertEqual(g.totalCS, 2)
+        XCTAssertEqual(g.csPerDie, 2)
         XCTAssertEqual(g.channels.first?.busWidthBits, 32)
         XCTAssertEqual(g.channels.first?.dieWidthBits, 16)
         XCTAssertEqual(g.channels.first?.col, 10)
@@ -110,7 +119,9 @@ extension DdrGeometryTests {
     }
 
     // End-to-end against the real RK3568 folder: the LPDDR4 4GB/2-CS decode must
-    // return ONLY exact (4096 MB + 2 CS + LPDDR4-family) matches, exact-type first.
+    // return ONLY exact matches. Per sdram.h, LPDDR4 (7) and LPDDR4X (8) are
+    // distinct types, so a type-7 detection matches the LPDDR4 cfg and NOT the
+    // same-size/CS LPDDR4X cfg.
     func testRealCaptureRanksAgainstRK3568Folder() throws {
         let root = FileManager.default.currentDirectoryPath + "/DDRTestFiles"
         guard FileManager.default.fileExists(atPath: root) else { throw XCTSkip("no DDRTestFiles") }
@@ -118,19 +129,45 @@ extension DdrGeometryTests {
         let soc = files.filter { $0.socName == "RK3568&RK3566" }
         try XCTSkipIf(soc.isEmpty, "no RK3568 cfgs")
         let g = OsRegDecoder.decode([0,0,0x1000EAF1,0x30000001,0,0,0,0,0,0,0,0])
+        XCTAssertEqual(g.dramType, .lpddr4)
         let cands = CfgAutoSelect.rank(geometry: g, socFiles: soc)
         print(">>> EXACT MATCHES:")
-        for c in cands { print("   [\(c.score)] \(c.entry.displayName)") }
+        for c in cands { print("   \(c.entry.displayName)") }
         XCTAssertFalse(cands.isEmpty)
-        // every returned candidate is an EXACT geometry match
+        // every returned candidate is an EXACT (type + capacity + CS) match —
+        // LPDDR4 only, the same-size LPDDR4X cfg is excluded.
         for c in cands {
             XCTAssertEqual(c.sizeMB, 4096)
             XCTAssertEqual(c.csCount, 2)
-            XCTAssertTrue(c.dramType == .lpddr4 || c.dramType == .lpddr4x)
+            XCTAssertEqual(c.dramType, .lpddr4)
         }
-        // exact-type (LPDDR4) ranks first
-        XCTAssertEqual(cands.first?.dramType, .lpddr4)
         XCTAssertTrue(cands.first!.entry.displayName.contains("4GB"))
+    }
+
+    // Real OS_REG captured from an RK3588 board (rk3588 v1.21 DDR bin):
+    //   OS_REG2=0x3AF51AF5 OS_REG3=0x30001005  (group 0: ch0/1)
+    //   OS_REG4=0x3AF51AF5 OS_REG5=0x30001005  (group 1: ch2/3, identical)
+    // RK3588's 64-bit bus = 4×16-bit channels across TWO SYS_REG groups, so the
+    // capacity is the SUM of both: 4 channels, dual-CS, 16-bit each → 8192 MB.
+    // Type high bit reg3[13:12]=1 → LPDDR4X (the RK3588 bin does set it).
+    func testDecodeRK3588FourChannelCapture() {
+        let words: [UInt32] = [0, 0, 0x3AF51AF5, 0x30001005, 0x3AF51AF5, 0x30001005, 0, 0, 0, 0, 0, 0]
+        let g = OsRegDecoder.decode(words)
+        print(">>> RK3588 DECODE: version=\(g.sysRegVersion) \(g.summary())")
+        XCTAssertEqual(g.sysRegVersion, 3)
+        XCTAssertEqual(g.dramType, .lpddr4x)
+        XCTAssertEqual(g.numChannels, 4)      // 2 groups × 2 channels
+        XCTAssertEqual(g.csPerDie, 2)         // per-die/per-channel rank (NOT the 8 total)
+        XCTAssertEqual(g.totalSizeMB, 8192)   // 2 × the single-group 4096 MB
+        XCTAssertEqual(g.channels.first?.busWidthBits, 16)
+    }
+
+    // The second SYS_REG group is counted ONLY when populated: RK356x zeros
+    // os_reg4/5, so its single-group result is unchanged by the multi-group loop.
+    func testSingleGroupUnaffectedWhenSecondGroupZero() {
+        let g = OsRegDecoder.decode([0, 0, 0x1000EAF1, 0x30000001, 0, 0, 0, 0, 0, 0, 0, 0])
+        XCTAssertEqual(g.numChannels, 1)
+        XCTAssertEqual(g.totalSizeMB, 4096)   // matches testDecodeRealCapture (RK3568)
     }
 
     // A garbage geometry (all-zero SYS_REG, as a FAILED DDR init produces →

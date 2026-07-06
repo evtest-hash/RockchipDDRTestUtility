@@ -189,7 +189,7 @@ final class TestExecutionEngineTests: XCTestCase {
     private func rk3588Fixture() -> String {
         let repoRoot = URL(fileURLWithPath: #file)
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        return repoRoot.appendingPathComponent("DDRTestFiles/RK3588/16GB LPDDR5(用2片颗粒 每片颗粒2个CS 每个CS有32Gb).cfg").path
+        return repoRoot.appendingPathComponent("DDRTestFiles/RK3588/16GB LPDDR5(用2片颗粒 每片颗粒2个CS 每个CS有32Gb)焊接检测.cfg").path
     }
 }
 

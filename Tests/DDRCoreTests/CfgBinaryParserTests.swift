@@ -7,7 +7,7 @@ final class CfgBinaryParserTests: XCTestCase {
     func testRK3588ConfigParsing() throws {
         let path = fixturePath(
             soc: "RK3588",
-            fileName: "16GB LPDDR5(用2片颗粒 每片颗粒2个CS 每个CS有32Gb).cfg"
+            fileName: "16GB LPDDR5(用2片颗粒 每片颗粒2个CS 每个CS有32Gb)焊接检测.cfg"
         )
         let plan = try parser.parse(url: URL(fileURLWithPath: path))
 

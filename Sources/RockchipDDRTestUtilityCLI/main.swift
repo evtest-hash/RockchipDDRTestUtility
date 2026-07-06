@@ -11,7 +11,6 @@ struct CLIArguments {
     /// DDR auto-detect spike: download the auto-probing rkbin DDR bin (0x471),
     /// run the osregdump probe cfg, read OS_REG over USB, decode + shortlist cfg.
     var detect = false
-    var ddrBinPath: String?
     var detectCfgPath: String?
     /// How many times to run the full cfg in one process. >1 exercises the
     /// repeat-test / boot-skip path: the first run boots, and subsequent runs
@@ -51,12 +50,6 @@ struct CLIArguments {
                 args.probeBulk = true
             case "--detect":
                 args.detect = true
-            case "--ddr-bin":
-                idx += 1
-                guard idx < argv.count else {
-                    throw DDRToolError.invalidFormat("Missing value for --ddr-bin")
-                }
-                args.ddrBinPath = argv[idx]
             case "--detect-cfg":
                 idx += 1
                 guard idx < argv.count else {
@@ -87,7 +80,7 @@ func printUsageAndExit() -> Never {
       --list
       --probe-bulk [--device-id <id>]
       --cfg <cfg_path> [--device-id <id>] [--output-log <txt_path>] [--repeat N]
-      --detect [--ddr-bin <rkbin_ddr.bin>] [--detect-cfg <probe.cfg>] [--device-id <id>]
+      --detect [--detect-cfg <detect.cfg>] [--device-id <id>]
 
     Examples:
       swift run RockchipDDRTestUtilityCLI --list
@@ -218,18 +211,17 @@ struct RockchipDDRTestUtilityCLI {
         print("Device: \(device.productName) soc=\(device.socName ?? "?") pid=0x\(hex16(device.productID))")
 
         let root = CfgRepository.makeDefaultRootURL()
+        let socName = DetectProfiles.forPID(device.productID)?.soc ?? device.socName ?? ""
         let socFiles = ((try? CfgRepository(rootURL: root).discoverTestFiles()) ?? [])
-            .filter { $0.socName == (device.socName ?? "") }
+            .filter { $0.socName == socName }
 
-        // resourcesDir holds both the detect cfg and the standalone reboot bin
-        // (tools/ddr-autodetect); rkbinDir holds the rkbin DDR bin, derived from
-        // --ddr-bin if given, else defaulting alongside the repo's rkbin checkout.
+        // The self-contained detect cfg (rkbin DDR bin + Boot + osregdump +
+        // reboot) now lives in the SoC's DDRTestFiles dir alongside the real
+        // test cfgs. Default there; --detect-cfg overrides the directory.
         let resourcesDir = args.detectCfgPath.map { URL(fileURLWithPath: ($0 as NSString).deletingLastPathComponent) }
-            ?? URL(fileURLWithPath: "tools/ddr-autodetect")
-        let rkbinDir = args.ddrBinPath.map { URL(fileURLWithPath: ($0 as NSString).deletingLastPathComponent) }
-            ?? URL(fileURLWithPath: "../rkbin/bin/rk35")
+            ?? root.appendingPathComponent(socName)
 
-        let detector = DdrDetector(resourcesDir: resourcesDir, rkbinDir: rkbinDir)
+        let detector = DdrDetector(resourcesDir: resourcesDir)
         let out = try await detector.detect(transport: transport, device: device, socFiles: socFiles)
 
         print("\n=== OS_REG (raw) ===")
@@ -250,14 +242,13 @@ struct RockchipDDRTestUtilityCLI {
         } else {
             for c in cands.prefix(6) {
                 let t = c.dramType?.displayName ?? "?"
-                print(String(format: "  %@  (%@ %dMB %dCS)%@", c.entry.displayName, t, c.sizeMB, c.csCount,
-                             c.score == 2 ? " [exact type]" : " [LP4/LP4X family]"))
+                print(String(format: "  %@  (%@ %dMB %dCS)", c.entry.displayName, t, c.sizeMB, c.csCount))
             }
             if cands.count == 1 {
                 print("\nAuto-select: \(cands[0].entry.relativePath)")
             } else {
                 print("\nTop: \(cands[0].entry.relativePath)")
-                print("Multiple cfgs share this geometry (LPDDR4 vs LPDDR4X — SYS_REG can't distinguish) — confirm from the list.")
+                print("Multiple cfgs share this exact (type + capacity + CS) — they differ only in die composition — confirm from the list.")
             }
         }
     }

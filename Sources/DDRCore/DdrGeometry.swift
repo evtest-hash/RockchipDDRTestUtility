@@ -64,9 +64,12 @@ public struct DetectedGeometry: Sendable {
     public let channels: [ChannelGeometry]
     public let totalSizeMB: Int
 
-    /// Total chip-selects across all channels (= number of ranks). Used to
-    /// disambiguate cfgs that share type+size but differ in CS layout.
-    public var totalCS: Int { channels.reduce(0) { $0 + $1.rank } }
+    /// Chip-selects per die/channel (= a channel's rank). Rockchip's cfg
+    /// filenames label CS PER DIE ("每片颗粒M个CS" / "用M个CS"), NOT the total
+    /// across channels, so this — not the sum — is the field to match on. All
+    /// channels of a part are identical here, so the first channel's rank is
+    /// representative (falls back to the max if a mixed config ever appears).
+    public var csPerDie: Int { channels.map { $0.rank }.max() ?? 0 }
 
     /// Human-readable one-liner, mirroring the DDR bin's own print format.
     public func summary() -> String {
@@ -125,20 +128,62 @@ public enum OsRegDecoder {
     /// `osreg[3]` = SYS_REG3. The DDR type is a 5-bit field split across both
     /// registers; rank and CS row also draw high bits from SYS_REG3.
     ///
-    /// LPDDR4 vs LPDDR4X: the SYS_REG DDRTYPE field distinguishes them ONLY if the
-    /// DDR bin encodes the high type bits (reg3[13:12]); many bins store LPDDR4 (7)
-    /// for both and distinguish LP4X via head-info elsewhere. So LP4/LP4X may not
-    /// be separable from OS_REG readback — CfgAutoSelect treats them as one family.
+    /// DDRTYPE is the authoritative 5-bit code from `sdram.h`: LPDDR4 (7) and
+    /// LPDDR4X (8) are DISTINCT values, carried by reg2[15:13] (low 3 bits) and
+    /// reg3[13:12] (high 2 bits) exactly as `SYS_REG_ENC/DEC_DDRTYPE_V3` define.
+    /// We decode the full field and report the exact type; `CfgAutoSelect` matches
+    /// it exactly (no LP4/LP4X folding). Note `sdram.h` has no LPDDR5X code — both
+    /// LPDDR5 and LPDDR5X are 9, so an LPDDR5X part simply reads back as LPDDR5.
     public static func decode(_ osreg: [UInt32]) -> DetectedGeometry {
-        let reg2 = osreg.count > 2 ? osreg[2] : 0
-        let reg3 = osreg.count > 3 ? osreg[3] : 0
-
-        // VERSION: SYS_REG3[31:28].  DDRTYPE_V3: reg2[15:13] low3 | reg3[13:12] high2.
-        let version = bits(reg3, 28, 0xf)
-        let typeRaw = bits(reg2, 13, 0x7) | (bits(reg3, 12, 0x3) << 3)
+        // A single SYS_REG descriptor (one reg2/reg3 pair) covers at most 2
+        // channels (NUM_CH is 1 bit). SoCs with more physical channels write
+        // additional descriptors in consecutive os_reg pairs: RK356x uses one
+        // group at (os_reg2, os_reg3); RK3588 (64-bit bus = 4×16-bit channels)
+        // uses TWO — (os_reg2,os_reg3) for ch0/1 and (os_reg4,os_reg5) for ch2/3
+        // — so total capacity is the SUM across groups (confirmed on hardware:
+        // an RK3588 8GB board reports reg2/3 == reg4/5, each decoding to 4GB).
+        // Version + DRAM type come from the first (primary) group.
+        let reg3_0 = osreg.count > 3 ? osreg[3] : 0
+        let reg2_0 = osreg.count > 2 ? osreg[2] : 0
+        let version = bits(reg3_0, 28, 0xf)                                  // SYS_REG3[31:28]
+        let typeRaw = bits(reg2_0, 13, 0x7) | (bits(reg3_0, 12, 0x3) << 3)   // DDRTYPE_V3
         let dramType = DramType(rawValue: typeRaw)
-        let numCh = 1 + bits(reg2, 12, 0x1)   // NUM_CH: reg2[12]
 
+        var channels: [ChannelGeometry] = []
+        var totalBytes: UInt64 = 0
+        // Groups live at (os_reg2,3), (os_reg4,5), … The first is always decoded;
+        // each later pair counts only if it's a valid same-version descriptor
+        // (non-zero reg2, matching version nibble) — RK356x's zeroed reg4/5 stop
+        // the loop, so its single-group result is unchanged.
+        var group = 0
+        while true {
+            let i2 = 2 + 2 * group, i3 = 3 + 2 * group
+            guard osreg.count > i3 else { break }
+            let reg2 = osreg[i2], reg3 = osreg[i3]
+            if group > 0 {
+                guard reg2 != 0, bits(reg3, 28, 0xf) == version else { break }
+            }
+            let (chs, bytes) = decodeGroup(reg2: reg2, reg3: reg3)
+            channels.append(contentsOf: chs)
+            totalBytes += bytes
+            group += 1
+            if group >= 5 { break }   // 12 os_reg words → at most 5 pairs from index 2
+        }
+
+        return DetectedGeometry(
+            rawOsReg: osreg,
+            sysRegVersion: version,
+            dramType: dramType,
+            numChannels: channels.count,
+            channels: channels,
+            totalSizeMB: Int(totalBytes >> 20))
+    }
+
+    /// Decodes one SYS_REG descriptor (a reg2/reg3 pair) into its channels and
+    /// byte capacity, per the Rockchip `_V3` macros. NUM_CH (reg2[12]) selects 1
+    /// or 2 channels within this group.
+    private static func decodeGroup(reg2: UInt32, reg3: UInt32) -> ([ChannelGeometry], UInt64) {
+        let numCh = 1 + bits(reg2, 12, 0x1)   // NUM_CH: reg2[12]
         var channels: [ChannelGeometry] = []
         var totalBytes: UInt64 = 0
         for ch in 0..<numCh {
@@ -174,13 +219,6 @@ public enum OsRegDecoder {
             if row34 { chBytes = chBytes / 4 * 3 }
             totalBytes += chBytes
         }
-
-        return DetectedGeometry(
-            rawOsReg: osreg,
-            sysRegVersion: version,
-            dramType: dramType,
-            numChannels: numCh,
-            channels: channels,
-            totalSizeMB: Int(totalBytes >> 20))
+        return (channels, totalBytes)
     }
 }

@@ -2,29 +2,51 @@ import XCTest
 @testable import DDRCore
 
 final class DetectCfgTests: XCTestCase {
-    /// The detect cfg must carry ONLY Boot + osregdump. reboot must NOT be a
-    /// record in this cfg: TestExecutionEngine.run() executes every non-Boot
-    /// item in file order, so an embedded "reboot" record would auto-fire
-    /// immediately after osregdump — resetting the device to maskrom before
-    /// DdrDetector's OS_REG retry loop / explicit rebootToMaskrom() ever runs.
-    /// Reboot instead ships as a standalone raw payload (rk3568_reboot.bin)
-    /// that the host loads and runs explicitly, after OS_REG capture.
-    func testDetectCfgHasOnlyBootAndProbe() throws {
-        let path = FileManager.default.currentDirectoryPath + "/tools/ddr-autodetect/rk3568_osregdump.cfg"
+    /// The detect cfg is a self-contained PACKAGING container: it carries all
+    /// four payloads the detect flow needs — Boot + ddrbin + osregdump + reboot.
+    /// DdrDetector pulls each out of embeddedBins and drives the sequence itself
+    /// (it never runs the cfg through TestExecutionEngine), so embedding reboot
+    /// here is safe: the detector runs it explicitly, after OS_REG capture.
+    func testDetectCfgPackagesAllPayloads() throws {
+        let path = FileManager.default.currentDirectoryPath + "/DDRTestFiles/RK3568&RK3566/DDR自动探测.cfg"
         try XCTSkipUnless(FileManager.default.fileExists(atPath: path))
         let plan = try CfgBinaryParser().parse(url: URL(fileURLWithPath: path))
         XCTAssertEqual(plan.downloadBaseAddress, 0xFDCC_4000)
         let names = plan.items.map { $0.name.lowercased() }
         XCTAssertTrue(names.contains("boot"))
+        XCTAssertTrue(names.contains("ddrbin"))
         XCTAssertTrue(names.contains("osregdump"))
-        XCTAssertFalse(names.contains("reboot"), "reboot must not be embedded in the detect cfg")
-        XCTAssertEqual(names.count, 2)
+        XCTAssertTrue(names.contains("reboot"))
+        XCTAssertEqual(names.count, 4)
     }
 
-    func testStandaloneRebootBinExists() throws {
-        let path = FileManager.default.currentDirectoryPath + "/tools/ddr-autodetect/rk3568_reboot.bin"
+    /// Every packaged payload must round-trip out of the cfg non-empty (Boot raw,
+    /// the rest RC4-decrypted by the parser). The rkbin DDR bin is the largest.
+    func testDetectCfgPayloadsNonEmpty() throws {
+        let path = FileManager.default.currentDirectoryPath + "/DDRTestFiles/RK3568&RK3566/DDR自动探测.cfg"
         try XCTSkipUnless(FileManager.default.fileExists(atPath: path))
-        let data = try Data(contentsOf: URL(fileURLWithPath: path))
-        XCTAssertGreaterThan(data.count, 0)
+        let plan = try CfgBinaryParser().parse(url: URL(fileURLWithPath: path))
+        for name in ["Boot", "ddrbin", "osregdump", "reboot"] {
+            let bin = plan.embeddedBins.first { $0.key.caseInsensitiveCompare(name) == .orderedSame }?.value
+            XCTAssertNotNil(bin, "missing payload \(name)")
+            XCTAssertGreaterThan(bin?.count ?? 0, 0, "empty payload \(name)")
+        }
+        let ddrbin = plan.embeddedBins.first { $0.key.caseInsensitiveCompare("ddrbin") == .orderedSame }?.value
+        XCTAssertGreaterThan(ddrbin?.count ?? 0, 10_000)
+    }
+
+    /// RK3588's detect cfg is built the same way (build.sh) with RK3588 addresses
+    /// and packages all four payloads; its item download base is 0xFF004000.
+    func testRK3588DetectCfgPackagesAllPayloads() throws {
+        let path = FileManager.default.currentDirectoryPath + "/DDRTestFiles/RK3588/DDR自动探测.cfg"
+        try XCTSkipUnless(FileManager.default.fileExists(atPath: path))
+        let plan = try CfgBinaryParser().parse(url: URL(fileURLWithPath: path))
+        XCTAssertEqual(plan.downloadBaseAddress, 0xFF00_4000)
+        let names = plan.items.map { $0.name.lowercased() }
+        XCTAssertEqual(names.count, 4)
+        for name in ["Boot", "ddrbin", "osregdump", "reboot"] {
+            let bin = plan.embeddedBins.first { $0.key.caseInsensitiveCompare(name) == .orderedSame }?.value
+            XCTAssertGreaterThan(bin?.count ?? 0, 0, "empty/missing payload \(name)")
+        }
     }
 }

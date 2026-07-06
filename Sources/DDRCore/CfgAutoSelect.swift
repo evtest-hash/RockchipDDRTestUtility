@@ -15,18 +15,12 @@ public enum CfgAutoSelect {
         public let dramType: DramType?
         public let sizeMB: Int
         public let csCount: Int         // 0 = unknown
-        public let score: Int           // higher = better match
     }
 
-    /// Two LPDDR4 variants (LPDDR4 / LPDDR4X) share electrical geometry and are
-    /// hard to tell apart from OS_REG alone, so treat them as one family.
-    private static func sameFamily(_ a: DramType, _ b: DramType) -> Bool {
-        if a == b { return true }
-        let lp4: Set<DramType> = [.lpddr4, .lpddr4x]
-        return lp4.contains(a) && lp4.contains(b)
-    }
-
-    /// Parse chip-select count from a filename ("用2个CS" / "2个cs" / "4 CS").
+    /// Parse the PER-DIE chip-select count from a filename. Rockchip labels CS
+    /// per die, not per module: RK356x "用2个CS", RK3588 "每片颗粒2个CS" — the
+    /// regex picks up the digit immediately before 个?CS in both, which is the
+    /// per-die value to match against `DetectedGeometry.csPerDie`.
     public static func csCount(fromFilename name: String) -> Int {
         if let m = name.range(of: #"(\d+)\s*个?\s*[Cc][Ss]"#, options: .regularExpression) {
             let digits = name[m].prefix { $0.isNumber }
@@ -70,12 +64,18 @@ public enum CfgAutoSelect {
     /// config isn't in the library, or DDR init failed and the geometry is garbage
     /// (e.g. all-zero SYS_REG decodes to a bogus part that matches nothing here).
     ///
-    /// Capacity and CS come straight from the decoded geometry. Type matches by
-    /// family: SYS_REG reports LPDDR4 for both LPDDR4 and LPDDR4X (it cannot tell
-    /// them apart — see `OsRegDecoder`), so an LPDDR4 detection matches both and
-    /// the caller resolves that tie (results are ordered exact-type first).
+    /// Type matches EXACTLY per the Rockchip SYS_REG standard (U-Boot `sdram.h`):
+    /// LPDDR4 (7) and LPDDR4X (8) are distinct DDRTYPE codes that the V3 encoder
+    /// and `OsRegDecoder` both represent fully, so we trust the decoded type and
+    /// do NOT fold LP4/LP4X together. (LPDDR5X has no separate `sdram.h` code —
+    /// both LPDDR5 and LPDDR5X are 9 — so an LPDDR5X part and an "LPDDR5X"-named
+    /// cfg both resolve to `.lpddr5` and match without any special-casing.)
+    ///
+    /// More than one candidate can still come back when the library holds several
+    /// cfgs with the same (type, capacity, CS) that differ only in die
+    /// composition — a real ambiguity the caller surfaces for the user to resolve.
     public static func rank(geometry: DetectedGeometry, socFiles: [TestFileEntry]) -> [Candidate] {
-        guard let g = geometry.dramType, geometry.totalSizeMB > 0, geometry.totalCS > 0 else { return [] }
+        guard let g = geometry.dramType, geometry.totalSizeMB > 0, geometry.csPerDie > 0 else { return [] }
         let solder = socFiles.filter { $0.displayName.contains("焊接") }
         let pool = solder.isEmpty ? socFiles : solder
         var out: [Candidate] = []
@@ -83,11 +83,10 @@ public enum CfgAutoSelect {
             guard let t = dramType(fromFilename: e.displayName) else { continue }
             let sz = sizeMB(fromFilename: e.displayName)
             let cs = csCount(fromFilename: e.displayName)
-            guard sz == geometry.totalSizeMB, cs == geometry.totalCS, sameFamily(t, g) else { continue }
-            let score = (t == g) ? 2 : 1   // exact type ranks above LP4/LP4X family
-            out.append(Candidate(entry: e, dramType: t, sizeMB: sz, csCount: cs, score: score))
+            guard sz == geometry.totalSizeMB, cs == geometry.csPerDie, t == g else { continue }
+            out.append(Candidate(entry: e, dramType: t, sizeMB: sz, csCount: cs))
         }
-        return out.sorted { $0.score > $1.score }
+        return out
     }
 
     /// Picks the best-ranked candidate that is actually present in `files`

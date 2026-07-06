@@ -5,10 +5,10 @@ import XCTest
 
 final class DdrDetectorTests: XCTestCase {
     func testUnsupportedSocThrows() async {
-        let det = DdrDetector(resourcesDir: URL(fileURLWithPath: "/tmp"),
-                              rkbinDir: URL(fileURLWithPath: "/tmp"))
-        let dev = UsbDevice(deviceID: "x", vendorID: 0x2207, productID: 0x350B,
-                            productName: "RK3588", serialNumber: nil, socName: "RK3588")
+        let det = DdrDetector(resourcesDir: URL(fileURLWithPath: "/tmp"))
+        // 0x350C (RK3562) has no DetectProfile yet → the unsupportedSoc guard fires.
+        let dev = UsbDevice(deviceID: "x", vendorID: 0x2207, productID: 0x350C,
+                            productName: "RK3562", serialNumber: nil, socName: "RK3562")
         do {
             _ = try await det.detect(transport: MockTransport(), device: dev, socFiles: [])
             XCTFail("expected unsupportedSoc")

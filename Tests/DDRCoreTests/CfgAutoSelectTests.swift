@@ -7,14 +7,15 @@ final class CfgAutoSelectTests: XCTestCase {
         TestFileEntry(absolutePath: path, relativePath: path, socName: soc, displayName: path)
     }
 
-    private func candidate(_ e: TestFileEntry, score: Int) -> CfgAutoSelect.Candidate {
-        CfgAutoSelect.Candidate(entry: e, dramType: nil, sizeMB: 0, csCount: 0, score: score)
+    private func candidate(_ e: TestFileEntry) -> CfgAutoSelect.Candidate {
+        CfgAutoSelect.Candidate(entry: e, dramType: nil, sizeMB: 0, csCount: 0)
     }
 
     func testFirstAvailablePicksTopRankedCandidatePresentInFiles() {
         let best = entry("/a/8GB LPDDR4X.cfg")
         let second = entry("/a/4GB LPDDR4X.cfg")
-        let candidates = [candidate(best, score: 200), candidate(second, score: 100)]
+        // `rank()` returns candidates best-first; firstAvailable honors that order.
+        let candidates = [candidate(best), candidate(second)]
         let files = [best, second]
 
         XCTAssertEqual(CfgAutoSelect.firstAvailable(candidates, in: files)?.id, best.id)
@@ -25,7 +26,7 @@ final class CfgAutoSelectTests: XCTestCase {
         let present = entry("/a/4GB LPDDR4X.cfg")
         // Best-ranked candidate (`missing`) no longer exists in the loaded file
         // set — firstAvailable should fall through to the next one that does.
-        let candidates = [candidate(missing, score: 200), candidate(present, score: 100)]
+        let candidates = [candidate(missing), candidate(present)]
         let files = [present]
 
         XCTAssertEqual(CfgAutoSelect.firstAvailable(candidates, in: files)?.id, present.id)
@@ -33,7 +34,7 @@ final class CfgAutoSelectTests: XCTestCase {
 
     func testFirstAvailableReturnsNilWhenNoCandidatePresent() {
         let missing = entry("/a/8GB LPDDR4X.cfg")
-        let candidates = [candidate(missing, score: 200)]
+        let candidates = [candidate(missing)]
         let files: [TestFileEntry] = []
 
         XCTAssertNil(CfgAutoSelect.firstAvailable(candidates, in: files))

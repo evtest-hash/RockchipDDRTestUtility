@@ -609,7 +609,8 @@ final class MainViewModel: ObservableObject {
         Self.dlog("detect start: device=\(device.deviceID) pid=0x\(String(format: "%04X", device.productID))")
         do {
             let transport = try makeTransport()
-            let det = DdrDetector(resourcesDir: detectResourcesDir(), rkbinDir: rkbinDir())
+            let socName = DetectProfiles.forPID(device.productID)?.soc ?? device.socName ?? ""
+            let det = DdrDetector(resourcesDir: detectResourcesDir(soc: socName))
             let out = try await det.detect(transport: transport, device: device, socFiles: filesForSelectedSoc)
             // Detection succeeds ONLY on an exact (type + capacity + CS) match.
             // `out.candidates` is already the exact-match set (empty ⇒ no match).
@@ -630,9 +631,11 @@ final class MainViewModel: ObservableObject {
                 statusMessage = "检测到 \(out.geometry.summary())(已预选 cfg),但设备未回到 MASKROM,请重新插拔后再测"
                 Self.dlog("matched but not rebooted → skip auto-test; user must replug")
             } else {
-                let ambiguous = out.candidates.count > 1   // LP4/LP4X share geometry
+                // >1 exact match means the library holds several cfgs with the
+                // same (type + capacity + CS) differing only in die composition.
+                let ambiguous = out.candidates.count > 1
                 statusMessage = ambiguous
-                    ? "检测到 \(out.geometry.summary()) — 已预选 cfg(LPDDR4/LPDDR4X 同几何,可改选)"
+                    ? "检测到 \(out.geometry.summary()) — 已预选 cfg(多个同规格 cfg,可改选)"
                     : "检测到 \(out.geometry.summary()) — 已预选 cfg"
                 // TODO(hw联调): reboot re-enumerates the device (deviceID may
                 // change); startTest falls back to devices.first when the saved
@@ -655,41 +658,14 @@ final class MainViewModel: ObservableObject {
         fputs("[DDRDetect] \(message)\n", stderr)
     }
 
-    /// Directory holding the DDR auto-detect resources: the per-SoC detect cfg
-    /// (`DetectProfile.detectCfgName`, e.g. `rk3568_osregdump.cfg`) and the
-    /// standalone reboot-to-maskrom payload (`DetectProfile.rebootBinName`,
-    /// e.g. `rk3568_reboot.bin`) — both must live in the same directory (see
-    /// `DdrDetector`). Mirrors `CfgRepository.makeDefaultRootURL()`'s
-    /// bundle-vs-dev probing: a packaged app would bundle these under
-    /// `Resources/ddr-autodetect`, while `swift run` / dev finds them
-    /// CWD-relative at `tools/ddr-autodetect` — the same default the CLI's
-    /// `--detect` mode falls back to (`RockchipDDRTestUtilityCLI/main.swift`).
-    /// NOTE: `scripts/package.sh` does not yet copy this directory into the
-    /// `.app` bundle; the bundle branch is forward-looking for when packaging
-    /// is updated, and is inert (falls through) until then.
-    private func detectResourcesDir() -> URL {
-        if let resourceURL = Bundle.main.resourceURL {
-            let bundled = resourceURL.appendingPathComponent("ddr-autodetect")
-            if FileManager.default.fileExists(atPath: bundled.path) {
-                return bundled
-            }
-        }
-        return URL(fileURLWithPath: "tools/ddr-autodetect")
-    }
-
-    /// Directory holding the per-SoC rkbin auto-probing DDR bins
-    /// (`DetectProfile.ddrBinName`, e.g. `rk3568_ddr_1560MHz_v1.25.bin`). Same
-    /// bundle-vs-dev probing as `detectResourcesDir()`; the dev/CWD-relative
-    /// default matches the CLI's `--detect` fallback (a sibling `rkbin`
-    /// checkout next to this repo). See the bundling caveat on
-    /// `detectResourcesDir()` — likewise inert until packaging is updated.
-    private func rkbinDir() -> URL {
-        if let resourceURL = Bundle.main.resourceURL {
-            let bundled = resourceURL.appendingPathComponent("rkbin")
-            if FileManager.default.fileExists(atPath: bundled.path) {
-                return bundled
-            }
-        }
-        return URL(fileURLWithPath: "../rkbin/bin/rk35")
+    /// Directory holding the single self-contained DDR auto-detect cfg
+    /// (`DetectProfile.detectCfgName`, e.g. `DDR自动探测.cfg`), which packages
+    /// every payload the detect flow needs (rkbin DDR bin, Boot, osregdump,
+    /// reboot). It lives in the SoC's `DDRTestFiles/<soc>/` dir alongside the
+    /// real test cfgs, so it is discovered and bundled by the exact same path as
+    /// every other cfg (`CfgRepository.makeDefaultRootURL()` → bundle or dev CWD,
+    /// and `scripts/package.sh` already copies `DDRTestFiles/` into the `.app`).
+    private func detectResourcesDir(soc: String) -> URL {
+        CfgRepository.makeDefaultRootURL().appendingPathComponent(soc)
     }
 }
