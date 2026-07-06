@@ -43,11 +43,26 @@ public actor DdrDetector {
         let cfgURL = resourcesDir.appendingPathComponent(profile.detectCfgName)
         let plan = try parser.parse(url: cfgURL)
 
+        // --- phase timing (diagnostic; stderr) ---
+        var mark = Date()
+        func phase(_ label: String) {
+            let now = Date()
+            fputs("[DDRDetect/timing] \(label): \(Int(now.timeIntervalSince(mark) * 1000))ms\n", stderr)
+            mark = now
+        }
+
         // ① rkbin DDR bin via 0x471
         if !transport.isOpen { try transport.open(device: device) }
         let ddrItem = CfgItem(name: "ddrbin", payloadOffset: 0, payloadLength: ddrBin.count)
         try transport.downloadBoot(item: ddrItem, payload: ddrBin)
-        try await Task.sleep(nanoseconds: 1_500_000_000)
+        phase("① open+rkbin download (\(ddrBin.count)B)")
+        // Let the rkbin DDR bin finish auto-detect + write OS_REG before we load
+        // the Test Tool Boot over it. DDR training on RK3568 completes well under
+        // this; if it ever isn't ready the OS_REG parse below simply misses and
+        // the in-session retry loop re-reads it, so this is a floor, not a
+        // correctness dependency.
+        try await Task.sleep(nanoseconds: 600_000_000)
+        phase("settle-after-rkbin")
 
         // ②③ run detect cfg (Boot + osregdump) on the same handle; collect printf.
         // NOTE: adapted from the brief's live-mutating closure (`captured += ...`
@@ -60,7 +75,8 @@ public actor DdrDetector {
         // `result.logs.filter { $0.code == "INFO_PRINTF" }` approach.
         let engine = TestExecutionEngine(parser: parser, transport: transport)
         let result = await engine.run(cfgPath: cfgURL.path, selectedDeviceID: device.deviceID,
-                                      skipBoot: false, keepTransportOpen: true)
+                                      skipBoot: false, keepTransportOpen: true, bootSettleMs: 300)
+        phase("②③ engine.run (Test Tool Boot + osregdump)")
         var captured = result.logs
             .filter { $0.code == "INFO_PRINTF" }
             .map { $0.message }
@@ -84,6 +100,7 @@ public actor DdrDetector {
                 }
                 words = OsRegDecoder.parseProbeOutput(captured)
             }
+            phase("capture retries")
         }
         guard let words else { throw DetectError.noOsReg }
 
@@ -96,6 +113,7 @@ public actor DdrDetector {
         // only ever fires here, explicitly — never mid-capture.
         let rebooted = (try? await rebootToMaskrom(transport: transport, profile: profile,
                                                     plan: plan, device: device)) ?? false
+        phase("④⑤ reboot + re-enum (rebooted=\(rebooted))")
         return DetectOutcome(rawOsReg: words, geometry: geo, candidates: candidates,
                              rebootedToMaskrom: rebooted)
     }

@@ -34,7 +34,11 @@ public actor TestExecutionEngine {
         self.logHandler = logHandler
     }
 
-    public func run(cfgPath: String, selectedDeviceID: String? = nil, skipBoot: Bool = false, keepTransportOpen: Bool = false) async -> ExecutionResult {
+    /// `bootSettleMs` overrides the post-boot settle delay for this run only
+    /// (default `nil` → `defaultBootSettleDelayMs`, 1000ms — the value the real
+    /// soldering test relies on). DDR auto-detect passes a shorter value because
+    /// the DDR Test Tool Boot comes up fast and a missed drain is retried anyway.
+    public func run(cfgPath: String, selectedDeviceID: String? = nil, skipBoot: Bool = false, keepTransportOpen: Bool = false, bootSettleMs: UInt64? = nil) async -> ExecutionResult {
         let context = RunContext(startedAt: Date())
 
         do {
@@ -103,7 +107,7 @@ public actor TestExecutionEngine {
                         )
                     }
 
-                    try await Task.sleep(nanoseconds: defaultBootSettleDelayMs * 1_000_000)
+                    try await Task.sleep(nanoseconds: (bootSettleMs ?? defaultBootSettleDelayMs) * 1_000_000)
 
                     // Post-boot handshake: send a single opcode-0 poll to verify
                     // the booted firmware is responding to US (not another process).

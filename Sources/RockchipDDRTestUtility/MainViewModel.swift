@@ -535,6 +535,7 @@ final class MainViewModel: ObservableObject {
                        DetectProfiles.forPID(device.productID) != nil {
                         if !hasDetectedForCurrentDevice {
                             hasDetectedForCurrentDevice = true
+                            Self.dlog("new profiled device arrived (pid=0x\(String(format: "%04X", device.productID))) → launch auto-detect")
                             Task { await runDetectThenMaybeTest(device) }
                         }
                     } else {
@@ -605,11 +606,13 @@ final class MainViewModel: ObservableObject {
         statusMessage = "正在检测 DDR…"
         stopKeepAlive()
         defer { isDetecting = false }
+        Self.dlog("detect start: device=\(device.deviceID) pid=0x\(String(format: "%04X", device.productID))")
         do {
             let transport = try makeTransport()
             let det = DdrDetector(resourcesDir: detectResourcesDir(), rkbinDir: rkbinDir())
             let out = try await det.detect(transport: transport, device: device, socFiles: filesForSelectedSoc)
             let matched = applyDetectCandidates(out.candidates) != nil
+            Self.dlog("detect ok: \(out.geometry.summary()) rebootedToMaskrom=\(out.rebootedToMaskrom) matched=\(matched) selected=\(selectedFileID ?? "nil")")
             if !matched {
                 selectedFileID = filesForSelectedSoc.first?.id
             }
@@ -629,15 +632,25 @@ final class MainViewModel: ObservableObject {
                 // (and the startTest() it schedules) still use the
                 // `selectedDeviceID` captured before this probe ran; if the ID
                 // changed, that boot attempt targets a now-stale device path.
+                Self.dlog("rebooted to MASKROM; autoTestEnabled=\(autoTestEnabled) → maybeAutoTest()")
                 maybeAutoTest()
             } else {
                 statusMessage = "检测到 \(out.geometry.summary()),但设备未回到 MASKROM,请重新插拔设备后再测"
+                Self.dlog("NOT rebooted to MASKROM — skipping auto-test; user must replug")
             }
         } catch {
             selectedFileID = filesForSelectedSoc.first?.id
             statusMessage = "DDR 自动检测失败(\(error)),设备可能需重新插拔;或手动选择 cfg"
             setDeviceNeedsBoot(true)
+            Self.dlog("detect FAILED: \(error) — fell back to manual selection")
         }
+    }
+
+    /// Diagnostic log to stderr for the DDR auto-detect flow (mirrors
+    /// CfgRepository's stderr logging). Visible when the GUI is launched from a
+    /// terminal; keeps the detect path observable without a UI console.
+    private static func dlog(_ message: String) {
+        fputs("[DDRDetect] \(message)\n", stderr)
     }
 
     /// Directory holding the DDR auto-detect resources: the per-SoC detect cfg
