@@ -170,17 +170,33 @@ extension DdrGeometryTests {
         XCTAssertEqual(g.totalSizeMB, 4096)   // matches testDecodeRealCapture (RK3568)
     }
 
+    // Real OS_REG captured from an RK3576 board (rk3576 v1.12 LPDDR5 bin):
+    //   OS_REG2=0x3BF53BF5 OS_REG3=0x30001005 (single group; os_reg4/5=0).
+    // The DDR bin printed "Bk=16 … Size=4096MB/channel" (2 channels → 8 GB). The
+    // SYS_REG BK field decodes to 2 (4 banks), but LPDDR5 has 16 banks, so the
+    // decoder must correct bank→4 by type — else it under-counts 4× (2 GB).
+    func testDecodeRK3576LPDDR5BankCorrection() {
+        let words: [UInt32] = [0, 0, 0x3BF53BF5, 0x30001005, 0, 0, 1, 0, 0, 0, 0, 0]
+        let g = OsRegDecoder.decode(words)
+        print(">>> RK3576 DECODE: version=\(g.sysRegVersion) \(g.summary())")
+        XCTAssertEqual(g.dramType, .lpddr5)
+        XCTAssertEqual(g.numChannels, 2)
+        XCTAssertEqual(g.csPerDie, 2)
+        XCTAssertEqual(g.channels.first?.bank, 4)     // LPDDR5 16 banks (not the raw 2)
+        XCTAssertEqual(g.totalSizeMB, 8192)           // 2ch × 2CS × 2GB — matches the bin's print
+    }
+
     // A garbage geometry (all-zero SYS_REG, as a FAILED DDR init produces →
-    // decodes to a bogus DDR4 128MB 1CS) must match NOTHING: detection fails
-    // rather than confidently offering a wrong cfg.
+    // decodes to a bogus DDR4 256MB 1CS: type 0, 1 bank-group bit from dbw) must
+    // match NOTHING: detection fails rather than offering a wrong cfg.
     func testGarbageGeometryMatchesNothing() throws {
         let root = FileManager.default.currentDirectoryPath + "/DDRTestFiles"
         guard FileManager.default.fileExists(atPath: root) else { throw XCTSkip("no DDRTestFiles") }
         let soc = try CfgRepository(rootURL: URL(fileURLWithPath: root)).discoverTestFiles()
             .filter { $0.socName == "RK3568&RK3566" }
         try XCTSkipIf(soc.isEmpty, "no RK3568 cfgs")
-        let g = OsRegDecoder.decode([0, 0, 0, 0])   // all-zero → DDR4 128MB 1CS (bogus)
-        XCTAssertEqual(g.totalSizeMB, 128)          // no RK3568 cfg is 128 MB
+        let g = OsRegDecoder.decode([0, 0, 0, 0])   // all-zero → bogus DDR4 256MB 1CS
+        XCTAssertEqual(g.totalSizeMB, 256)          // no RK3568 cfg is 256 MB
         XCTAssertTrue(CfgAutoSelect.rank(geometry: g, socFiles: soc).isEmpty)
     }
 }

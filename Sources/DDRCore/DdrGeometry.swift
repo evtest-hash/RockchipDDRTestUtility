@@ -163,7 +163,7 @@ public enum OsRegDecoder {
             if group > 0 {
                 guard reg2 != 0, bits(reg3, 28, 0xf) == version else { break }
             }
-            let (chs, bytes) = decodeGroup(reg2: reg2, reg3: reg3)
+            let (chs, bytes) = decodeGroup(reg2: reg2, reg3: reg3, dramType: dramType)
             channels.append(contentsOf: chs)
             totalBytes += bytes
             group += 1
@@ -182,7 +182,7 @@ public enum OsRegDecoder {
     /// Decodes one SYS_REG descriptor (a reg2/reg3 pair) into its channels and
     /// byte capacity, per the Rockchip `_V3` macros. NUM_CH (reg2[12]) selects 1
     /// or 2 channels within this group.
-    private static func decodeGroup(reg2: UInt32, reg3: UInt32) -> ([ChannelGeometry], UInt64) {
+    private static func decodeGroup(reg2: UInt32, reg3: UInt32, dramType: DramType?) -> ([ChannelGeometry], UInt64) {
         let numCh = 1 + bits(reg2, 12, 0x1)   // NUM_CH: reg2[12]
         var channels: [ChannelGeometry] = []
         var totalBytes: UInt64 = 0
@@ -194,15 +194,36 @@ public enum OsRegDecoder {
                 ? (1 << (bits(reg2, 11, 0x1) | (bits(reg3, 14, 0x1) << 1)))
                 : (1 + bits(reg2, 11 + s, 0x1))
             let col = 9 + bits(reg2, 9 + s, 0x3)
-            let bank = 3 - bits(reg2, 8 + s, 0x1)
+            // BW/DBW_V3: DEC = 2 >> code; width bits = 8 << (that). dbwCode is also
+            // the `cap_info->dbw` U-Boot uses for its DDR4 bank-group term.
+            let busWidthBits = 8 << (2 >> bits(reg2, 2 + s, 0x3))
+            let dbwCode = bits(reg2, 0 + s, 0x3)
+            let dieWidthBits = 8 << (2 >> dbwCode)
+            // Total BANK address bits, matching the rkbin DDR bin's own capacity
+            // routine (RE'd from rk3576 v1.12, get_cs_cap @0xde8:
+            // `cap = 1 << (bw + col + bg + bk + row)`).
+            //
+            // SYS_REG_ENC_BK is 1-bit — `(bk==3)?0:1` — so the wire only tells us
+            // "bk==3" vs "bk≠3"; it can't say WHICH non-3 value. We must NOT hard-
+            // code a bank count (RK3576 cfgs parameterise by die_cap, not bank, and
+            // different LPDDR5 die densities decompose to different bank counts, so
+            // "LPDDR5 ⇒ 16 banks" would be wrong for an 8-bank LPDDR5 die). Instead
+            // read reg2[8] and disambiguate ONLY the lossy `≠3` case by type:
+            //   reg2[8]=0 ⟹ bk=3 (8 banks) for every type — faithful, untouched.
+            //   reg2[8]=1 ⟹ LPDDR5/DDR5: 16 banks (bk=4); others: 4 banks (bk=2).
+            // HW-confirmed on RK3576 (reg2[8]=1, LPDDR5 → bk=4 → 8 GB, matching the
+            // bin's "Bk=16 / Size=4096MB/channel").
+            let bkBit = bits(reg2, 8 + s, 0x1)
+            let bk = (dramType == .lpddr5 || dramType == .ddr5) ? (3 + bkBit) : (3 - bkBit)
+            // bg (bank-group bits): the bin adds these ONLY for DDR4 (it gates on
+            // `dram_type == 0`), derived from die width: bg = (dbw==0)?2:1.
+            let bg = (dramType == .ddr4) ? ((2 >> dbwCode == 0) ? 2 : 1) : 0
+            let bank = bk + bg
             // CS0/CS1 ROW_V3: 2 low bits in reg2 + 1 high bit in reg3.
             let cs0Row = (((bits(reg2, 6 + s, 0x3) | (bits(reg3, 5 + 2 * ch, 0x1) << 2)) + 1) & 0x7) + 12
             let cs1Row = (((bits(reg2, 4 + s, 0x3) | (bits(reg3, 4 + 2 * ch, 0x1) << 2)) + 1) & 0x7) + 12
             let cs1Col = 9 + bits(reg3, 2 * ch, 0x3)     // CS1_COL_V3 (reg3[1:0] for ch0)
             let row34 = bits(reg2, 30 + ch, 0x1) != 0    // ROW_3_4: only 3/4 of rows populated
-            // BW/DBW_V3: DEC = 2 >> code; bus width bits = 8 << (that).
-            let busWidthBits = 8 << (2 >> bits(reg2, 2 + s, 0x3))
-            let dieWidthBits = 8 << (2 >> bits(reg2, 0 + s, 0x3))
 
             channels.append(ChannelGeometry(
                 rank: rank, col: col, bank: bank,
