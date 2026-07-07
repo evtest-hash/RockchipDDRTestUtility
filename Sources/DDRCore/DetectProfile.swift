@@ -16,7 +16,14 @@ public struct DetectProfile: Sendable {
     public let downloadBase: UInt32   // item download/run base
     public let usbPutsVector: UInt32  // Boot service vector: puts -> USB ring (0x80-readable)
     public let osRegBase: UInt32      // PMU_GRF OS_REG0 address
-    public let bootModeReg: UInt32    // reboot-to-maskrom: boot-mode register
+    /// reboot-to-maskrom: register where the BROM_DOWNLOAD magic goes. This is the
+    /// SoC's CONFIG_ROCKCHIP_BOOT_MODE_REG — the register the NEXT-STAGE loader
+    /// (eMMC/SD U-Boot TPL/SPL) reads early to decide `back_to_bootrom()`. The
+    /// BootROM itself never checks it (see U-Boot bootrom.c), so on a board with
+    /// bootable media the magic MUST land in this exact register or the loader
+    /// boots the OS instead of returning to maskrom. NOT necessarily os_reg0:
+    /// RK3568 0xFDC20200 (==os_reg0), RK3576 0x26024040, RK3588 0xFD588080.
+    public let bootModeReg: UInt32
     public let maskromMagic: UInt32   // reboot-to-maskrom: magic written to bootModeReg
     public let cruResetReg: UInt32    // CRU global soft-reset register
     public let cruResetValue: UInt32  // value that triggers the reset
@@ -51,7 +58,7 @@ public enum DetectProfiles {
             downloadBase: 0xFF00_4000,
             usbPutsVector: 0xFF00_1004,
             osRegBase: 0xFD58_A200,
-            bootModeReg: 0xFD58_A200,
+            bootModeReg: 0xFD58_8080,   // CONFIG_ROCKCHIP_BOOT_MODE_REG (NOT os_reg0)
             maskromMagic: 0xEF08_A53C,
             cruResetReg: 0xFD7C_0C08,
             cruResetValue: 0x0000_FDB9),
@@ -68,7 +75,7 @@ public enum DetectProfiles {
             downloadBase: 0x3FF8_4000,
             usbPutsVector: 0x3FF8_1004,
             osRegBase: 0x2602_6200,
-            bootModeReg: 0x2602_6200,
+            bootModeReg: 0x2602_4040,   // CONFIG_ROCKCHIP_BOOT_MODE_REG (NOT os_reg0)
             maskromMagic: 0xEF08_A53C,
             cruResetReg: 0x2720_0C08,
             cruResetValue: 0x0000_FDB9),

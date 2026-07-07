@@ -19,7 +19,7 @@ final class DetectProfileTests: XCTestCase {
         XCTAssertEqual(p.downloadBase, 0xFF00_4000)
         XCTAssertEqual(p.usbPutsVector, 0xFF00_1004)
         XCTAssertEqual(p.osRegBase, 0xFD58_A200)
-        XCTAssertEqual(p.bootModeReg, 0xFD58_A200)
+        XCTAssertEqual(p.bootModeReg, 0xFD58_8080)   // CONFIG_ROCKCHIP_BOOT_MODE_REG
         XCTAssertEqual(p.maskromMagic, 0xEF08_A53C)
         XCTAssertEqual(p.cruResetReg, 0xFD7C_0C08)
         XCTAssertEqual(p.cruResetValue, 0x0000_FDB9)
@@ -31,7 +31,7 @@ final class DetectProfileTests: XCTestCase {
         XCTAssertEqual(p.downloadBase, 0x3FF8_4000)
         XCTAssertEqual(p.usbPutsVector, 0x3FF8_1004)
         XCTAssertEqual(p.osRegBase, 0x2602_6200)
-        XCTAssertEqual(p.bootModeReg, 0x2602_6200)
+        XCTAssertEqual(p.bootModeReg, 0x2602_4040)   // CONFIG_ROCKCHIP_BOOT_MODE_REG
         XCTAssertEqual(p.maskromMagic, 0xEF08_A53C)
         XCTAssertEqual(p.cruResetReg, 0x2720_0C08)
         XCTAssertEqual(p.cruResetValue, 0x0000_FDB9)
