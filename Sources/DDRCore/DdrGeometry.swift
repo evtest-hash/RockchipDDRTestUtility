@@ -122,8 +122,26 @@ public enum OsRegDecoder {
         Int((v >> UInt32(shift)) & mask)
     }
 
-    /// Decode OS_REG words into geometry using Rockchip's SYS_REG **version-3**
-    /// layout (RK356x/RK3588), ported from the `_V3` macros in U-Boot
+    /// Decode OS_REG words into geometry, dispatching on the SYS_REG encoding
+    /// version. The version nibble lives in SYS_REG3[31:28] (`osreg[3]`):
+    ///   • version 3 → the V3 layout below (RK356x/RK3576/RK3588, arm64).
+    ///   • otherwise → the classic single-register V1 layout (`decodeV1`), used by
+    ///     pre-V3 SoCs like RK3288. These parts populate ONLY os_reg[2]; os_reg[3]
+    ///     is untouched, so the nibble reads back 0 → V1 path. (SYS_REG V2, used by
+    ///     some Tier-2 SoCs, is not yet implemented — add a `version == 2` branch
+    ///     when one is brought up.)
+    public static func decode(_ osreg: [UInt32]) -> DetectedGeometry {
+        let reg3_0 = osreg.count > 3 ? osreg[3] : 0
+        let version = bits(reg3_0, 28, 0xf)
+        if version == 3 {
+            return decodeV3(osreg, version: version)
+        }
+        let reg2_0 = osreg.count > 2 ? osreg[2] : 0
+        return decodeV1(osreg, reg2: reg2_0, version: version)
+    }
+
+    /// Decode OS_REG words using Rockchip's SYS_REG **version-3** layout
+    /// (RK356x/RK3588), ported from the `_V3` macros in U-Boot
     /// `arch/arm/include/asm/arch-rockchip/sdram_common.h`. `osreg[2]` = SYS_REG2,
     /// `osreg[3]` = SYS_REG3. The DDR type is a 5-bit field split across both
     /// registers; rank and CS row also draw high bits from SYS_REG3.
@@ -134,7 +152,7 @@ public enum OsRegDecoder {
     /// We decode the full field and report the exact type; `CfgAutoSelect` matches
     /// it exactly (no LP4/LP4X folding). Note `sdram.h` has no LPDDR5X code — both
     /// LPDDR5 and LPDDR5X are 9, so an LPDDR5X part simply reads back as LPDDR5.
-    public static func decode(_ osreg: [UInt32]) -> DetectedGeometry {
+    private static func decodeV3(_ osreg: [UInt32], version: Int) -> DetectedGeometry {
         // A single SYS_REG descriptor (one reg2/reg3 pair) covers at most 2
         // channels (NUM_CH is 1 bit). SoCs with more physical channels write
         // additional descriptors in consecutive os_reg pairs: RK356x uses one
@@ -145,7 +163,6 @@ public enum OsRegDecoder {
         // Version + DRAM type come from the first (primary) group.
         let reg3_0 = osreg.count > 3 ? osreg[3] : 0
         let reg2_0 = osreg.count > 2 ? osreg[2] : 0
-        let version = bits(reg3_0, 28, 0xf)                                  // SYS_REG3[31:28]
         let typeRaw = bits(reg2_0, 13, 0x7) | (bits(reg3_0, 12, 0x3) << 3)   // DDRTYPE_V3
         let dramType = DramType(rawValue: typeRaw)
 
@@ -241,5 +258,56 @@ public enum OsRegDecoder {
             totalBytes += chBytes
         }
         return (channels, totalBytes)
+    }
+
+    /// Decode the classic single-register SYS_REG (**version 1**) used by pre-V3
+    /// SoCs (RK3288 et al.), ported from the non-`_V2`/`_V3` `SYS_REG_DEC_*` macros
+    /// in older U-Boot `sdram_common.h`. All geometry lives in `osreg[2]`, split
+    /// into two 16-bit channel lanes (ch1 at +16); there is NO os_reg3 (DDRTYPE is
+    /// 3-bit, no high bits) and NO multi-group extension. These parts predate
+    /// LPDDR4/5, so DDRTYPE is DDR2/DDR3/LPDDR2/LPDDR3-era: bank is always
+    /// `3 - bkBit` (8 or 4 banks) and there is no DDR4 bank-group term.
+    ///
+    /// HW-confirmed on RK3288 (os_reg[2] = 0x32817281 → DDR3, 2ch × 32-bit,
+    /// col=10, 8 banks, cs0_row=15, 2048 MB), matching the DDR bin's UART print.
+    private static func decodeV1(_ osreg: [UInt32], reg2: UInt32, version: Int) -> DetectedGeometry {
+        let typeRaw = bits(reg2, 13, 0x7)             // 3-bit DDRTYPE (no reg3 high bits)
+        let dramType = DramType(rawValue: typeRaw)
+        let numCh = 1 + bits(reg2, 12, 0x1)           // NUM_CH: reg2[12]
+        var channels: [ChannelGeometry] = []
+        var totalBytes: UInt64 = 0
+        for ch in 0..<numCh {
+            let s = ch * 16
+            let rank = 1 + bits(reg2, 11 + s, 0x1)
+            let col = 9 + bits(reg2, 9 + s, 0x3)
+            let bk = 3 - bits(reg2, 8 + s, 0x1)                    // 8 or 4 banks
+            let cs0Row = 13 + bits(reg2, 6 + s, 0x3)               // 2-bit field, no wrap
+            let cs1Row = 13 + bits(reg2, 4 + s, 0x3)
+            let busWidthBits = 8 << (2 >> bits(reg2, 2 + s, 0x3))  // BW: same enc as V3
+            let dieWidthBits = 8 << (2 >> bits(reg2, 0 + s, 0x3))  // DBW
+            let row34 = bits(reg2, 30 + ch, 0x1) != 0             // ROW_3_4
+
+            channels.append(ChannelGeometry(
+                rank: rank, col: col, bank: bk,
+                cs0Row: cs0Row, cs1Row: cs1Row,
+                busWidthBits: busWidthBits, dieWidthBits: dieWidthBits))
+
+            // Capacity per CS = 2^(row + col + bank) addresses × bus bytes. V1 has
+            // no separate CS1 column field, so CS1 reuses CS0's column count.
+            let busBytes = UInt64(busWidthBits / 8)
+            var chBytes = (UInt64(1) << UInt64(cs0Row + col + bk)) * busBytes
+            if rank >= 2 {
+                chBytes += (UInt64(1) << UInt64(cs1Row + col + bk)) * busBytes
+            }
+            if row34 { chBytes = chBytes / 4 * 3 }
+            totalBytes += chBytes
+        }
+        return DetectedGeometry(
+            rawOsReg: osreg,
+            sysRegVersion: version,
+            dramType: dramType,
+            numChannels: channels.count,
+            channels: channels,
+            totalSizeMB: Int(totalBytes >> 20))
     }
 }

@@ -79,6 +79,31 @@ public enum DetectProfiles {
             maskromMagic: 0xEF08_A53C,
             cruResetReg: 0x2720_0C08,
             cruResetValue: 0x0000_FDB9),
+        // RK3288 (arm32 / SYS_REG **V1**). All addresses confirmed against U-Boot
+        // (mixtile rk3288 tree) + RE of the ForceInit item:
+        //   Boot links 0xFFFF0000; item base 0xFFFF1500; USB puts service 0xFFFF0020
+        //   (RE'd from ForceInit: r0=char*, blx; dual UART+USB console — HW-verified
+        //   reading os_reg over USB).
+        //   PMU sys_reg base 0xFF730090; os_reg0 @+0x04 = 0xFF730094 (geometry the
+        //   V1 DDR bin writes lands in os_reg2 = 0xFF73009C). Kconfig
+        //   ROCKCHIP_BOOT_MODE_REG = 0xFF730094 (== os_reg0, like RK3568).
+        //   CRU_BASE 0xFF760000 (dtsi) + glb_srst_fst @0x1B0 → 0xFF7601B0, value
+        //   0xFDB9 (cleanly restarts the BROM boot chain; the PMU boot-mode flag
+        //   survives it — the DDR bin re-checks that flag after every reset). The
+        //   companion boot_id stamp (reboot payload) is what makes maskrom actually
+        //   fire: our detect arrives over USB and fst leaves IRAM's boot-source id
+        //   as stale-USB, which the DDR bin's guard treats as "skip maskrom".
+        //   Magic BOOT_BROM_DOWNLOAD 0xEF08A53C.
+        0x320A: DetectProfile(
+            soc: "RK3288",
+            detectCfgName: "DDR自动探测.cfg",
+            downloadBase: 0xFFFF_1500,
+            usbPutsVector: 0xFFFF_0020,
+            osRegBase: 0xFF73_0094,
+            bootModeReg: 0xFF73_0094,   // CONFIG_ROCKCHIP_BOOT_MODE_REG (== os_reg0)
+            maskromMagic: 0xEF08_A53C,
+            cruResetReg: 0xFF76_01B0,   // glb_srst_fst (clean restart; flag survives)
+            cruResetValue: 0x0000_FDB9),
     ]
     public static func forPID(_ pid: UInt16) -> DetectProfile? { all[pid] }
 }

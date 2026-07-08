@@ -186,17 +186,88 @@ extension DdrGeometryTests {
         XCTAssertEqual(g.totalSizeMB, 8192)           // 2ch × 2CS × 2GB — matches the bin's print
     }
 
-    // A garbage geometry (all-zero SYS_REG, as a FAILED DDR init produces →
-    // decodes to a bogus DDR4 256MB 1CS: type 0, 1 bank-group bit from dbw) must
-    // match NOTHING: detection fails rather than offering a wrong cfg.
+    // Real OS_REG captured from an RK3288 board (rk3288 v1.12 DDR bin, arm32):
+    //   OS_REG2 = 0x32817281, OS_REG3 = 0 (single-register SYS_REG **V1**).
+    // Both 16-bit lanes decode identically: DDR3 (type 3), 32-bit bus, x16 die,
+    // col=10, 8 banks, cs0_row=15, rank 1. NUM_CH=2 → 2 × 1024 MB = 2048 MB.
+    // Matches the DDR bin's own UART print ("通道a: DDR3 400MHz Bus Width=32
+    // Col=10 …"). os_reg3 is untouched so the version nibble reads 0 → V1 path,
+    // NOT the V3 decoder (which would spuriously read reg3 high bits).
+    func testDecodeRK3288V1Capture() {
+        let words: [UInt32] = [0, 0, 0x3281_7281, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        let g = OsRegDecoder.decode(words)
+        print(">>> RK3288 V1 DECODE: version=\(g.sysRegVersion) \(g.summary())")
+        XCTAssertEqual(g.sysRegVersion, 0)           // V1: no version nibble
+        XCTAssertEqual(g.dramType, .ddr3)
+        XCTAssertEqual(g.numChannels, 2)
+        XCTAssertEqual(g.csPerDie, 1)
+        XCTAssertEqual(g.totalSizeMB, 2048)          // 2ch × 1GB
+        let c = g.channels[0]
+        XCTAssertEqual(c.rank, 1)
+        XCTAssertEqual(c.col, 10)
+        XCTAssertEqual(c.bank, 3)                    // 8 banks
+        XCTAssertEqual(c.cs0Row, 15)
+        XCTAssertEqual(c.busWidthBits, 32)
+        XCTAssertEqual(c.dieWidthBits, 16)
+    }
+
+    // A single-channel dual-rank V1 part, hand-encoded: DDR3, NUM_CH=1 (bit12=0),
+    // rank=2 (bit11), col=10, 8 banks, cs0_row=15, cs1_row=14 (reg2[5:4]=1),
+    // 32-bit bus, x16 die. CS1 reuses CS0's column count (V1 has no separate CS1
+    // column field), so the channel is 1024 (CS0) + 512 (CS1) = 1536 MB.
+    //   lane = (3<<13)|(1<<11)|(1<<9)|(2<<6)|(1<<4)|(1<<0) = 0x6A91
+    func testDecodeV1DualRank() {
+        let g = OsRegDecoder.decode([0, 0, 0x0000_6A91, 0])
+        XCTAssertEqual(g.dramType, .ddr3)
+        XCTAssertEqual(g.numChannels, 1)             // reg2[12]=0
+        XCTAssertEqual(g.csPerDie, 2)
+        let c = g.channels[0]
+        XCTAssertEqual(c.rank, 2)
+        XCTAssertEqual(c.cs0Row, 15)
+        XCTAssertEqual(c.cs1Row, 14)
+        XCTAssertEqual(g.totalSizeMB, 1536)          // 1024 (CS0) + 512 (CS1)
+    }
+
+    // End-to-end against the real RK3288 folder: the DDR3 2048MB 1-CS/channel
+    // decode (os_reg2=0x32817281) must select the symmetric "2GB DDR3(通道a用1个CS
+    // …通道b用1个CS…)" cfg. RK3288 cfgs name CS per channel ("通道a用N个CS"); the
+    // csCount parser picks the first "N个CS" and csPerDie is the max channel rank,
+    // which agree for this symmetric part (both channels rank 1).
+    func testRK3288CaptureRanksAgainstFolder() throws {
+        let root = FileManager.default.currentDirectoryPath + "/DDRTestFiles"
+        guard FileManager.default.fileExists(atPath: root) else { throw XCTSkip("no DDRTestFiles") }
+        let soc = try CfgRepository(rootURL: URL(fileURLWithPath: root)).discoverTestFiles()
+            .filter { $0.socName == "RK3288" }
+        try XCTSkipIf(soc.isEmpty, "no RK3288 cfgs")
+        let g = OsRegDecoder.decode([0, 0, 0x3281_7281, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        XCTAssertEqual(g.dramType, .ddr3)
+        XCTAssertEqual(g.totalSizeMB, 2048)
+        XCTAssertEqual(g.csPerDie, 1)
+        let cands = CfgAutoSelect.rank(geometry: g, socFiles: soc)
+        print(">>> RK3288 EXACT MATCHES:")
+        for c in cands { print("   \(c.entry.displayName)") }
+        XCTAssertFalse(cands.isEmpty)
+        for c in cands {
+            XCTAssertEqual(c.sizeMB, 2048)
+            XCTAssertEqual(c.csCount, 1)
+            XCTAssertEqual(c.dramType, .ddr3)
+        }
+        // The symmetric 2GB/1-CS DDR3 cfg is among the matches.
+        XCTAssertTrue(cands.contains { $0.entry.displayName.contains("2GB DDR3(通道a用1个CS") })
+    }
+
+    // A garbage geometry (all-zero SYS_REG, as a FAILED DDR init produces) must
+    // match NOTHING: detection fails rather than offering a wrong cfg. The version
+    // nibble is 0 → V1 path, which decodes all-zero to a bogus DDR4 128MB 1CS
+    // (type 0, col 9, 8 banks, row 13, 32-bit; no DDR4 bank-group term in V1).
     func testGarbageGeometryMatchesNothing() throws {
         let root = FileManager.default.currentDirectoryPath + "/DDRTestFiles"
         guard FileManager.default.fileExists(atPath: root) else { throw XCTSkip("no DDRTestFiles") }
         let soc = try CfgRepository(rootURL: URL(fileURLWithPath: root)).discoverTestFiles()
             .filter { $0.socName == "RK3568&RK3566" }
         try XCTSkipIf(soc.isEmpty, "no RK3568 cfgs")
-        let g = OsRegDecoder.decode([0, 0, 0, 0])   // all-zero → bogus DDR4 256MB 1CS
-        XCTAssertEqual(g.totalSizeMB, 256)          // no RK3568 cfg is 256 MB
+        let g = OsRegDecoder.decode([0, 0, 0, 0])   // all-zero → bogus DDR4 128MB 1CS
+        XCTAssertEqual(g.totalSizeMB, 128)          // no RK3568 cfg is 128 MB
         XCTAssertTrue(CfgAutoSelect.rank(geometry: g, socFiles: soc).isEmpty)
     }
 }

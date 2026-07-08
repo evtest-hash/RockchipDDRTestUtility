@@ -37,6 +37,18 @@ final class DetectProfileTests: XCTestCase {
         XCTAssertEqual(p.cruResetValue, 0x0000_FDB9)
         XCTAssertEqual(p.detectCfgName, "DDR自动探测.cfg")
     }
+    func testRK3288Profile() throws {
+        let p = try XCTUnwrap(DetectProfiles.forPID(0x320A))
+        XCTAssertEqual(p.soc, "RK3288")
+        XCTAssertEqual(p.downloadBase, 0xFFFF_1500)
+        XCTAssertEqual(p.usbPutsVector, 0xFFFF_0020)
+        XCTAssertEqual(p.osRegBase, 0xFF73_0094)     // os_reg0 (geometry in os_reg2 0xFF73009C)
+        XCTAssertEqual(p.bootModeReg, 0xFF73_0094)   // CONFIG_ROCKCHIP_BOOT_MODE_REG (== os_reg0)
+        XCTAssertEqual(p.maskromMagic, 0xEF08_A53C)
+        XCTAssertEqual(p.cruResetReg, 0xFF76_01B0)   // glb_srst_fst (clean restart, flag survives)
+        XCTAssertEqual(p.cruResetValue, 0x0000_FDB9)
+        XCTAssertEqual(p.detectCfgName, "DDR自动探测.cfg")
+    }
     func testUnsupportedPIDReturnsNil() {
         XCTAssertNil(DetectProfiles.forPID(0x350C))   // RK3562 not configured yet
     }
