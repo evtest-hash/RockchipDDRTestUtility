@@ -12,6 +12,13 @@ struct CLIArguments {
     /// run the osregdump probe cfg, read OS_REG over USB, decode + shortlist cfg.
     var detect = false
     var detectCfgPath: String?
+    /// EXPERIMENT (Step 2): unified detect→test on ONE transport, no reboot.
+    /// detect(reboot:false) leaves the DDR Test Tool Boot resident + transport
+    /// open; the matched cfg then runs with skipBoot:true on that same Boot.
+    /// Validates that the reboot-to-maskrom step is avoidable (→ dodges the
+    /// RK3288 populated-eMMC reboot limitation). Reuses both executors' existing
+    /// steps unchanged — only the sequencing differs.
+    var detectThenTest = false
     /// How many times to run the full cfg in one process. >1 exercises the
     /// repeat-test / boot-skip path: the first run boots, and subsequent runs
     /// pass `skipBoot: true` (mirroring MainViewModel's `deviceNeedsBoot`
@@ -50,6 +57,8 @@ struct CLIArguments {
                 args.probeBulk = true
             case "--detect":
                 args.detect = true
+            case "--detect-then-test":
+                args.detectThenTest = true
             case "--detect-cfg":
                 idx += 1
                 guard idx < argv.count else {
@@ -81,6 +90,7 @@ func printUsageAndExit() -> Never {
       --probe-bulk [--device-id <id>]
       --cfg <cfg_path> [--device-id <id>] [--output-log <txt_path>] [--repeat N]
       --detect [--detect-cfg <detect.cfg>] [--device-id <id>]
+      --detect-then-test [--device-id <id>]   (experiment: detect→test, no reboot)
 
     Examples:
       swift run RockchipDDRTestUtilityCLI --list
@@ -131,6 +141,11 @@ struct RockchipDDRTestUtilityCLI {
 
             if args.detect {
                 try await runDetect(args: args)
+                return
+            }
+
+            if args.detectThenTest {
+                try await runDetectThenTest(args: args)
                 return
             }
 
@@ -251,6 +266,50 @@ struct RockchipDDRTestUtilityCLI {
                 print("Multiple cfgs share this exact (type + capacity + CS) — they differ only in die composition — confirm from the list.")
             }
         }
+    }
+
+    /// EXPERIMENT (Step 2): detect → test on ONE transport, no reboot.
+    static func runDetectThenTest(args: CLIArguments) async throws {
+        let transport = try RkUsbTransportLibusb()
+        let devices = try transport.discoverDevices()
+        guard let device = chooseDevice(from: devices, selectedDeviceID: args.selectedDeviceID) else {
+            throw DDRToolError.noDevice
+        }
+        print("Device: \(device.productName) soc=\(device.socName ?? "?") pid=0x\(hex16(device.productID))")
+
+        let root = CfgRepository.makeDefaultRootURL()
+        let socName = DetectProfiles.forPID(device.productID)?.soc ?? device.socName ?? ""
+        let socFiles = ((try? CfgRepository(rootURL: root).discoverTestFiles()) ?? [])
+            .filter { $0.socName == socName }
+        let resourcesDir = args.detectCfgPath.map { URL(fileURLWithPath: ($0 as NSString).deletingLastPathComponent) }
+            ?? root.appendingPathComponent(socName)
+
+        // ── detect WITHOUT reboot: keeps the DDR Test Tool Boot resident + the
+        //    transport open. Steps unchanged; only the ④ reboot is skipped.
+        let detector = DdrDetector(resourcesDir: resourcesDir)
+        let out = try await detector.detect(transport: transport, device: device,
+                                            socFiles: socFiles, reboot: false)
+        print("\n=== Detected: \(out.geometry.summary()) ===")
+        guard let matched = CfgAutoSelect.firstAvailable(out.candidates, in: socFiles) else {
+            print("No exact-match cfg — cannot run test. Candidates: \(out.candidates.count)")
+            try? transport.close()
+            return
+        }
+        print("Matched cfg: \(matched.relativePath)")
+
+        // ── test on the SAME transport with skipBoot: reuse the resident Boot
+        //    (no downloadBoot, no reboot). This is the crux the experiment tests.
+        print("\n=== Running test with skipBoot on the resident Boot (no reboot) ===")
+        let engine = TestExecutionEngine(parser: CfgBinaryParser(), transport: transport) { entry in
+            print("[\(entry.level.rawValue)] \(entry.code) \(entry.message)")
+        }
+        let result = await engine.run(
+            cfgPath: matched.absolutePath,
+            selectedDeviceID: args.selectedDeviceID,
+            skipBoot: true,
+            keepTransportOpen: false
+        )
+        print("\n=== detect→test result: outcome=\(result.outcome.rawValue) state=\(result.state.rawValue) bootSucceeded=\(result.bootSucceeded) ===")
     }
 
     private static func hex16(_ value: UInt16) -> String {

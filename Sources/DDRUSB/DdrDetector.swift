@@ -35,8 +35,15 @@ public actor DdrDetector {
         self.resourcesDir = resourcesDir
     }
 
+    /// `reboot` (default true) controls only whether the ④ reboot-to-maskrom step
+    /// runs — the detect STEPS (ddrbin → Boot → osregdump) are unchanged. Pass
+    /// false to keep the device in its booted state and the `transport` OPEN, so a
+    /// caller can hand the same session straight to a test with `skipBoot: true`
+    /// (the resident DDR Test Tool Boot is reused). This is the unified
+    /// detect→test path that avoids the reboot entirely (and thus the RK3288
+    /// populated-eMMC reboot limitation).
     public func detect(transport: UsbTransport, device: UsbDevice,
-                       socFiles: [TestFileEntry]) async throws -> DetectOutcome {
+                       socFiles: [TestFileEntry], reboot: Bool = true) async throws -> DetectOutcome {
         guard let profile = DetectProfiles.forPID(device.productID) else {
             throw DetectError.unsupportedSoc
         }
@@ -116,11 +123,12 @@ public actor DdrDetector {
         // explicitly, after capture — never mid-capture (the whole reason this
         // detector doesn't hand the cfg to TestExecutionEngine).
         var rebooted = false
-        if let rebootBin {
+        if reboot, let rebootBin {
             rebooted = (try? await rebootToMaskrom(transport: transport, payload: rebootBin,
                                                    base: base, device: device)) ?? false
         }
-        phase("④ reboot + re-enum (rebooted=\(rebooted))")
+        phase(reboot ? "④ reboot + re-enum (rebooted=\(rebooted))"
+                     : "④ reboot SKIPPED (unified detect→test; transport kept open)")
         return DetectOutcome(rawOsReg: words, geometry: geo, candidates: candidates,
                              rebootedToMaskrom: rebooted)
     }

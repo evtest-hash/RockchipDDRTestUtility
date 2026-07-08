@@ -22,11 +22,25 @@ final class MainViewModel: ObservableObject {
     @Published var overallOutcome: TestOutcome?
     @Published var selectedSoc: String?
     @Published var autoTestEnabled = false
+    /// User switch for DDR auto-detect (preselecting the cfg on plug-in). ON by
+    /// default. Deliberately NOT persisted — its lifetime is this app run only,
+    /// so every launch starts with auto-detect on. When OFF, a profiled device is
+    /// treated like any other: no probe, no reboot, the user picks the cfg
+    /// manually (their choice is never overwritten). Auto-detect only ever
+    /// *preselects*; this switch lets the operator opt out entirely.
+    @Published var autoDetectEnabled = true
     /// True while a DDR auto-detect probe (DdrDetector.detect) is in flight for
     /// a newly-arrived device. UI can use this to show a "detecting..." state
     /// distinct from `isRunning` (which covers the actual test execution).
     @Published var isDetecting = false
     private var hasRunAutoTestForCurrentDevice = false
+    /// Name of the DDR auto-detect card shown in the central log area (so detect
+    /// and the subsequent test read as one timeline).
+    static let detectStepName = "DDR 自动探测"
+    /// Set when a detect card has been placed in `testSteps`; tells the next
+    /// `startTest` to APPEND its steps after it (one timeline) instead of clearing.
+    /// Consumed by that `startTest`; a fresh detect re-arms it, an unplug clears it.
+    private var carryDetectStepIntoTest = false
     /// Mirrors `hasRunAutoTestForCurrentDevice` for the DDR auto-detect probe:
     /// set the moment `runDetectThenMaybeTest` is launched for the current
     /// device, so a subsequent `pollDevices` tick (the 1s timer) can't launch a
@@ -136,8 +150,15 @@ final class MainViewModel: ObservableObject {
         }
 
         isRunning = true
-        testSteps = []
-        totalMessageCount = 0
+        // Keep the detect card + start a continuous timeline when this test
+        // follows an auto-detect; otherwise start fresh. (Consume the flag so a
+        // second, standalone test run resets normally.)
+        if carryDetectStepIntoTest {
+            carryDetectStepIntoTest = false
+        } else {
+            testSteps = []
+            totalMessageCount = 0
+        }
         overallOutcome = nil
         // The engine owns the transport while a test runs — stop the idle
         // keep-alive so the two never contend (the engine's own 200ms
@@ -448,6 +469,7 @@ final class MainViewModel: ObservableObject {
         selectedDeviceID = nil
         hasRunAutoTestForCurrentDevice = false
         hasDetectedForCurrentDevice = false
+        carryDetectStepIntoTest = false
         // Launch-suppression ("don't auto-test devices present at launch") ends
         // once the user unplugs — a replug, even of the same deviceID, should
         // count as newly arrived and re-trigger auto-test.
@@ -531,7 +553,8 @@ final class MainViewModel: ObservableObject {
                     // second, overlapping detect while one is already in flight for
                     // this connection (detect's own reboot-to-maskrom step drops
                     // the device off USB and re-enumerates for up to ~6s).
-                    if let device = devices.first(where: { $0.deviceID == selectedDeviceID }),
+                    if autoDetectEnabled,
+                       let device = devices.first(where: { $0.deviceID == selectedDeviceID }),
                        DetectProfiles.forPID(device.productID) != nil {
                         if !hasDetectedForCurrentDevice {
                             hasDetectedForCurrentDevice = true
@@ -607,46 +630,111 @@ final class MainViewModel: ObservableObject {
         stopKeepAlive()
         defer { isDetecting = false }
         Self.dlog("detect start: device=\(device.deviceID) pid=0x\(String(format: "%04X", device.productID))")
+        // Start a fresh timeline in the central log area with the detect card;
+        // the following test appends after it (carryDetectStepIntoTest).
+        testSteps = []
+        totalMessageCount = 0
+        overallOutcome = nil
+        ensureStep(Self.detectStepName)
+        setStepState(Self.detectStepName, .running)
+        appendStepMessage(Self.detectStepName, "开始探测…")
+        carryDetectStepIntoTest = true
         do {
-            let transport = try makeTransport()
+            // Unified detect→test (no reboot): run detect on the PERSISTENT
+            // transport with reboot:false, so the DDR Test Tool Boot stays
+            // resident and the handle stays open. The subsequent test — auto or a
+            // later manual "开始测试" — reuses this exact session with skipBoot
+            // (never re-downloads Boot, never resets). This sidesteps the RK3288
+            // populated-eMMC reboot limitation entirely (no reset → the eMMC boot
+            // chain never runs) and is faster (no reboot + re-enum wait).
+            // HW-validated (RK3288 --detect-then-test: PASS, bootSucceeded=false).
+            if activeTransport == nil || activeTransportDeviceID != selectedDeviceID {
+                tearDownActiveTransport()
+                activeTransport = try makeTransport()
+                activeTransportDeviceID = selectedDeviceID
+            }
             let socName = DetectProfiles.forPID(device.productID)?.soc ?? device.socName ?? ""
             let det = DdrDetector(resourcesDir: detectResourcesDir(soc: socName))
-            let out = try await det.detect(transport: transport, device: device, socFiles: filesForSelectedSoc)
+            let out = try await det.detect(transport: activeTransport!, device: device,
+                                           socFiles: filesForSelectedSoc, reboot: false)
             // Detection succeeds ONLY on an exact (type + capacity + CS) match.
             // `out.candidates` is already the exact-match set (empty ⇒ no match).
             let matched = applyDetectCandidates(out.candidates) != nil
-            Self.dlog("detect done: \(out.geometry.summary()) rebooted=\(out.rebootedToMaskrom) matches=\(out.candidates.count) selected=\(selectedFileID ?? "nil")")
-            // The next boot must always run (never skip-boot after a probe/reboot).
-            setDeviceNeedsBoot(true)
+            Self.dlog("detect done: \(out.geometry.summary()) matches=\(out.candidates.count) selected=\(selectedFileID ?? "nil")")
+            // Boot is resident from detect → the test skips boot (reuses it).
+            setDeviceNeedsBoot(false)
 
             if !matched {
                 // No cfg exactly matches — DDR uninitialized/defective, or config
                 // not in the library. Do NOT auto-test; require manual selection.
+                // Transport stays open: a manual pick + test still skip-boots.
+                setStepState(Self.detectStepName, .failed)
+                appendStepMessage(Self.detectStepName, "未匹配到 cfg(\(out.geometry.summary()))")
+                appendStepMessage(Self.detectStepName, "可能未初始化/坏板,或不在库中 — 请手动选择配置文件")
                 selectedFileID = filesForSelectedSoc.first?.id
                 statusMessage = "DDR 探测未匹配到 cfg(\(out.geometry.summary()))— 可能未初始化/坏板,或不在库中,请手动选择"
-                Self.dlog("no exact match → manual selection, no auto-test")
-            } else if !out.rebootedToMaskrom {
-                // Matched, but the device isn't back in MASKROM → the next boot
-                // would fail; require a replug before testing.
-                statusMessage = "检测到 \(out.geometry.summary())(已预选 cfg),但设备未回到 MASKROM,请重新插拔后再测"
-                Self.dlog("matched but not rebooted → skip auto-test; user must replug")
+                Self.dlog("no exact match → manual selection")
+                startKeepAlive()
             } else {
                 // >1 exact match means the library holds several cfgs with the
                 // same (type + capacity + CS) differing only in die composition.
                 let ambiguous = out.candidates.count > 1
+                let cfgName = out.candidates.first?.entry.displayName ?? "(cfg)"
+                setStepState(Self.detectStepName, .passed)
+                appendStepMessage(Self.detectStepName, "检测到 \(out.geometry.summary())")
+                appendStepMessage(Self.detectStepName, ambiguous
+                    ? "预选 cfg(多个同规格,可改选): \(cfgName)"
+                    : "预选 cfg: \(cfgName)")
                 statusMessage = ambiguous
-                    ? "检测到 \(out.geometry.summary()) — 已预选 cfg(多个同规格 cfg,可改选)"
-                    : "检测到 \(out.geometry.summary()) — 已预选 cfg"
-                // TODO(hw联调): reboot re-enumerates the device (deviceID may
-                // change); startTest falls back to devices.first when the saved
-                // selectedDeviceID is gone, so single-device auto-test still works.
-                Self.dlog("matched + rebooted; autoTestEnabled=\(autoTestEnabled) → maybeAutoTest()")
-                maybeAutoTest()
+                    ? "检测到 \(out.geometry.summary()) — 已预选 cfg(多个同规格 cfg,可改选),可开始测试"
+                    : "检测到 \(out.geometry.summary()) — 已预选 cfg,可开始测试"
+                if autoTestEnabled && !hasRunAutoTestForCurrentDevice {
+                    // Trigger the test DIRECTLY — not via maybeAutoTest(), whose
+                    // `newIDs` (device-just-enumerated) guard was satisfied by the
+                    // old reboot re-enumeration. The unified flow never reboots, so
+                    // the deviceID is unchanged and that guard would never fire.
+                    // We already know a device just detected + a cfg matched; the
+                    // `hasRunAutoTestForCurrentDevice` latch (cleared on replug)
+                    // prevents repeats.
+                    //
+                    // WAIT for the resident Boot to return to its idle command loop
+                    // before letting startTest download the test's forceinit: right
+                    // after the osregdump probe the Boot can still be busy, and a
+                    // fixed short delay raced it → intermittent "bulk IN timeout" on
+                    // the first downloadItem. probeAlive() succeeds only once the
+                    // Boot services commands again, so poll it (this is exactly what
+                    // makes the manual path — keep-alive running until the user
+                    // clicks — reliable). Deterministic, not a guessed delay.
+                    hasRunAutoTestForCurrentDevice = true
+                    Self.dlog("matched; autoTest on → wait for Boot idle, then startTest()")
+                    let t = activeTransport
+                    // Detached so the blocking probeAlive() bulk call runs OFF the
+                    // main thread (the keep-alive does the same); startTest is
+                    // @MainActor, so the final await hops back to main.
+                    Task.detached { [weak self] in
+                        for _ in 0..<30 {                       // up to ~3s
+                            try? await Task.sleep(nanoseconds: 100_000_000)
+                            if t?.probeAlive() == true { break }
+                        }
+                        await self?.startTest()
+                    }
+                } else {
+                    // Hold the session open until the user clicks 开始测试
+                    // (that run also skip-boots on the resident Boot).
+                    Self.dlog("matched; autoTest off (or already ran) → hold transport for manual test")
+                    startKeepAlive()
+                }
             }
         } catch {
+            // Detect failed → the device's state is uncertain; drop the handle so
+            // the next attempt re-opens fresh, and require a real boot next time.
+            setStepState(Self.detectStepName, .failed)
+            appendStepMessage(Self.detectStepName, "探测失败:\(error)")
+            appendStepMessage(Self.detectStepName, "设备可能需重新插拔;或手动选择 cfg")
+            tearDownActiveTransport()
             selectedFileID = filesForSelectedSoc.first?.id
-            statusMessage = "DDR 自动检测失败(\(error)),设备可能需重新插拔;或手动选择 cfg"
             setDeviceNeedsBoot(true)
+            statusMessage = "DDR 自动检测失败(\(error)),设备可能需重新插拔;或手动选择 cfg"
             Self.dlog("detect FAILED: \(error) — fell back to manual selection")
         }
     }
