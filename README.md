@@ -53,6 +53,8 @@ swift run RockchipDDRTestUtility
 ```bash
 swift run RockchipDDRTestUtilityCLI --list
 swift run RockchipDDRTestUtilityCLI --cfg "/path/to/test.cfg"
+swift run RockchipDDRTestUtilityCLI --detect            # auto-detect DDR + shortlist matching cfg
+swift run RockchipDDRTestUtilityCLI --detect-then-test  # detect → run matched test on one session (no reboot)
 ```
 
 ### Build Universal DMG
@@ -88,20 +90,37 @@ At runtime, `CfgRepository` discovers files from:
 
 ## Usage
 
-1. Connect a Rockchip device via USB (device must be in download mode)
-2. The app auto-detects the SoC and selects the correct test configuration
-3. Click **开始测试** (Start Test) or enable **自动测试** (Auto Test) for automatic testing on device insertion
-4. View results in the log area
+1. Connect a Rockchip device via USB (Maskrom / download mode, VID 0x2207)
+2. **DDR auto-detect** (on by default) probes the board's DRAM over USB and preselects the exactly-matching test config — no manual selection needed
+3. Click **开始测试** (Start Test) to run it — or enable **自动测试** (Auto Test) so it runs automatically right after detection
+4. View results in the log area (the detection step appears as the first card, followed by the test steps)
 5. Click **保存测试结果** (Save Result) to export a test report
+
+The two toggles are optional conveniences with sensible defaults; a new user just connects the board and clicks **开始测试**. To pick a config by hand, turn **自动探测** off and select from the sidebar list.
+
+## DDR Auto-Detect
+
+On plug-in, the tool identifies the board's DDR geometry **over pure USB** (no serial/UART) and auto-selects the matching soldering-test config:
+
+1. Downloads the Rockchip auto-probing DDR init blob → the SoC detects the DRAM and writes its geometry to the PMU `OS_REG` (SYS_REG) words
+2. Loads the DDR Test Tool loader + a tiny probe that dumps `OS_REG` back over USB
+3. Decodes the geometry (DRAM type, total capacity, per-die CS) — SYS_REG **V3** (RK356x/RK3576/RK3588) or **V1** (RK3288)
+4. Matches it **exactly** (type + capacity + per-die CS) against the SoC's soldering-test configs and preselects the result
+
+Detection succeeds only on an exact match; otherwise the tool asks for manual selection (never silently runs a wrong config). The whole detect payload ships as a single self-contained `DDR自动探测.cfg` per SoC (not user-selectable — it's driven by a dedicated detector, not the test engine).
+
+The subsequent test reuses the same USB session with the already-resident loader (no reboot between detect and test), so detection flows straight into testing.
+
+**Auto-detect supported on:** RK3568 / RK3566 (0x350A), RK3588 (0x350B), RK3576 (0x350E), RK3288 (0x320A). Other SoCs fall back to manual config selection.
 
 ## Architecture
 
 | Module | Description |
 |--------|-------------|
-| `DDRCore` | Config parsing, binary `.cfg` parser, test execution engine, result writer |
-| `DDRUSB` | USB transport via libusb (Rockchip protocol) |
+| `DDRCore` | Config parsing, binary `.cfg` parser, test execution engine, result writer; DDR auto-detect logic — `DetectProfile` (per-SoC params), `OsRegDecoder` (SYS_REG V1/V3 decode), `CfgAutoSelect` (exact-match cfg ranking) |
+| `DDRUSB` | USB transport via libusb (Rockchip protocol); `DdrDetector` (auto-detect driver) |
 | `RockchipDDRTestUtility` | SwiftUI GUI application |
-| `RockchipDDRTestUtilityCLI` | Command-line interface |
+| `RockchipDDRTestUtilityCLI` | Command-line interface (`--list`, `--cfg`, `--detect`, `--detect-then-test`) |
 
 ### Test Flow
 
