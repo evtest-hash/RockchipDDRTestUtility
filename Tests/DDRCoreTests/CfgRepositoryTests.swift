@@ -33,6 +33,17 @@ final class CfgRepositoryTests: XCTestCase {
         }
     }
 
+    // The DDR auto-detect payload cfg ("…自动探测.cfg") is an internal container
+    // driven by DdrDetector, NOT a user-selectable test — discovery must exclude
+    // it so it never appears in the picker or runs through TestExecutionEngine.
+    func testDiscoverTestFilesExcludesDetectCfg() throws {
+        let repo = CfgRepository(rootURL: repoRoot())
+        let entries = try repo.discoverTestFiles()
+        XCTAssertFalse(entries.isEmpty)
+        XCTAssertFalse(entries.contains { $0.displayName.contains("自动探测") },
+                       "detect cfg must not appear among discovered test files")
+    }
+
     func testDiscoverTestFilesAreSorted() throws {
         let root = repoRoot()
         let repo = CfgRepository(rootURL: root)

@@ -22,17 +22,24 @@ struct ContentView: View {
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: 0) {
             // CFG file list
-            List(selection: $viewModel.selectedFileID) {
-                ForEach(viewModel.filesForSelectedSoc) { file in
-                    Text(file.displayName)
-                        .font(.system(size: 12))
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                        .tag(file.id)
-                        .help(file.displayName)
+            ScrollViewReader { proxy in
+                List(selection: $viewModel.selectedFileID) {
+                    ForEach(viewModel.filesForSelectedSoc) { file in
+                        Text(file.displayName)
+                            .font(.system(size: 12))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .tag(file.id)
+                            .help(file.displayName)
+                    }
+                }
+                .listStyle(.sidebar)
+                .disabled(viewModel.isDetecting)
+                .onChange(of: viewModel.selectedFileID) { newValue in
+                    guard let newValue else { return }
+                    proxy.scrollTo(newValue, anchor: .center)
                 }
             }
-            .listStyle(.sidebar)
         }
         .frame(minWidth: 260, maxWidth: 320)
     }
@@ -64,10 +71,19 @@ struct ContentView: View {
 
             Spacer()
 
-            if viewModel.isRunning {
-                ProgressView()
-                    .controlSize(.small)
+            if viewModel.isDetecting || viewModel.isRunning {
+                HStack(spacing: 6) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text(viewModel.isDetecting ? "探测中…" : "测试中…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
+
+            Toggle("自动探测", isOn: $viewModel.autoDetectEnabled)
+                .toggleStyle(.checkbox)
+                .help("勾选后，插入设备时自动探测 DDR 并预选匹配的配置文件（默认开启，仅本次运行有效）。关闭后请手动选择配置文件。")
 
             Toggle("自动测试", isOn: $viewModel.autoTestEnabled)
                 .toggleStyle(.checkbox)
@@ -80,7 +96,7 @@ struct ContentView: View {
                     .frame(minWidth: 80)
             }
             .keyboardShortcut(.return)
-            .disabled(viewModel.isRunning || viewModel.devices.isEmpty)
+            .disabled(viewModel.isRunning || viewModel.isDetecting || viewModel.devices.isEmpty)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
@@ -100,9 +116,9 @@ struct ContentView: View {
                             .font(.headline)
                             .foregroundStyle(.secondary)
                         VStack(alignment: .leading, spacing: 4) {
-                            Label("连接 Rockchip 设备（Maskrom 状态）", systemImage: "1.circle")
-                            Label("在左侧选择对应的测试配置文件", systemImage: "2.circle")
-                            Label("点击「开始测试」或开启「自动测试」", systemImage: "3.circle")
+                            Label("连接设备（Maskrom 状态）", systemImage: "1.circle")
+                            Label("自动识别 DDR 并选好配置（无需手动）", systemImage: "2.circle")
+                            Label("点「开始测试」查看结果", systemImage: "3.circle")
                         }
                         .font(.callout)
                         .foregroundStyle(.tertiary)
@@ -145,11 +161,6 @@ struct ContentView: View {
 
     private var statusBar: some View {
         HStack {
-            Text(viewModel.statusMessage)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-
             Spacer()
 
             Button("保存测试结果") {

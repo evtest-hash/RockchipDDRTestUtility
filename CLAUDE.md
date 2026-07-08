@@ -38,10 +38,10 @@ Tests cover CfgBinaryParser, CfgRepository (SoC name extraction), TestExecutionE
 
 **Swift Package Manager project** (swift-tools-version: 5.9, macOS 12+). Four targets:
 
-- **DDRCore** — Shared library: config/INI parsing, binary `.cfg` parser, test execution engine, result log writer, models.
-- **DDRUSB** — USB transport layer: `RkUsbTransportLibusb` implements `UsbTransport` protocol using libusb. Handles control transfers (boot download), bulk transfers (command/data), ACK validation, and printf polling.
-- **RockchipDDRTestUtility** — SwiftUI desktop app. `MainViewModel` orchestrates the workflow: load config → discover test files → discover USB devices → run test → save result.
-- **RockchipDDRTestUtilityCLI** — Command-line interface with `--list`, `--probe-bulk`, `--reset-usb`, `--cfg` modes.
+- **DDRCore** — Shared library: config/INI parsing, binary `.cfg` parser, test execution engine, result log writer, models. Also the DDR auto-detect logic: `DetectProfile` (per-SoC parameter table keyed by USB PID), `OsRegDecoder` (SYS_REG V1/V3 geometry decode), `CfgAutoSelect` (exact type+capacity+per-die-CS cfg ranking).
+- **DDRUSB** — USB transport layer: `RkUsbTransportLibusb` implements `UsbTransport` protocol using libusb. Handles control transfers (boot download), bulk transfers (command/data), ACK validation, and printf polling. Also `DdrDetector` (actor) — the dedicated DDR auto-detect driver (NOT the test engine).
+- **RockchipDDRTestUtility** — SwiftUI desktop app. `MainViewModel` orchestrates the workflow: load config → discover test files → discover USB devices → auto-detect DDR + preselect cfg → run test → save result.
+- **RockchipDDRTestUtilityCLI** — Command-line interface with `--list`, `--probe-bulk`, `--reset-usb`, `--cfg`, `--detect`, `--detect-then-test` modes.
 
 ### Key Data Flow
 
@@ -56,6 +56,23 @@ Tests cover CfgBinaryParser, CfgRepository (SoC name extraction), TestExecutionE
 1. **Bundled app**: `Bundle.main.resourceURL/DDRTestFiles` (inside `.app/Contents/Resources/`)
 2. **CLI / development**: DDRTestFiles sibling to the executable
 3. **Fallback**: `./DDRTestFiles` relative to CWD
+
+### DDR Auto-Detect
+
+On plug-in, `DdrDetector` (DDRUSB) identifies a board's DRAM geometry **over pure USB** (no serial) and preselects the matching soldering-test cfg. Supported SoCs: RK3568/3566 (0x350A), RK3588 (0x350B), RK3576 (0x350E), RK3288 (0x320A) — see `DetectProfiles`. Flow:
+
+1. `DetectProfile` (by USB PID) provides per-SoC addresses; `DdrDetector` loads the SoC's single packaged `DDR自动探测.cfg` and pulls its four payloads.
+2. Downloads the rkbin auto-probing DDR bin (0x471) → SoC writes geometry to PMU `OS_REG`; downloads the DDR Test Tool Boot; runs the `osregdump` probe which dumps `OS_REG` back over USB.
+3. `OsRegDecoder` decodes — SYS_REG **V3** (RK356x/3576/3588, `os_reg2`+`os_reg3`, multi-group) or **V1** (RK3288, single `os_reg2`). `CfgAutoSelect.rank` matches EXACTLY on (DRAM type + total capacity + per-die CS); an empty result = detection failed (never runs a wrong cfg).
+4. The detect cfg packages Boot + ddrbin + osregdump + reboot; `DdrDetector` drives them itself (NOT via `TestExecutionEngine`). `CfgRepository.discoverTestFiles()` EXCLUDES any `…自动探测.cfg` so it's never user-selectable / run as a test.
+
+**Unified detect→test (no reboot):** `DdrDetector.detect(reboot: false)` keeps the transport open and the Boot resident; the test then runs with `skipBoot: true` on that same session (`MainViewModel`; CLI `--detect-then-test`). This avoids the reboot-to-maskrom step entirely — faster, and it sidesteps the RK3288-with-populated-eMMC limitation (see below). Before auto-running the test, `MainViewModel` polls `probeAlive()` until the resident Boot is idle (else the first `downloadItem` can intermittently `bulk IN timeout`).
+
+**reboot-to-maskrom is loader-dependent** (only used when NOT unifying). The BootROM never checks the flag; the next-stage loader/ddrbin does (`CONFIG_ROCKCHIP_BOOT_MODE_REG` = magic `0xEF08A53C`, then a CRU soft-reset). Works on empty-eMMC boards (BROM falls to maskrom) and cooperative loaders; a populated eMMC with a non-cooperative loader needs the hardware maskrom key. No pure-software, loader-independent, non-destructive maskrom exists on these SoCs — hence the unified no-reboot flow is preferred.
+
+**GUI toggles** (`MainViewModel`, in-memory, not persisted): `autoDetectEnabled` (default ON — off ⇒ no probe, user picks cfg manually, their choice never overwritten), `autoTestEnabled` (default OFF — on ⇒ test auto-runs after a matched detect).
+
+**Detect-cfg build tooling** lives in `tools/ddr-autodetect/` (**gitignored, dev-only**): `build.sh` cross-assembles the arm64/arm32 `probe.S.in`/`reboot.S.in` payloads (clang) and packs each SoC's `DDR自动探测.cfg`. Only the generated cfg ships in `DDRTestFiles/<soc>/`; regenerate via `bash tools/ddr-autodetect/build.sh` when payloads/addresses change. arm32 payloads must be fully inline (no `bl`/forward branches — the raw `.text` extractor doesn't resolve R_ARM_CALL relocations).
 
 The DMG build script (`scripts/package.sh`) copies `DDRTestFiles/` to `Contents/Resources/DDRTestFiles` in the app bundle.
 

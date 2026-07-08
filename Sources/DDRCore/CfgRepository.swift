@@ -102,6 +102,15 @@ public final class CfgRepository {
 
         while let url = enumerator?.nextObject() as? URL {
             guard url.pathExtension.lowercased() == "cfg" else { continue }
+            // Skip the DDR auto-detect payload cfg: it's an internal container
+            // (Boot + ddrbin + osregdump + reboot) driven by DdrDetector's own
+            // pipeline, NOT a user-selectable soldering-test cfg. Its name always
+            // carries "自动探测" and never "焊接" (by design), so it's identifiable
+            // here. Excluding it keeps it out of the picker and out of
+            // TestExecutionEngine (which would otherwise run its osregdump/reboot
+            // items as if they were a memory test). DdrDetector loads it directly
+            // by path, so this doesn't affect detection.
+            if url.lastPathComponent.contains("自动探测") { continue }
             let fullPath = url.path
             guard fullPath.hasPrefix(rootPath + "/") else { continue }
             let relative = String(fullPath.dropFirst(rootPath.count + 1))

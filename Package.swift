@@ -61,7 +61,7 @@ let package = Package(
         ),
         .testTarget(
             name: "DDRCoreTests",
-            dependencies: ["DDRCore"]
+            dependencies: ["DDRCore", "DDRUSB"]
         ),
     ]
 )
