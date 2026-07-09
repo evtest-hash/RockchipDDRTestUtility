@@ -15,20 +15,29 @@ public enum CfgParamGeometry {
         }
     }
 
-    private static func intValue(_ item: CfgItem, _ name: String) -> Int? {
-        item.params.first { ($0.name.isEmpty ? $0.section : $0.name) == name }
-            .flatMap { Int($0.value) }
+    /// 从 cfg forceinit 参数取 CS0 的位宽键。位宽参数是 combo：value 是索引，
+    /// 实际位数 = inputRangeValue 按 "|" 拆分后的第 index 项 —— 与引擎
+    /// RkUsbTransportLibusb.resolveParamValue 写进硬件的口径完全一致（权威，非经验公式）。
+    /// 缺参数、缺 inputRangeValue、索引越界、或值非整数 → 返回 nil（上层回退手动，绝不误判）。
+    public static func widthKey(fromForceinit item: CfgItem) -> WidthKey? {
+        guard let bus = resolvedComboInt(item, "cs0_bit_width"),
+              let die = resolvedComboInt(item, "cs0_die_bit_width") else { return nil }
+        return WidthKey(busWidthBits: bus, dieWidthBits: die)
     }
 
-    /// 从 cfg `forceinit` 参数取 CS0 的位宽键。仅支持 `cs*_` 参数 schema
-    /// (RK3568&RK3566 等)；缺 `cs0_bit_width`/`cs0_die_bit_width`（如 RK3288 的
-    /// `cha/chb` schema）返回 nil —— 调用方据此回退手动，绝不误判。
-    /// 映射（真实 cfg + 硬件实采验证）：die = 8<<(enum-1)；bus = 8<<enum。
-    public static func widthKey(fromForceinit item: CfgItem) -> WidthKey? {
-        guard let dieEnum = intValue(item, "cs0_die_bit_width"), dieEnum >= 1,
-              let busEnum = intValue(item, "cs0_bit_width"), busEnum >= 1 else { return nil }
-        return WidthKey(busWidthBits: 8 << busEnum,
-                        dieWidthBits: 8 << (dieEnum - 1))
+    /// Resolve a combo param to its actual integer value via inputRangeValue[index].
+    /// Non-combo params resolve by parsing `value` directly.
+    private static func resolvedComboInt(_ item: CfgItem, _ name: String) -> Int? {
+        guard let p = item.params.first(where: { ($0.name.isEmpty ? $0.section : $0.name) == name }) else { return nil }
+        switch p.inputType {
+        case .combo:
+            guard let rv = p.inputRangeValue else { return Int(p.value) }
+            let opts = rv.split(separator: "|").map(String.init)
+            guard let idx = Int(p.value), idx >= 0, idx < opts.count else { return nil }
+            return Int(opts[idx])
+        default:
+            return Int(p.value)
+        }
     }
 
     public static func widthKey(fromDecoded ch: ChannelGeometry) -> WidthKey {

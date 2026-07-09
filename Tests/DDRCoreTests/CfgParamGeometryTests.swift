@@ -3,35 +3,39 @@ import XCTest
 
 final class CfgParamGeometryTests: XCTestCase {
 
-    // 用真实 cfg 的 forceinit params 构造 CfgItem 的辅助
-    private func item(dieEnum: String, busEnum: String) -> CfgItem {
+    private func item(dieIdx: String, busIdx: String) -> CfgItem {
         let params = [
             CfgParameter(index: 0, section: "PARAM_02", name: "cs0_bit_width",
-                         inputType: .combo, value: busEnum, unit: "",
-                         inputRange: nil, inputRangeName: nil, inputRangeValue: nil),
+                         inputType: .combo, value: busIdx, unit: "",
+                         inputRange: nil, inputRangeName: "*8|*16|*32", inputRangeValue: "8|16|32"),
             CfgParameter(index: 1, section: "PARAM_03", name: "cs0_die_bit_width",
-                         inputType: .combo, value: dieEnum, unit: "",
-                         inputRange: nil, inputRangeName: nil, inputRangeValue: nil),
+                         inputType: .combo, value: dieIdx, unit: "",
+                         inputRange: nil, inputRangeName: "*4|*8|*16|*32", inputRangeValue: "4|8|16|32"),
         ]
         return CfgItem(name: "forceinit", pathHint: nil, nameOffset: 0,
                        payloadOffset: 0, payloadLength: 0, paramAddress: nil, params: params)
     }
 
-    func testDieWidthEnumMapping() {
-        // 1→×8, 2→×16, 3→×32
-        XCTAssertEqual(CfgParamGeometry.widthKey(fromForceinit: item(dieEnum: "1", busEnum: "1"))?.dieWidthBits, 8)
-        XCTAssertEqual(CfgParamGeometry.widthKey(fromForceinit: item(dieEnum: "2", busEnum: "1"))?.dieWidthBits, 16)
-        XCTAssertEqual(CfgParamGeometry.widthKey(fromForceinit: item(dieEnum: "3", busEnum: "1"))?.dieWidthBits, 32)
+    func testDieWidthComboIndexMapping() {
+        // 索引: 0→×4, 1→×8, 2→×16, 3→×32
+        XCTAssertEqual(CfgParamGeometry.widthKey(fromForceinit: item(dieIdx: "0", busIdx: "0"))?.dieWidthBits, 4)
+        XCTAssertEqual(CfgParamGeometry.widthKey(fromForceinit: item(dieIdx: "1", busIdx: "0"))?.dieWidthBits, 8)
+        XCTAssertEqual(CfgParamGeometry.widthKey(fromForceinit: item(dieIdx: "2", busIdx: "0"))?.dieWidthBits, 16)
+        XCTAssertEqual(CfgParamGeometry.widthKey(fromForceinit: item(dieIdx: "3", busIdx: "0"))?.dieWidthBits, 32)
     }
 
-    func testBusWidthEnumMapping() {
-        // 1→16-bit, 2→32-bit
-        XCTAssertEqual(CfgParamGeometry.widthKey(fromForceinit: item(dieEnum: "2", busEnum: "1"))?.busWidthBits, 16)
-        XCTAssertEqual(CfgParamGeometry.widthKey(fromForceinit: item(dieEnum: "2", busEnum: "2"))?.busWidthBits, 32)
+    func testBusWidthComboIndexMapping() {
+        // 索引: 0→8, 1→16, 2→32
+        XCTAssertEqual(CfgParamGeometry.widthKey(fromForceinit: item(dieIdx: "1", busIdx: "0"))?.busWidthBits, 8)
+        XCTAssertEqual(CfgParamGeometry.widthKey(fromForceinit: item(dieIdx: "1", busIdx: "1"))?.busWidthBits, 16)
+        XCTAssertEqual(CfgParamGeometry.widthKey(fromForceinit: item(dieIdx: "1", busIdx: "2"))?.busWidthBits, 32)
+    }
+
+    func testIndexOutOfRangeYieldsNil() {
+        XCTAssertNil(CfgParamGeometry.widthKey(fromForceinit: item(dieIdx: "9", busIdx: "0")))
     }
 
     func testMissingParamsYieldNil() {
-        // RK3288 cha/chb schema 没有 cs0_* → nil（本轮不支持，回退手动）
         let empty = CfgItem(name: "forceinit", pathHint: nil, nameOffset: 0,
                             payloadOffset: 0, payloadLength: 0, paramAddress: nil, params: [])
         XCTAssertNil(CfgParamGeometry.widthKey(fromForceinit: empty))
@@ -43,5 +47,18 @@ final class CfgParamGeometryTests: XCTestCase {
         let k = CfgParamGeometry.widthKey(fromDecoded: ch)
         XCTAssertEqual(k.busWidthBits, 32)
         XCTAssertEqual(k.dieWidthBits, 16)
+    }
+
+    // 交叉印证：用一个真实 cfg，widthKey 解析出的位宽应等于其文件名/物理事实。
+    // 4GB LPDDR4(2CS,每CS 16Gb) 实采 dbw=16 bw=32。
+    func testRealCfgResolvesToPhysicalWidth() throws {
+        let url = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("DDRTestFiles/RK3568&RK3566")
+            .appendingPathComponent("4GB LPDDR4(用2个CS且每个CS为16Gb组成)焊接检测.cfg")
+        let plan = try CfgBinaryParser().parse(url: url)
+        let fi = try XCTUnwrap(plan.items.first { $0.name == "forceinit" })
+        let k = try XCTUnwrap(CfgParamGeometry.widthKey(fromForceinit: fi))
+        XCTAssertEqual(k.dieWidthBits, 16)
+        XCTAssertEqual(k.busWidthBits, 32)
     }
 }
