@@ -14,5 +14,9 @@ DerivedData/
 # generated DDRTestFiles/<soc>/DDR自动探测.cfg, not these intermediates.
 /tools/ddr-autodetect/
 
+# Eye-scan RE + build tooling — dev-only; contains extracted proprietary
+# blobs (DDR Test Tool) and analysis artifacts, nothing shipped.
+/tools/ddr-eyescan/
+
 # Local design docs / specs / plans — dev-only, not shipped
 /docs/
