@@ -105,4 +105,28 @@ public enum CfgAutoSelect {
         }
         return nil
     }
+
+    /// 探测匹配分级，供上层决定是否允许自动测试。
+    public enum MatchTier: Sendable {
+        case uniqueByCoarse    // L1(文件名 type+容量+CS) 即唯一命中
+        case uniqueByTieBreak  // L1>1，靠参数几何 tie-break 收敛成唯一（离散颗粒，未硬件验证 → 待确认）
+        case ambiguous         // L1>1 且 tie-break 仍无法唯一
+        case none              // L1 零命中
+    }
+
+    /// 在 L1 候选内部，用每个候选 `forceinit` 的位宽几何与解码几何比对，
+    /// 只保留 (busWidthBits, dieWidthBits) 与解码首通道一致的候选。保序。
+    /// 解码无通道、或候选 `forceinit` 为 nil / 取不到位宽键 → 该候选被排除，
+    /// 绝不误选（配合铁律回退手动）。
+    public static func tieBreak(_ pairs: [(candidate: Candidate, forceinit: CfgItem?)],
+                                decoded: DetectedGeometry) -> [Candidate] {
+        guard let ch = decoded.channels.first else { return [] }
+        let target = CfgParamGeometry.widthKey(fromDecoded: ch)
+        return pairs.compactMap { pair in
+            guard let fi = pair.forceinit,
+                  let k = CfgParamGeometry.widthKey(fromForceinit: fi),
+                  k == target else { return nil }
+            return pair.candidate
+        }
+    }
 }

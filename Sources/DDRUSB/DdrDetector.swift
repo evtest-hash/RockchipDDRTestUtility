@@ -6,6 +6,7 @@ public struct DetectOutcome: Sendable {
     public let rawOsReg: [UInt32]
     public let geometry: DetectedGeometry
     public let candidates: [CfgAutoSelect.Candidate]
+    public let matchTier: CfgAutoSelect.MatchTier
     public let rebootedToMaskrom: Bool
 }
 
@@ -117,7 +118,29 @@ public actor DdrDetector {
         guard let words else { throw DetectError.noOsReg }
 
         let geo = OsRegDecoder.decode(words)
-        let candidates = CfgAutoSelect.rank(geometry: geo, socFiles: socFiles)
+        let coarse = CfgAutoSelect.rank(geometry: geo, socFiles: socFiles)
+        // 两级匹配：L1>1 时，解析这几个候选的 forceinit 参数做组内 tie-break。
+        var candidates = coarse
+        var tier: CfgAutoSelect.MatchTier
+        switch coarse.count {
+        case 0:
+            tier = .none
+        case 1:
+            tier = .uniqueByCoarse
+        default:
+            let parser = CfgBinaryParser()
+            let pairs = coarse.map { c -> (candidate: CfgAutoSelect.Candidate, forceinit: CfgItem?) in
+                let plan = try? parser.parse(url: URL(fileURLWithPath: c.entry.absolutePath))
+                return (c, plan?.items.first { $0.name == "forceinit" })
+            }
+            let narrowed = CfgAutoSelect.tieBreak(pairs, decoded: geo)
+            if narrowed.count == 1 {
+                candidates = narrowed
+                tier = .uniqueByTieBreak
+            } else {
+                tier = .ambiguous   // 保留原始 coarse 候选，交回上层手动
+            }
+        }
 
         // ④ reboot to maskrom, then wait for re-enumeration. Runs ONLY here,
         // explicitly, after capture — never mid-capture (the whole reason this
@@ -130,7 +153,7 @@ public actor DdrDetector {
         phase(reboot ? "④ reboot + re-enum (rebooted=\(rebooted))"
                      : "④ reboot SKIPPED (unified detect→test; transport kept open)")
         return DetectOutcome(rawOsReg: words, geometry: geo, candidates: candidates,
-                             rebootedToMaskrom: rebooted)
+                             matchTier: tier, rebootedToMaskrom: rebooted)
     }
 
     /// Runs the reboot-to-maskrom payload (extracted from the detect cfg) on the

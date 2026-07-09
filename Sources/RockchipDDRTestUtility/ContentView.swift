@@ -83,11 +83,11 @@ struct ContentView: View {
 
             Toggle("自动探测", isOn: $viewModel.autoDetectEnabled)
                 .toggleStyle(.checkbox)
-                .help("勾选后，插入设备时自动探测 DDR 并预选匹配的配置文件（默认开启，仅本次运行有效）。关闭后请手动选择配置文件。")
+                .help("开启后，点「开始测试」会先自动探测 DDR 并选好匹配的配置文件，再接着测试（默认开启，仅本次运行有效）。关闭则使用你手动选择的配置文件。")
 
             Toggle("自动测试", isOn: $viewModel.autoTestEnabled)
                 .toggleStyle(.checkbox)
-                .help("勾选后，检测到新设备时自动开始测试")
+                .help("开启后，插入设备即自动开始（探测+测试），适合大批量连续测试；关闭则需点「开始测试」。")
 
             Button {
                 Task { await viewModel.startTest() }
@@ -117,8 +117,8 @@ struct ContentView: View {
                             .foregroundStyle(.secondary)
                         VStack(alignment: .leading, spacing: 4) {
                             Label("连接设备（Maskrom 状态）", systemImage: "1.circle")
-                            Label("自动识别 DDR 并选好配置（无需手动）", systemImage: "2.circle")
-                            Label("点「开始测试」查看结果", systemImage: "3.circle")
+                            Label("点「开始测试」：自动识别 DDR 并选好配置", systemImage: "2.circle")
+                            Label("查看焊接质量结果", systemImage: "3.circle")
                         }
                         .font(.callout)
                         .foregroundStyle(.tertiary)
