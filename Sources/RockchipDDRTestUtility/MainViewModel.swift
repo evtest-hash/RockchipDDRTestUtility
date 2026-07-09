@@ -693,35 +693,55 @@ final class MainViewModel: ObservableObject {
                                            socFiles: filesForSelectedSoc, reboot: false)
             // Detection succeeds ONLY on an exact (type + capacity + CS) match.
             // `out.candidates` is already the exact-match set (empty ⇒ no match).
-            let matched = applyDetectCandidates(out.candidates) != nil
-            Self.dlog("detect done: \(out.geometry.summary()) matches=\(out.candidates.count) selected=\(selectedFileID ?? "nil")")
-            // Boot is resident from detect → the test skips boot (reuses it).
-            setDeviceNeedsBoot(false)
+            // `out.matchTier` further grades HOW that match was reached — only
+            // .uniqueByCoarse (a clean, unambiguous hit) is allowed to auto-test.
+            Self.dlog("detect done: \(out.geometry.summary()) matches=\(out.candidates.count) tier=\(out.matchTier) selected=\(selectedFileID ?? "nil")")
+            let selected = applyDetectCandidates(out.candidates)
+            setDeviceNeedsBoot(false)   // Boot 常驻，测试跳过 boot
 
-            if !matched {
-                // No cfg exactly matches — DDR uninitialized/defective, or config
-                // not in the library. Do NOT auto-test; require manual selection.
-                // Transport stays open: a manual pick + test still skip-boots.
+            switch out.matchTier {
+            case .none:
+                // 零命中：交回手动，不测。
                 setStepState(Self.detectStepName, .failed)
                 appendStepMessage(Self.detectStepName, "未匹配到 cfg(\(out.geometry.summary()))")
                 appendStepMessage(Self.detectStepName, "可能未初始化/坏板,或不在库中 — 请手动选择配置文件")
                 selectedFileID = filesForSelectedSoc.first?.id
-                statusMessage = "DDR 探测未匹配到 cfg(\(out.geometry.summary()))— 可能未初始化/坏板,或不在库中,请手动选择"
-                Self.dlog("no exact match → manual selection")
+                statusMessage = "DDR 探测未匹配到 cfg(\(out.geometry.summary()))— 请手动选择"
                 startKeepAlive()
-            } else {
-                // >1 exact match means the library holds several cfgs with the
-                // same (type + capacity + CS) differing only in die composition.
-                let ambiguous = out.candidates.count > 1
+
+            case .ambiguous:
+                // L1>1 且 tie-break 未能唯一：预选第一个但不自动测，可改选。
                 let cfgName = out.candidates.first?.entry.displayName ?? "(cfg)"
                 setStepState(Self.detectStepName, .passed)
                 appendStepMessage(Self.detectStepName, "检测到 \(out.geometry.summary())")
-                appendStepMessage(Self.detectStepName, ambiguous
-                    ? "预选 cfg(多个同规格,可改选): \(cfgName)"
-                    : "预选 cfg: \(cfgName)")
-                statusMessage = ambiguous
-                    ? "检测到 \(out.geometry.summary()) — 已预选 cfg(多个同规格 cfg,可改选),可开始测试"
-                    : "检测到 \(out.geometry.summary()) — 已预选 cfg,可开始测试"
+                appendStepMessage(Self.detectStepName, "多个同规格 cfg,已预选: \(cfgName)(可改选后手动开始测试)")
+                statusMessage = "检测到 \(out.geometry.summary()) — 多个同规格 cfg,请确认/改选后开始测试"
+                startKeepAlive()
+
+            case .uniqueByTieBreak:
+                // 参数几何收敛到唯一，但离散颗粒未经硬件验证：预选 + 待确认,不自动测。
+                let cfgName = out.candidates.first?.entry.displayName ?? "(cfg)"
+                setStepState(Self.detectStepName, .passed)
+                appendStepMessage(Self.detectStepName, "检测到 \(out.geometry.summary())")
+                appendStepMessage(Self.detectStepName, "已按几何预选: \(cfgName)(离散颗粒,未经硬件验证,请确认后开始测试)")
+                statusMessage = "检测到 \(out.geometry.summary()) — 已按几何预选 cfg,请确认后开始测试"
+                startKeepAlive()
+
+            case .uniqueByCoarse:
+                // 干净唯一命中：维持现状,允许自动测试。
+                guard selected != nil else {
+                    setStepState(Self.detectStepName, .failed)
+                    appendStepMessage(Self.detectStepName, "匹配到 cfg 但不在已加载列表 — 请手动选择")
+                    selectedFileID = filesForSelectedSoc.first?.id
+                    statusMessage = "DDR 探测匹配到 cfg 但不在列表 — 请手动选择"
+                    startKeepAlive()
+                    break
+                }
+                let cfgName = out.candidates.first?.entry.displayName ?? "(cfg)"
+                setStepState(Self.detectStepName, .passed)
+                appendStepMessage(Self.detectStepName, "检测到 \(out.geometry.summary())")
+                appendStepMessage(Self.detectStepName, "预选 cfg: \(cfgName)")
+                statusMessage = "检测到 \(out.geometry.summary()) — 已预选 cfg,可开始测试"
                 if autoTestEnabled && !hasRunAutoTestForCurrentDevice {
                     // Trigger the test DIRECTLY — not via maybeAutoTest(), whose
                     // `newIDs` (device-just-enumerated) guard was satisfied by the
@@ -740,7 +760,7 @@ final class MainViewModel: ObservableObject {
                     // makes the manual path — keep-alive running until the user
                     // clicks — reliable). Deterministic, not a guessed delay.
                     hasRunAutoTestForCurrentDevice = true
-                    Self.dlog("matched; autoTest on → wait for Boot idle, then startTest()")
+                    Self.dlog("uniqueByCoarse; autoTest on → wait for Boot idle, then startTest()")
                     let t = activeTransport
                     // Detached so the blocking probeAlive() bulk call runs OFF the
                     // main thread (the keep-alive does the same); startTest is
