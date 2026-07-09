@@ -624,6 +624,7 @@ final class MainViewModel: ObservableObject {
                         if t?.probeAlive() == true { break }
                     }
                 }.value
+                isDetecting = false
                 await runSolderTest()
 
             case .ambiguous:
