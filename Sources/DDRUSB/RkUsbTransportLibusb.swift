@@ -208,7 +208,7 @@ public final class RkUsbTransportLibusb: UsbTransport {
         _ = libusb_clear_halt(selected, bulkInEndpoint)
     }
 
-    public func downloadBoot(item: CfgItem, payload: Data) throws {
+    public func downloadBoot(item: CfgItem, payload: Data, lenientFinalChunk: Bool = false) throws {
         ioLock.lock(); defer { ioLock.unlock() }
         try ensureOpened()
         guard payload.count > 0 else {
@@ -244,7 +244,16 @@ public final class RkUsbTransportLibusb: UsbTransport {
         while offset < bootPayload.count {
             let chunkLen = min(Self.bootControlChunkSize, bootPayload.count - offset)
             let chunk = bootPayload.subdata(in: offset..<(offset + chunkLen))
-            try sendBootControlChunk(chunk)
+            let isFinal = (offset + chunkLen >= bootPayload.count)
+            do {
+                try sendBootControlChunk(chunk)
+            } catch {
+                if isFinal && lenientFinalChunk {
+                    debug("final chunk not ACKed — treating blob as launched")
+                } else {
+                    throw error
+                }
+            }
             offset += chunkLen
             if bootChunkDelayUs > 0 {
                 usleep(bootChunkDelayUs)
