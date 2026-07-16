@@ -188,6 +188,13 @@ public struct CfgTestPlan: Sendable {
         self.items = items
         self.embeddedBins = embeddedBins
     }
+
+    /// Look up an embedded payload by record name, case-insensitively. Shared by
+    /// the container-cfg consumers (`DdrDetector`, the GUI eye-scan flow) which
+    /// pull payloads out of a packaged cfg by name rather than running it.
+    public func payload(named name: String) -> Data? {
+        embeddedBins.first { $0.key.caseInsensitiveCompare(name) == .orderedSame }?.value
+    }
 }
 
 /// Maps Rockchip USB PID (VID 0x2207) to TestFiles directory name.

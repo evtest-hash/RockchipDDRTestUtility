@@ -3,6 +3,14 @@ import Foundation
 public final class CfgRepository {
     public let rootURL: URL
 
+    /// Filename marker of an eye-scan container cfg. Single source — used both to
+    /// exclude it from the selectable list here and to locate it (MainViewModel).
+    public static let eyescanCfgMarker = "眼图"
+
+    /// Filename markers of internal container cfgs excluded from the selectable
+    /// test-file list (see `discoverTestFiles`). Single source — extend here.
+    private static let containerCfgMarkers = ["自动探测", eyescanCfgMarker]
+
     public init(rootURL: URL) {
         self.rootURL = rootURL
     }
@@ -110,7 +118,12 @@ public final class CfgRepository {
             // TestExecutionEngine (which would otherwise run its osregdump/reboot
             // items as if they were a memory test). DdrDetector loads it directly
             // by path, so this doesn't affect detection.
-            if url.lastPathComponent.contains("自动探测") { continue }
+            // Skip internal container cfgs: they package payloads driven directly
+            // by DdrDetector ("自动探测") / EyescanRunner ("眼图"), NOT user-selectable
+            // soldering-test cfgs. Their names carry one of these markers and never
+            // "焊接" (by design), so a filename denylist identifies them. (Keep this
+            // the single source; add a marker here rather than a new inline guard.)
+            if Self.containerCfgMarkers.contains(where: url.lastPathComponent.contains) { continue }
             let fullPath = url.path
             guard fullPath.hasPrefix(rootPath + "/") else { continue }
             let relative = String(fullPath.dropFirst(rootPath.count + 1))

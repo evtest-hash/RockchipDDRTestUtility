@@ -10,7 +10,7 @@ public final class RkUsbTransportLibusb: UsbTransport {
     private static let bootControlChunkSize = 4096
 
     private static let downloadChunkSize = 0x4000
-    private static let pollReadLength: UInt32 = 0x200
+    private static let pollReadLength: UInt32 = 0x2000  // 8KB read buffer (>= enlarged DTT ring cap 4096)
     private static let pollOpcode: UInt32 = 0x80
     private static let writeOpcode: UInt32 = 0x02
     private static let runOpcode: UInt32 = 0x03
@@ -379,6 +379,10 @@ public final class RkUsbTransportLibusb: UsbTransport {
     }
 
     public func readPrintf() throws -> String? {
+        try readPrintf(acknowledge: true)
+    }
+
+    public func readPrintf(acknowledge: Bool) throws -> String? {
         ioLock.lock(); defer { ioLock.unlock() }
         try ensureOpened()
 
@@ -393,7 +397,10 @@ public final class RkUsbTransportLibusb: UsbTransport {
             return nil
         }
 
-        if data.count >= 128 {
+        // The runtime-log handshake is what the firmware answers slowly during
+        // streaming (~500ms/read). Skip it for high-rate drains — the DDR Test
+        // Tool ring advances on the read itself, so it is not needed there.
+        if acknowledge, data.count >= 128 {
             try acknowledgeRuntimeLog()
         }
 

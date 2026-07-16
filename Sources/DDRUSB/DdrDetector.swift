@@ -52,9 +52,7 @@ public actor DdrDetector {
         let plan = try parser.parse(url: cfgURL)
 
         // Pull each payload out of the packaged cfg by (case-insensitive) name.
-        func payload(_ name: String) -> Data? {
-            plan.embeddedBins.first { $0.key.caseInsensitiveCompare(name) == .orderedSame }?.value
-        }
+        func payload(_ name: String) -> Data? { plan.payload(named: name) }
         guard let ddrBin = payload("ddrbin") else {
             throw DetectError.cfgPayloadMissing("ddrbin")
         }

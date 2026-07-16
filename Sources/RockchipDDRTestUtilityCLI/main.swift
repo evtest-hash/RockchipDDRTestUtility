@@ -25,6 +25,21 @@ struct CLIArguments {
     /// latch, cleared only after `bootSucceeded`), exactly like clicking
     /// "start test" repeatedly in the GUI without re-plugging.
     var repeatCount: Int = 1
+    /// EYE-SCAN: 3-step capture. The train-only eye-scan bin (path here) trains
+    /// the PHY and DETECTS geometry on-device; then the DDR Test Tool (resident
+    /// 0x80 service); then the relocated eye-scan item. No host geometry params.
+    var eyescanDdrBin: String?
+    // Defaults are RK3568's shipped-equivalent bins (fast DTT + return-status item); every SoC
+    // overrides via --eye-dtt/--eye-item. (Pre-reorg paths tools/ddr-eyescan/{re,reloc}/ are gone.)
+    var eyescanItemPath = "tools/ddr-eyescan/rk3568/out/eyescan_item.bin"
+    var eyescanDttPath = "tools/ddr-eyescan/rk3568/out/dtt_fast.bin"
+    var eyescanOut = "/tmp/eyescan.txt"
+    /// Item download base + end-marker — per-SoC. RK3568=0xFDCC4000; RK3576=0x3FF84000; RK3588=0xFF004000.
+    /// Overridable so the same 3-step driver runs other SoCs' items / diagnostic probes.
+    var eyescanItemBase: UInt32 = 0xFDCC_4000
+    var eyescanMarker = "all dq eye scan done"
+    /// Optional reboot payload run after the scan → device auto-returns to maskrom (no replug).
+    var eyescanReboot: String?
 
     static func parse(_ argv: [String]) throws -> CLIArguments {
         var args = CLIArguments()
@@ -71,6 +86,33 @@ struct CLIArguments {
                     throw DDRToolError.invalidFormat("Missing/invalid value for --repeat (expect int >= 1)")
                 }
                 args.repeatCount = n
+            case "--eyescan":
+                idx += 1
+                guard idx < argv.count else {
+                    throw DDRToolError.invalidFormat("Missing value for --eyescan (standard DDR bin path)")
+                }
+                args.eyescanDdrBin = argv[idx]
+            case "--eye-item":
+                idx += 1; guard idx < argv.count else { throw DDRToolError.invalidFormat("Missing value for --eye-item") }
+                args.eyescanItemPath = argv[idx]
+            case "--eye-dtt":
+                idx += 1; guard idx < argv.count else { throw DDRToolError.invalidFormat("Missing value for --eye-dtt") }
+                args.eyescanDttPath = argv[idx]
+            case "--eye-out":
+                idx += 1; guard idx < argv.count else { throw DDRToolError.invalidFormat("Missing value for --eye-out") }
+                args.eyescanOut = argv[idx]
+            case "--eye-item-base":
+                idx += 1
+                guard idx < argv.count,
+                      let v = UInt32(argv[idx].replacingOccurrences(of: "0x", with: ""), radix: 16)
+                else { throw DDRToolError.invalidFormat("Missing/invalid --eye-item-base (hex)") }
+                args.eyescanItemBase = v
+            case "--eye-marker":
+                idx += 1; guard idx < argv.count else { throw DDRToolError.invalidFormat("Missing value for --eye-marker") }
+                args.eyescanMarker = argv[idx]
+            case "--eye-reboot":
+                idx += 1; guard idx < argv.count else { throw DDRToolError.invalidFormat("Missing value for --eye-reboot") }
+                args.eyescanReboot = argv[idx]
             case "--help", "-h":
                 printUsageAndExit()
             default:
@@ -91,6 +133,9 @@ func printUsageAndExit() -> Never {
       --cfg <cfg_path> [--device-id <id>] [--output-log <txt_path>] [--repeat N]
       --detect [--detect-cfg <detect.cfg>] [--device-id <id>]
       --detect-then-test [--device-id <id>]   (experiment: detect→test, no reboot)
+      --eyescan <train_only_bin> [--eye-item <bin> --eye-dtt <bin> --eye-out <txt>]
+                          (3-step eye-scan capture over USB 0x80;
+                           geometry auto-detected on-device, no host params)
 
     Examples:
       swift run RockchipDDRTestUtilityCLI --list
@@ -107,6 +152,7 @@ func printUsageAndExit() -> Never {
 @main
 struct RockchipDDRTestUtilityCLI {
     static func main() async {
+        setvbuf(stdout, nil, _IOLBF, 0)   // line-buffer so piped progress shows live
         do {
             let args = try CLIArguments.parse(CommandLine.arguments)
             let transport = try RkUsbTransportLibusb()
@@ -136,6 +182,11 @@ struct RockchipDDRTestUtilityCLI {
                 try transport.downloadItem(item: dummy, payload: payload, address: 0)
                 try transport.close()
                 print("Probe bulk transfer: OK")
+                return
+            }
+
+            if args.eyescanDdrBin != nil {
+                try await runEyescan(args: args)
                 return
             }
 
@@ -204,19 +255,78 @@ struct RockchipDDRTestUtilityCLI {
         }
     }
 
-    /// DDR auto-detect spike (approach A): drive the whole sequence over USB via
-    /// cfg + the existing engine — no xrock.
-    ///   ① download the auto-probing rkbin DDR bin (control-transfer 0x471) →
-    ///      SoC detects DRAM and writes geometry into PMU_GRF OS_REG (survives).
-    ///   ② run the osregdump cfg through the normal engine → downloads the DDR
-    ///      Test Tool Boot (0x471) + the probe item (bulk 0x02 / RunMemory 0x03).
-    ///   ③ the probe reads OS_REG and prints it over the 0x80 printf channel.
-    ///   ④ decode SYS_REG → geometry, shortlist the matching soldering-test cfg.
-    /// Thin CLI wrapper around `DdrDetector`: pick a device, discover the SoC's
-    /// candidate soldering-test cfgs, hand off to the detector for the full
-    /// probe → decode → rank → reboot-to-maskrom flow, then print the result.
-    /// All retry/orchestration logic now lives in `DdrDetector` (Task 4) — this
-    /// is the single call site, replacing the old inline spike.
+    /// EYE-SCAN: 3-step capture streaming the eye-scan report over USB 0x80.
+    /// The exact stage semantics are PER-SoC (the download mechanics are identical):
+    ///   • RK3568  (3-part model): ① train-only bin (trains DDR + detects geometry) →
+    ///     ② DDR Test Tool (resident 2-core USB svc) → ③ relocated measurement core.
+    ///   • RK3576/RK3588 (PATH ②, monolithic-bin family): ① the WHOLE eyescan bin runs
+    ///     as a fresh boot (self-trains + scans) with its putc redirected to capture the
+    ///     output into free SRAM → ② native DDR Test Tool → ③ a small item that reads the
+    ///     captured buffer, filters it, and relays the kept lines over the DTT ring.
+    /// Either way: NO host geometry — rank/type/width/freq/margins are all decided
+    /// on-device; the item reads NOTHING from the host.
+    static func runEyescan(args: CLIArguments) async throws {
+        guard let ddrBinPath = args.eyescanDdrBin else { throw DDRToolError.invalidFormat("--eyescan needs a DDR bin") }
+        // "none" → skip stage① (used by an eyescan-item that self-trains: DTT + item only).
+        let ddrBin = ddrBinPath == "none" ? Data() : try Data(contentsOf: URL(fileURLWithPath: ddrBinPath))
+        let dtt = try Data(contentsOf: URL(fileURLWithPath: args.eyescanDttPath))
+        let itemBin = try Data(contentsOf: URL(fileURLWithPath: args.eyescanItemPath))
+        print("Eye-scan 3-step over USB 0x80 (geometry auto-detected on-device, no host params):")
+        print("  ① stage-1 0x471 bin (on-device DDR init/train/scan): \(ddrBinPath) (\(ddrBin.count) B)")
+        print("  ② DDR Test Tool     (resident 2-core USB 0x80 svc) : \(args.eyescanDttPath) (\(dtt.count) B)")
+        print("  ③ stage-3 item      (bulk-run; streams 0x80 report): \(args.eyescanItemPath) (\(itemBin.count) B)")
+
+        let transport = try RkUsbTransportLibusb()
+        let devices = try transport.discoverDevices()
+        guard let device = chooseDevice(from: devices, selectedDeviceID: args.selectedDeviceID) else {
+            throw DDRToolError.noDevice
+        }
+        print("Device: \(device.productName) pid=0x\(hex16(device.productID)) id=\(device.deviceID)")
+
+        let runner = EyescanRunner()
+        let start = Date()
+        let box = ProgressBox()
+        let transcript = try await runner.run(
+            transport: transport, device: device,
+            ddrBin: ddrBin, ddrTestTool: dtt, itemBin: itemBin,
+            itemBase: args.eyescanItemBase,
+            timeout: 120,
+            rebootBin: args.eyescanReboot.flatMap { try? Data(contentsOf: URL(fileURLWithPath: $0)) },
+            onProgress: { chunk in box.note(chunk, since: start) })
+        try? transport.close()
+        try? transcript.write(toFile: args.eyescanOut, atomically: true, encoding: .utf8)
+
+        let done = transcript.contains(args.eyescanMarker)
+        print("\n=== EYE-SCAN SUMMARY ===")
+        print("  bytes captured : \(transcript.utf8.count)")
+        print("  lines          : \(transcript.split(separator: "\n", omittingEmptySubsequences: false).count)")
+        print("  saw done marker: \(done)")
+        print("  output written : \(args.eyescanOut)")
+        print("  VERDICT: \(done ? "GO — full eye-scan log captured over USB 0x80" : "incomplete — inspect \(args.eyescanOut)")")
+    }
+
+    /// Thread-safe progress heartbeat for the streaming drain.
+    final class ProgressBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var bytes = 0
+        private var nextBeat = 5.0
+        private let ph: FileHandle?
+        init(partialPath: String = "/tmp/eyescan_partial.txt") {
+            FileManager.default.createFile(atPath: partialPath, contents: nil)
+            ph = try? FileHandle(forWritingTo: URL(fileURLWithPath: partialPath))
+        }
+        func note(_ chunk: String, since start: Date) {
+            lock.lock(); defer { lock.unlock() }
+            bytes += chunk.utf8.count
+            if let d = chunk.data(using: .utf8) { ph?.write(d) }   // incremental capture (survives a kill)
+            let el = Date().timeIntervalSince(start)
+            if el >= nextBeat {
+                print("    [\(Int(el))s] \(bytes) B captured")
+                nextBeat += 5.0
+            }
+        }
+    }
+
     static func runDetect(args: CLIArguments) async throws {
         let transport = try RkUsbTransportLibusb()
         let devices = try transport.discoverDevices()

@@ -1,13 +1,18 @@
 import DDRCore
 import SwiftUI
+import AppKit
 
 struct ContentView: View {
     @StateObject private var viewModel = MainViewModel()
 
     var body: some View {
         HStack(spacing: 0) {
-            sidebar
-            Divider()
+            // 眼图不选配置文件(几何自动探测)——隐藏侧边 cfg 栏,免得误以为
+            // 能选 cfg 做眼图。仅焊接模式显示。
+            if viewModel.mode == .solder {
+                sidebar
+                Divider()
+            }
             mainContent
         }
         .frame(minWidth: 860, minHeight: 560)
@@ -69,6 +74,18 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
             }
 
+            // 模式分段：选「测什么」，下面的「开始」按钮按此分派。眼图对不支持
+            // 的 SoC 不隐藏（保发现性），改为禁用「开始」+ hover 说明原因。
+            Picker("", selection: $viewModel.mode) {
+                ForEach(MainViewModel.ToolMode.allCases) { m in
+                    Text(m.rawValue).tag(m)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .fixedSize()
+            .disabled(viewModel.isRunning || viewModel.isDetecting)
+
             Spacer()
 
             if viewModel.isDetecting || viewModel.isRunning {
@@ -81,22 +98,32 @@ struct ContentView: View {
                 }
             }
 
+            // 自动探测 / 自动测试是焊接流程专属 → 眼图模式下变灰。
             Toggle("自动探测", isOn: $viewModel.autoDetectEnabled)
                 .toggleStyle(.checkbox)
-                .help("开启后，点「开始测试」会先自动探测 DDR 并选好匹配的配置文件，再接着测试（默认开启，仅本次运行有效）。关闭则使用你手动选择的配置文件。")
+                .disabled(viewModel.mode == .eyescan)
+                .help("开启后，点「开始」会先自动探测 DDR 并选好匹配的配置文件，再接着测试（默认开启，仅本次运行有效）。关闭则使用你手动选择的配置文件。（焊接模式专用）")
 
             Toggle("自动测试", isOn: $viewModel.autoTestEnabled)
                 .toggleStyle(.checkbox)
-                .help("开启后，插入设备即自动开始（探测+测试），适合大批量连续测试；关闭则需点「开始测试」。")
+                .disabled(viewModel.mode == .eyescan)
+                .help("开启后，插入设备即自动开始（探测+测试），适合大批量连续测试；关闭则需点「开始」。（焊接模式专用）")
 
             Button {
-                Task { await viewModel.startTest() }
+                Task {
+                    if viewModel.mode == .solder {
+                        await viewModel.startTest()
+                    } else {
+                        await viewModel.startEyescan()
+                    }
+                }
             } label: {
-                Text("开始测试")
+                Text("开始")
                     .frame(minWidth: 80)
             }
             .keyboardShortcut(.return)
-            .disabled(viewModel.isRunning || viewModel.isDetecting || viewModel.devices.isEmpty)
+            .disabled(!viewModel.canStart)
+            .help(viewModel.mode == .eyescan ? viewModel.eyescanHelp : "")
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
@@ -112,19 +139,24 @@ struct ContentView: View {
                         .font(.system(size: 36))
                         .foregroundStyle(.quaternary)
                     VStack(spacing: 8) {
-                        Text("DDR 焊接质量测试")
+                        Text(viewModel.mode.emptyStateTitle)
                             .font(.headline)
                             .foregroundStyle(.secondary)
                         VStack(alignment: .leading, spacing: 4) {
-                            Label("连接设备（Maskrom 状态）", systemImage: "1.circle")
-                            Label("点「开始测试」：自动识别 DDR 并选好配置", systemImage: "2.circle")
-                            Label("查看焊接质量结果", systemImage: "3.circle")
+                            ForEach(viewModel.mode.emptyStateSteps, id: \.text) { step in
+                                Label(step.text, systemImage: step.symbol)
+                            }
                         }
                         .font(.callout)
                         .foregroundStyle(.tertiary)
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if viewModel.mode == .eyescan {
+                // Eye-scan: ONE large log → a single full-height pane (native NSTextView, scrolls
+                // internally). NOT the step-card-in-ScrollView model, which is for the multi-item
+                // solder test and can't give the log the whole area.
+                eyescanLogPane
             } else {
                 ScrollViewReader { proxy in
                     ScrollView {
@@ -146,6 +178,9 @@ struct ContentView: View {
                         proxy.scrollTo(last.id, anchor: .bottom)
                     }
                 }
+                // 每轮新测试重建一个全新的 ScrollView(滚动位置回到顶部),避免复用
+                // 上一轮滚到底部的偏移导致清空后显示空白。
+                .id(viewModel.runToken)
             }
 
             if let outcome = viewModel.overallOutcome {
@@ -157,22 +192,47 @@ struct ContentView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
+    // MARK: - Eye-scan Log Pane
+
+    /// The eye-scan display: a status header + the full log filling the rest of the area, scrolling
+    /// internally via a native NSTextView. Reads `viewModel.eyescanLog` (one growing string).
+    private var eyescanLogPane: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if let step = viewModel.testSteps.first {
+                HStack(spacing: 8) {
+                    stepStateIcon(step.state)
+                    Text(step.name)
+                        .font(.system(size: 14, weight: .medium))
+                    Spacer()
+                    stepStateLabel(step.state)
+                }
+            }
+            LogView(text: viewModel.eyescanLog)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(Color(nsColor: .textBackgroundColor).opacity(0.25))
+                )
+        }
+        .padding(16)
+    }
+
     // MARK: - Status Bar
 
     private var statusBar: some View {
         HStack {
             Spacer()
 
-            Button("保存测试结果") {
+            Button(viewModel.mode.saveButtonLabel) {
                 let panel = NSSavePanel()
                 panel.allowedContentTypes = [.plainText]
-                panel.nameFieldStringValue = "DDR_Test_Result.txt"
+                panel.nameFieldStringValue = viewModel.mode.saveFileName
                 panel.begin { response in
                     guard response == .OK, let url = panel.url else { return }
                     viewModel.saveResult(to: url)
                 }
             }
-            .disabled(viewModel.lastResult == nil || viewModel.isRunning)
+            .disabled(!viewModel.canSaveResult)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 6)
@@ -191,6 +251,8 @@ struct ContentView: View {
             }
 
             if !step.messages.isEmpty {
+                // Solder steps carry only a handful of status lines — per-line Text is fine here.
+                // (The high-volume eye-scan log does NOT use step cards; it has its own pane.)
                 VStack(alignment: .leading, spacing: 3) {
                     ForEach(Array(step.messages.enumerated()), id: \.offset) { _, msg in
                         Text(msg)
@@ -273,5 +335,55 @@ struct ContentView: View {
                 .fill(isPass ? .green : .red)
                 .shadow(color: Color(isPass ? .green : .red).opacity(0.3), radius: 8, y: 4)
         )
+    }
+}
+
+/// Native AppKit text log for LARGE content (the eye-scan report, ~592 lines). SwiftUI's
+/// `Text`/`ForEach` keep every line laid out in the view tree, so once a big log is present every
+/// app layout pass re-lays it and the whole app stutters. `NSTextView` lays out only the visible
+/// glyphs (cached layout manager) and scrolls natively — flat cost regardless of log length.
+/// Read-only + selectable; the drain is already decoupled from the UI, so string updates here can
+/// never affect the USB pipeline.
+struct LogView: NSViewRepresentable {
+    let text: String
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = false
+        scroll.drawsBackground = false
+        scroll.borderType = .noBorder
+
+        let tv = NSTextView()
+        tv.isEditable = false
+        tv.isSelectable = true
+        tv.drawsBackground = false
+        tv.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        tv.textColor = .secondaryLabelColor
+        tv.textContainerInset = NSSize(width: 0, height: 2)
+        tv.minSize = NSSize(width: 0, height: 0)
+        tv.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        tv.isVerticallyResizable = true
+        tv.isHorizontallyResizable = false
+        tv.textContainer?.widthTracksTextView = true
+        tv.textContainer?.lineFragmentPadding = 0
+        tv.autoresizingMask = [.width]
+        scroll.documentView = tv
+        return scroll
+    }
+
+    func updateNSView(_ scroll: NSScrollView, context: Context) {
+        guard let tv = scroll.documentView as? NSTextView, tv.string != text else { return }
+        // Was the user parked near the bottom BEFORE this update? (Compare the viewport bottom to
+        // the current document height.) If so, follow the newest content; if they scrolled up to
+        // read, leave their position alone. Content only changes while streaming, so this pins the
+        // live tail without yanking a reader who scrolled back.
+        let followTail = (tv.frame.height - scroll.contentView.bounds.maxY) < 40
+        tv.string = text
+        tv.textColor = .secondaryLabelColor
+        if followTail {
+            tv.layoutManager?.ensureLayout(for: tv.textContainer!)   // lay out new text first…
+            tv.scrollToEndOfDocument(nil)                            // …then pin to the bottom
+        }
     }
 }

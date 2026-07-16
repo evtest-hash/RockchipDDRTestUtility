@@ -20,7 +20,9 @@ final class MainViewModel: ObservableObject {
     @Published var totalMessageCount = 0
 
     @Published var overallOutcome: TestOutcome?
-    @Published var selectedSoc: String?
+    @Published var selectedSoc: String? {
+        didSet { if selectedSoc != oldValue { refreshEyescanCfgURL() } }
+    }
     @Published var autoTestEnabled = false
     /// User switch for DDR auto-detect (preselecting the cfg on plug-in). ON by
     /// default. Deliberately NOT persisted — its lifetime is this app run only,
@@ -33,6 +35,76 @@ final class MainViewModel: ObservableObject {
     /// a newly-arrived device. UI can use this to show a "detecting..." state
     /// distinct from `isRunning` (which covers the actual test execution).
     @Published var isDetecting = false
+    /// 工具箱模式:焊接测试(广覆盖)或眼图 / 裕量扫描(窄覆盖,按 cfg 存在与否背书)。
+    /// 分段控件选「测什么」,单个「开始」按钮按此模式分派。每个模式自带它的展示
+    /// 文案(空状态标题 / 步骤、保存按钮标题 / 文件名),文案跟着模式走,视图里不必
+    /// 散落 `mode == …` 三元分支——加新工具时只在这里补一行。
+    enum ToolMode: String, CaseIterable, Identifiable {
+        case solder = "焊接"
+        case eyescan = "眼图"
+        var id: String { rawValue }
+
+        var emptyStateTitle: String {
+            switch self {
+            case .solder:  return "DDR 焊接质量测试"
+            case .eyescan: return "DDR 眼图 / 裕量扫描"
+            }
+        }
+        /// 空状态里的三步引导:(文案, SF Symbol)。
+        var emptyStateSteps: [(text: String, symbol: String)] {
+            switch self {
+            case .solder:
+                return [("连接设备（Maskrom 状态）", "1.circle"),
+                        ("点「开始」：自动识别 DDR 并选好配置", "2.circle"),
+                        ("查看焊接质量结果", "3.circle")]
+            case .eyescan:
+                return [("连接设备（Maskrom 状态）", "1.circle"),
+                        ("点「开始」：固件自训练 DDR，逐 DQ 扫描裕量", "2.circle"),
+                        ("查看 rx / tx 眼图裕量结果", "3.circle")]
+            }
+        }
+        var saveButtonLabel: String { self == .eyescan ? "保存眼图日志" : "保存测试结果" }
+        var saveFileName: String { self == .eyescan ? "DDR_Eyescan.txt" : "DDR_Test_Result.txt" }
+    }
+    @Published var mode: ToolMode = .solder
+
+    /// 每开一轮新测试(焊接 / detect / 眼图)自增。用作日志区 ScrollView 的 `.id`,
+    /// 强制新一轮重建一个全新的 ScrollView——否则会复用上一轮已滚到底部的滚动
+    /// 位置,清空重填后偏移停在旧底部、显示空白(内容其实在,往上滚才见)。
+    @Published private(set) var runToken = 0
+
+    /// 复位一轮新测试的公共状态:清时间线、重置计数、翻 `runToken`(强制新建
+    /// ScrollView)、清总判定。焊接 / detect / 眼图三个入口共用。
+    private func beginNewRun() {
+        testSteps = []
+        totalMessageCount = 0
+        runToken += 1
+        overallOutcome = nil
+    }
+
+    /// 眼图对当前 SoC 是否可用,**完全由「是否随附眼图 cfg」决定**——眼图无需任何
+    /// host 侧参数 / 地址,cfg 的存在本身就是该 SoC 的背书。缓存,在 `selectedSoc`
+    /// 变化时刷新(refreshEyescanCfgURL),使 canEyescan / eyescanHelp / startEyescan
+    /// 在 SwiftUI 渲染热路径上零磁盘 I/O。新增一款眼图 SoC = 打好 "…眼图.cfg" 放进
+    /// DDRTestFiles/<soc>/ 即可,零代码改动。
+    @Published private(set) var eyescanCfgURL: URL?
+
+    /// 眼图当前是否可用(当前 SoC 有随附眼图 cfg)。
+    var canEyescan: Bool { eyescanCfgURL != nil }
+
+    /// 「开始」按钮是否可点(按当前模式)。
+    var canStart: Bool {
+        guard !isRunning, !isDetecting, !devices.isEmpty else { return false }
+        return mode == .solder || canEyescan
+    }
+
+    /// 眼图模式下「开始」按钮的 hover 说明(不可用时解释原因)。
+    var eyescanHelp: String {
+        guard selectedSoc != nil else { return "请先连接设备" }
+        if !canEyescan { return "当前芯片未随附眼图 cfg,暂不支持眼图测试" }
+        return "对当前 DDR 做眼图 / 裕量扫描(需设备处于 Maskrom)"
+    }
+
     /// Name of the DDR auto-detect card shown in the central log area (so detect
     /// and the subsequent test read as one timeline).
     static let detectStepName = "DDR 自动探测"
@@ -54,6 +126,9 @@ final class MainViewModel: ObservableObject {
     /// so repeated "start test" runs skip boot and just re-run the bulk test —
     /// exactly how Windows lets you keep clicking start.
     private var deviceNeedsBoot = true
+    /// 眼图流式展示的跨 chunk 行缓冲:readPrintf 的字节不按行对齐,末尾未完成的
+    /// 一行暂存于此,待下一段补齐后再落成一条消息(见 appendEyescanLines)。
+    private var eyescanLineCarry = ""
     /// Persistent USB transport held open across "start test" clicks for the
     /// selected device — mirrors Windows' persistent device handle. The engine
     /// is told `keepTransportOpen`, so repeat tests reuse the same claimed
@@ -77,6 +152,13 @@ final class MainViewModel: ObservableObject {
     private let parser = CfgBinaryParser()
     private let logWriter = ResultLogWriter()
     private(set) var lastResult: ExecutionResult?
+    /// 最近一次眼图扫描的完整 transcript(供「保存结果」写出;眼图不产生
+    /// `ExecutionResult`,所以单独存)。
+    @Published private(set) var lastEyescanTranscript: String?
+    /// The eye-scan log as ONE growing string (not a 592-element message array). The eye-scan is a
+    /// single large log; its own display pane renders this via a native NSTextView. Kept separate
+    /// from the step-message model, which is for the multi-item solder test.
+    @Published private(set) var eyescanLog = ""
     private var deviceMonitorTimer: Timer?
 
     var socNames: [String] {
@@ -152,12 +234,11 @@ final class MainViewModel: ObservableObject {
         // follows an auto-detect; otherwise start fresh. (Consume the flag so a
         // second, standalone test run resets normally.)
         if carryDetectStepIntoTest {
-            carryDetectStepIntoTest = false
+            carryDetectStepIntoTest = false   // 续用 detect 的时间线,不新建 ScrollView
+            overallOutcome = nil
         } else {
-            testSteps = []
-            totalMessageCount = 0
+            beginNewRun()
         }
-        overallOutcome = nil
         // The engine owns the transport while a test runs — stop the idle
         // keep-alive so the two never contend (the engine's own 200ms
         // testDeviceReady polling keeps the pipe active mid-test). Restarted
@@ -217,6 +298,155 @@ final class MainViewModel: ObservableObject {
         startKeepAlive()
     }
 
+    static let eyescanStepName = "眼图测试"
+
+    /// 眼图判定标准(与设备固件一致):
+    /// - `all result:` 的**条数随 SoC 拓扑而变**:RK3576 双通道 / RK3588 四通道 → 每通道各一条;
+    ///   RK3568 单通道 → 只一条(固件把 cs0/cs1 两个片选汇总进这一条)。末尾接 `all dq eye scan done`。
+    /// **完全采用固件自己的汇总判定,HOST 不加额外判断逻辑**:
+    ///   (a) **完成标记** `all dq eye scan done`:确认真跑完(否则 → 未完成,不下 pass/fail 结论)。
+    ///   (b) **`all result:` 全 pass**:这是固件扫完所有 DQ 后打的**自身汇总判定行**(pass / `  fail`)。
+    ///       多通道(RK3576 双 / RK3588 四)每通道各打一条 → 忠实读取**每一条**,全 pass 才 PASS。
+    ///       这不是 host 额外逻辑,只是不遗漏任一通道的固件判定(旧代码只看最后一条会把某通道的
+    ///       失败被后一通道的 pass 掩盖)。RK3568 单通道只一条(固件把 cs0/cs1 汇总进它)。
+    /// - 无完成标记 → **未完成**(超时 / 设备异常 / 未处于 Maskrom / 训练中止),不下 pass/fail 结论。
+    private func eyescanVerdict(_ transcript: String)
+        -> (done: Bool, pass: Bool, resultLine: String?) {
+        let done = transcript.contains("all dq eye scan done")
+        let resultLines = transcript
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { $0.contains("all result:") }
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+        // 完成标记 + 每条固件汇总 all result: 都 pass(≥1 条)才判 PASS。
+        let pass = !resultLines.isEmpty && resultLines.allSatisfy { $0.contains("pass") }
+        // 展示:优先给出错的那条(定位是哪个通道),全 pass 时自然落到末条。
+        let resultLine = resultLines.first(where: { !$0.contains("pass") }) ?? resultLines.last
+        return (done, pass, resultLine)
+    }
+
+    /// 眼图测试入口。3 步全在设备端:train-only 眼图 bin(自训练 DDR + 定几何)→
+    /// DDR Test Tool(常驻 0x80 服务)→ 重定位测量核。全程无需选配置文件。
+    /// 眼图要求设备处于 Maskrom(第①步是 downloadBoot),且自己做整套 boot 序列
+    /// 并在结束时自复位回 Maskrom —— 所以不复用焊接测试的常驻 Boot 持久句柄。
+    func startEyescan() async {
+        // 先清上一轮显示——无论后续是否真正开跑,都不残留旧的通过/失败结论。
+        // (这也是眼图的唯一清屏点:pollDevices 不再清,见其注释。)
+        beginNewRun()
+        lastEyescanTranscript = nil
+        eyescanLineCarry = ""
+        eyescanLog = ""
+
+        // selectedDeviceID 在重枚举后可能短暂失配 → 回退到当前第一台设备。
+        guard let device = devices.first(where: { $0.deviceID == selectedDeviceID }) ?? devices.first,
+              let payloads = eyescanPayloads() else {
+            statusMessage = eyescanHelp
+            return
+        }
+        isRunning = true
+        // 眼图要 Maskrom + 自带 downloadBoot 序列 → 拆掉焊接测试的常驻持久句柄。
+        tearDownActiveTransport()
+        defer { isRunning = false }
+
+        ensureStep(Self.eyescanStepName)          // step tracks STATE only (drives the pane header)
+        setStepState(Self.eyescanStepName, .running)
+        eyescanLog += "开始眼图 / 裕量扫描…\n"
+
+        do {
+            let transport = try makeTransport()
+            // async 回调:EyescanRunner 会 `await` 它跑完再读下一段,所以逐段
+            // 严格有序(不再用 fire-and-forget 的 Task,那会乱序)。
+            let transcript = try await EyescanRunner().run(
+                transport: transport, device: device,
+                ddrBin: payloads.trainOnly, ddrTestTool: payloads.dtt, itemBin: payloads.item,
+                itemBase: payloads.itemBase,
+                timeout: 120,
+                rebootBin: payloads.reboot,
+                onProgress: { [weak self] chunk in
+                    await self?.appendEyescanLines(chunk)
+                })
+            try? transport.close()
+            flushEyescanLineCarry()   // 冲掉最后一行不带换行的残余
+
+            let v = eyescanVerdict(transcript)
+            lastEyescanTranscript = transcript
+            if v.done {
+                setStepState(Self.eyescanStepName, v.pass ? .passed : .failed)
+                overallOutcome = v.pass ? .passed : .failed
+                eyescanLog += "判定:\(v.resultLine ?? "all result: (缺失)")\n"
+                statusMessage = v.pass ? "眼图完成:PASS(所有 DQ 裕量达标)"
+                                       : "眼图完成:FAIL(存在裕量不足的 DQ)"
+            } else {
+                // overallOutcome 已在开头置 nil,未完成不下 pass/fail 结论,保持 nil。
+                setStepState(Self.eyescanStepName, .failed)
+                eyescanLog += "扫描未出现完成标记(all dq eye scan done)—— 可能超时或设备异常\n"
+                statusMessage = "眼图未完成,请检查设备"
+            }
+        } catch {
+            setStepState(Self.eyescanStepName, .failed)
+            eyescanLog += "眼图失败:\(error.localizedDescription)\n"
+            eyescanLog += "请确认设备处于 Maskrom(若刚跑过焊接测试,需重新插拔),再重试\n"
+            statusMessage = "眼图失败,请确认 Maskrom 后重试"
+        }
+
+        // 眼图跑完设备自复位回 Maskrom → 交给设备监视器(pollDevices)处理重枚举
+        // (重置连接门闩、刷新设备列表)。pollDevices 不再清日志,所以结果一直留到
+        // 下次点「开始」——不必在这里做任何保留处理。
+    }
+
+    /// 把眼图 transcript 的每个 chunk 按行灌进「眼图测试」步骤卡片(复用焊接
+    /// 那套 printf 流式展示 + 自动滚动)。readPrintf 返回的字节不按行对齐——
+    /// 一行可能跨 chunk——所以用 `eyescanLineCarry` 缓冲未完成的最后一行,只在
+    /// 遇到换行时才落一条完整消息,避免同一行被切成两条。
+    private func appendEyescanLines(_ chunk: String) {
+        var lines = (eyescanLineCarry + chunk).components(separatedBy: "\n")
+        eyescanLineCarry = lines.removeLast()   // 末段可能不完整(无结尾换行)→ 留到下段
+        let batch = lines.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        guard !batch.isEmpty else { return }
+        eyescanLog += batch.joined(separator: "\n") + "\n"   // append to the one growing log string
+    }
+
+    /// 扫描结束后冲掉行缓冲里最后一行不带换行的残余(如末尾的完成标记)。
+    /// 追加一个换行,让残余走 `appendEyescanLines` 的同一条落行路径。
+    private func flushEyescanLineCarry() {
+        appendEyescanLines("\n")
+    }
+
+    // MARK: - Eye-scan cfg
+
+    /// 眼图三件套(解密后的明文 payload):train-only bin、DDR Test Tool、测量核。
+    private struct EyescanPayloads { let trainOnly: Data; let dtt: Data; let item: Data; let itemBase: UInt32; let reboot: Data? }
+
+    /// 刷新眼图 cfg 缓存(在 `selectedSoc` 变化时调用,不在渲染路径上跑)。
+    private func refreshEyescanCfgURL() {
+        eyescanCfgURL = selectedSoc.flatMap { locateEyescanCfg(soc: $0) }
+    }
+
+    /// 定位某 SoC 的眼图 cfg:`DDRTestFiles/<soc>/…眼图.cfg`。眼图 cfg 与焊接
+    /// cfg、detect cfg 走完全相同的发现/打包路径(`package.sh` 已拷 DDRTestFiles),
+    /// 无需单独的资源目录。缺失 → nil。
+    private func locateEyescanCfg(soc: String) -> URL? {
+        guard let files = try? FileManager.default.contentsOfDirectory(
+                at: detectResourcesDir(soc: soc), includingPropertiesForKeys: nil) else { return nil }
+        return files.first { $0.pathExtension.lowercased() == "cfg"
+            && $0.lastPathComponent.contains(CfgRepository.eyescanCfgMarker) }
+    }
+
+    /// 解析缓存的眼图 cfg,按名字取出三件套(CfgBinaryParser 已把非 Boot 记录 RC4
+    /// 解密回明文)。任一缺失 → nil。与 `DdrDetector` 从 detect cfg 取 payload 同法
+    /// (共用 `CfgTestPlan.payload(named:)`)。
+    private func eyescanPayloads() -> EyescanPayloads? {
+        guard let url = eyescanCfgURL, let plan = try? parser.parse(url: url) else { return nil }
+        guard let trainOnly = plan.payload(named: "trainonly"),
+              let dtt = plan.payload(named: "Boot"),
+              let item = plan.payload(named: "eyescan") else { return nil }
+        // itemBase = the cfg's download-base (per-SoC): RK3568=0xFDCC4000, RK3576=0x3FF84000.
+        // reboot: optional 4th record — auto-return to maskrom after the scan so the operator
+        // can run again without a manual replug. nil for cfgs that don't package it (no-op then).
+        return EyescanPayloads(trainOnly: trainOnly, dtt: dtt, item: item,
+                               itemBase: plan.downloadBaseAddress,
+                               reboot: plan.payload(named: "reboot"))
+    }
+
     /// 「开始测试」按钮入口。本次连接尚未探测且设备适用自动探测 → 探测+测
     /// 一气呵成；否则测当前选中的 cfg（没选中则提示选择）。
     func startTest() async {
@@ -237,7 +467,28 @@ final class MainViewModel: ObservableObject {
         await runSolderTest()
     }
 
+    /// 「保存结果」是否可点(按当前模式:眼图存 transcript,焊接存 ExecutionResult)。
+    var canSaveResult: Bool {
+        guard !isRunning else { return false }
+        return mode == .eyescan ? lastEyescanTranscript != nil : lastResult != nil
+    }
+
     func saveResult(to outputURL: URL) {
+        // 眼图:直接写完整 transcript(无 ExecutionResult)。
+        if mode == .eyescan {
+            guard let transcript = lastEyescanTranscript else {
+                statusMessage = "无眼图结果可保存"
+                return
+            }
+            do {
+                try transcript.write(to: outputURL, atomically: true, encoding: .utf8)
+                statusMessage = "已保存眼图日志:\(outputURL.lastPathComponent)"
+            } catch {
+                statusMessage = error.localizedDescription
+            }
+            return
+        }
+
         guard let lastResult,
               let selected = testFiles.first(where: { $0.id == selectedFileID }) else {
             statusMessage = "No result to save"
@@ -529,11 +780,10 @@ final class MainViewModel: ObservableObject {
                     resetConnectionState()
                 } else {
                     setDeviceNeedsBoot(true)
-                    testSteps = []
-                    totalMessageCount = 0
-                    overallOutcome = nil
-                    lastResult = nil
-                    statusMessage = ""
+                    // 不在这里清日志区:每个「开始」入口(runSolderTest /
+                    // performDetectThenTest / startEyescan)在开跑前自己清。这样设备
+                    // 重枚举——尤其眼图自复位回 Maskrom——不会把刚出的结果冲掉,
+                    // 结果一直留到下次点「开始」。(避免了之前一次性标记赌时序的脆弱。)
 
                     if let currentID = selectedDeviceID,
                        !devices.contains(where: { $0.deviceID == currentID }) {
@@ -580,9 +830,7 @@ final class MainViewModel: ObservableObject {
         stopKeepAlive()
         defer { isDetecting = false }
         Self.dlog("detect start: device=\(device.deviceID) pid=0x\(String(format: "%04X", device.productID))")
-        testSteps = []
-        totalMessageCount = 0
-        overallOutcome = nil
+        beginNewRun()
         ensureStep(Self.detectStepName)
         setStepState(Self.detectStepName, .running)
         appendStepMessage(Self.detectStepName, "开始探测…")
