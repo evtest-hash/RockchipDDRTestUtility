@@ -10,7 +10,10 @@ public final class RkUsbTransportLibusb: UsbTransport {
     private static let bootControlChunkSize = 4096
 
     private static let downloadChunkSize = 0x4000
-    private static let pollReadLength: UInt32 = 0x2000  // 8KB read buffer (>= enlarged DTT ring cap 4096)
+    private static let pollReadLength: UInt32 = 0x200   // 512B (1 max-packet). Was 0x2000 for the eyescan
+    // DTT ring, but that broke the SOLDER test: a 0x2000 printf-poll command the solder DTT can't
+    // service leaves it unresponsive → the next testDeviceReady times out (bulk IN timeout) at the
+    // "connect" item. The eyescan's putc watermark backpressure keeps unread ≤256, so 512 drains it.
     private static let pollOpcode: UInt32 = 0x80
     private static let writeOpcode: UInt32 = 0x02
     private static let runOpcode: UInt32 = 0x03
