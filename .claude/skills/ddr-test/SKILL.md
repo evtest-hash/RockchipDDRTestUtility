@@ -16,24 +16,24 @@ is a self-contained macOS binary: the whole cfg library is embedded, so it needs
 ## 1. Get the CLI
 
 The release ships `RockchipDDRTestUtilityCLI-macos.tar.gz` (universal arm64+x86_64,
-macOS 12+) containing `ddrtest` + `libusb-1.0.0.dylib`. Cache it under
-`~/.cache/ddrtest/`; only re-download if `ddrtest` is missing.
+macOS 12+) containing `RockchipDDRTestUtilityCLI` + `libusb-1.0.0.dylib`. Cache it
+under `~/.cache/ddrtest/`; only re-download if the binary is missing.
 
 ```bash
 DDR_DIR="$HOME/.cache/ddrtest"
-if [ ! -x "$DDR_DIR/ddrtest" ]; then
+if [ ! -x "$DDR_DIR/RockchipDDRTestUtilityCLI" ]; then
   mkdir -p "$DDR_DIR"
   gh release download --repo evtest-hash/RockchipDDRTestUtility \
     --pattern 'RockchipDDRTestUtilityCLI-macos.tar.gz' -O "$DDR_DIR/cli.tar.gz" --clobber
   tar -xzf "$DDR_DIR/cli.tar.gz" -C "$DDR_DIR"
 fi
-DDRTEST="$DDR_DIR/ddrtest"
+DDRTEST="$DDR_DIR/RockchipDDRTestUtilityCLI"
 ```
 
 If `gh` is unavailable, download the same asset with `curl -L` from
 `https://github.com/evtest-hash/RockchipDDRTestUtility/releases/latest`. Keep
-`ddrtest` and `libusb-1.0.0.dylib` in the SAME directory (the binary loads libusb via
-`@loader_path`).
+`RockchipDDRTestUtilityCLI` and `libusb-1.0.0.dylib` in the SAME directory (the
+binary loads libusb via `@loader_path`).
 
 ## 2. Run
 
@@ -82,4 +82,4 @@ cfg so no test ran), `solder.outcome`, `eyescan.go`. The full eye-scan transcrip
 - One board per USB plug; each test returns the device to maskrom at the end.
 - Supported for detect/auto: RK3568/RK3566 (0x350A), RK3588 (0x350B), RK3576 (0x350E),
   RK3288 (0x320A, detect only). Eye-scan: RK3568/RK3576/RK3588.
-- `ddrtest --help` lists every flag and the exit-code contract.
+- `"$DDRTEST" --help` lists every flag and the exit-code contract.

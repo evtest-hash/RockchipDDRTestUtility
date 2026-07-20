@@ -222,17 +222,18 @@ CLI_DIST="$STAGING_DIR/cli"
 CLI_TARBALL="$PROJECT_DIR/RockchipDDRTestUtilityCLI-macos.tar.gz"
 rm -rf "$CLI_DIST"
 mkdir -p "$CLI_DIST"
-cp "$BUILD_DIR/RockchipDDRTestUtilityCLI" "$CLI_DIST/ddrtest"
+CLI_BIN="RockchipDDRTestUtilityCLI"
+cp "$BUILD_DIR/RockchipDDRTestUtilityCLI" "$CLI_DIST/$CLI_BIN"
 cp "$UNIVERSAL_LIBUSB" "$CLI_DIST/libusb-1.0.0.dylib"
-chmod u+w "$CLI_DIST/ddrtest" "$CLI_DIST/libusb-1.0.0.dylib"
+chmod u+w "$CLI_DIST/$CLI_BIN" "$CLI_DIST/libusb-1.0.0.dylib"
 
-add_rpath_once "$CLI_DIST/ddrtest" "@loader_path"
-verify_libusb "$CLI_DIST/ddrtest"
+add_rpath_once "$CLI_DIST/$CLI_BIN" "@loader_path"
+verify_libusb "$CLI_DIST/$CLI_BIN"
 
-echo "CLI arch:"; lipo -info "$CLI_DIST/ddrtest"
-echo "CLI libusb + rpath:"; otool -L "$CLI_DIST/ddrtest" | grep -E "libusb"; otool -l "$CLI_DIST/ddrtest" | grep -A2 LC_RPATH
+echo "CLI arch:"; lipo -info "$CLI_DIST/$CLI_BIN"
+echo "CLI libusb + rpath:"; otool -L "$CLI_DIST/$CLI_BIN" | grep -E "libusb"; otool -l "$CLI_DIST/$CLI_BIN" | grep -A2 LC_RPATH
 
-tar -czf "$CLI_TARBALL" -C "$CLI_DIST" ddrtest libusb-1.0.0.dylib
+tar -czf "$CLI_TARBALL" -C "$CLI_DIST" "$CLI_BIN" libusb-1.0.0.dylib
 echo "=== CLI tarball: $CLI_TARBALL ($(du -sh "$CLI_TARBALL" | cut -f1)) ==="
 
 # ── Step 8: Create DMG ──
