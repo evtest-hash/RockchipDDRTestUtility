@@ -338,14 +338,24 @@ struct ContentView: View {
     }
 }
 
-/// Native AppKit text log for LARGE content (the eye-scan report, ~592 lines). SwiftUI's
-/// `Text`/`ForEach` keep every line laid out in the view tree, so once a big log is present every
-/// app layout pass re-lays it and the whole app stutters. `NSTextView` lays out only the visible
-/// glyphs (cached layout manager) and scrolls natively — flat cost regardless of log length.
-/// Read-only + selectable; the drain is already decoupled from the UI, so string updates here can
-/// never affect the USB pipeline.
+/// Native AppKit text log for LARGE, high-rate streaming content (the eye-scan report). SwiftUI's
+/// `Text`/`ForEach` keep every line laid out in the view tree, so once a big log is present every app
+/// layout pass re-lays it and the whole app stutters. `NSTextView` lays out only the visible glyphs.
+///
+/// The LAYOUT is O(delta): while the shown text is an exact prefix of the new text (the streaming
+/// case) we `textStorage.append` only the new tail, so TextKit lays out just the new glyphs — the old
+/// `tv.string = text` path re-laid-out the whole growing document (O(n²)) and froze the UI. The append
+/// DETECTION here (comparing the shown string against the new text's prefix) is O(shown) per update;
+/// that's fine because the eyescan log is bounded (~6-20 KB filtered) — a few MB of copy over a whole
+/// run. When the shown text is NOT a prefix — a new run cleared the log to "" — we replace once, which
+/// is what makes the next scan's pane start empty instead of keeping the previous log. After any change
+/// we follow the tail if the reader is parked near the bottom (auto-scroll to the newest line).
 struct LogView: NSViewRepresentable {
     let text: String
+    private static let attrs: [NSAttributedString.Key: Any] = [
+        .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
+        .foregroundColor: NSColor.secondaryLabelColor,
+    ]
 
     func makeNSView(context: Context) -> NSScrollView {
         let scroll = NSScrollView()
@@ -373,17 +383,25 @@ struct LogView: NSViewRepresentable {
     }
 
     func updateNSView(_ scroll: NSScrollView, context: Context) {
-        guard let tv = scroll.documentView as? NSTextView, tv.string != text else { return }
-        // Was the user parked near the bottom BEFORE this update? (Compare the viewport bottom to
-        // the current document height.) If so, follow the newest content; if they scrolled up to
-        // read, leave their position alone. Content only changes while streaming, so this pins the
-        // live tail without yanking a reader who scrolled back.
+        guard let tv = scroll.documentView as? NSTextView, let storage = tv.textStorage else { return }
+        let shown = tv.string
+        if text == shown { return }                      // unchanged
+        let ns = text as NSString
+        let shownLen = (shown as NSString).length
+
         let followTail = (tv.frame.height - scroll.contentView.bounds.maxY) < 40
-        tv.string = text
-        tv.textColor = .secondaryLabelColor
+        // Content-based: if what's shown is an exact PREFIX of the new text, this is a pure append —
+        // lay out only the tail. Otherwise (a new run cleared the log → the short new text is NOT
+        // prefixed by the old log, or any divergence) REPLACE the whole document. This is what makes
+        // clicking 开始 for the next scan clear the previous log.
+        if ns.length > shownLen && ns.substring(to: shownLen) == shown {
+            storage.append(NSAttributedString(string: ns.substring(from: shownLen), attributes: Self.attrs))
+        } else {
+            storage.setAttributedString(NSAttributedString(string: text, attributes: Self.attrs))
+        }
         if followTail {
-            tv.layoutManager?.ensureLayout(for: tv.textContainer!)   // lay out new text first…
-            tv.scrollToEndOfDocument(nil)                            // …then pin to the bottom
+            tv.layoutManager?.ensureLayout(for: tv.textContainer!)
+            tv.scrollToEndOfDocument(nil)
         }
     }
 }
