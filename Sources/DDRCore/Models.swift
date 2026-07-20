@@ -195,6 +195,31 @@ public struct CfgTestPlan: Sendable {
     public func payload(named name: String) -> Data? {
         embeddedBins.first { $0.key.caseInsensitiveCompare(name) == .orderedSame }?.value
     }
+
+    /// Extract the eye-scan payloads packaged in this cfg — Boot (=DTT), eyescan (=item),
+    /// an optional `trainonly` stage① bin, and an optional `reboot` item; `itemBase` is the cfg's
+    /// download-base. Returns nil if this isn't an eye-scan cfg (no Boot/eyescan record). SINGLE
+    /// SOURCE shared by the GUI (`MainViewModel`) and the CLI `--eyescan` mode — both just parse the
+    /// SoC's `DDR眼图.cfg` and call this, so neither hand-specifies per-bin paths.
+    public func eyescanPayloads() -> EyescanPayloads? {
+        guard let dtt = payload(named: "Boot"), let item = payload(named: "eyescan") else { return nil }
+        return EyescanPayloads(trainOnly: payload(named: "trainonly") ?? Data(), dtt: dtt, item: item,
+                               itemBase: downloadBaseAddress, reboot: payload(named: "reboot"))
+    }
+}
+
+/// The four payloads that drive an eye-scan run, extracted from a packaged `DDR眼图.cfg`
+/// (see `CfgTestPlan.eyescanPayloads`). `trainOnly` empty ⇒ no stage① (self-training eyescan-item,
+/// e.g. RK3576/RK3588); non-empty ⇒ RK3568's small-core model that needs a train-only stage①.
+public struct EyescanPayloads: Sendable {
+    public let trainOnly: Data
+    public let dtt: Data
+    public let item: Data
+    public let itemBase: UInt32
+    public let reboot: Data?
+    public init(trainOnly: Data, dtt: Data, item: Data, itemBase: UInt32, reboot: Data?) {
+        self.trainOnly = trainOnly; self.dtt = dtt; self.item = item; self.itemBase = itemBase; self.reboot = reboot
+    }
 }
 
 /// Maps Rockchip USB PID (VID 0x2207) to TestFiles directory name.

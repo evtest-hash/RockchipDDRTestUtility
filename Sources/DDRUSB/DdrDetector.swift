@@ -154,6 +154,19 @@ public actor DdrDetector {
                              matchTier: tier, rebootedToMaskrom: rebooted)
     }
 
+    /// Reboot a RESIDENT (post-test) device back to maskrom using the SoC's detect-cfg reboot payload,
+    /// on the still-open transport. For one-shot CLI flows (`--detect-then-test`, `--cfg`) that have no
+    /// persistent keep-alive handle: leaving the device in a booted state is fragile, so the CLI
+    /// returns it to a clean bootrom. (The GUI instead holds its handle open across clicks.) Returns
+    /// whether the device re-enumerated. No-op (false) if the SoC/cfg/reboot payload is unavailable.
+    public func rebootToMaskrom(transport: UsbTransport, device: UsbDevice) async -> Bool {
+        guard let profile = DetectProfiles.forPID(device.productID),
+              let plan = try? parser.parse(url: resourcesDir.appendingPathComponent(profile.detectCfgName)),
+              let rebootBin = plan.payload(named: "reboot") else { return false }
+        return (try? await rebootToMaskrom(transport: transport, payload: rebootBin,
+                                           base: plan.downloadBaseAddress, device: device)) ?? false
+    }
+
     /// Runs the reboot-to-maskrom payload (extracted from the detect cfg) on the
     /// already-booted device, then waits for it to drop and re-enumerate in a
     /// fresh MASKROM. The payload writes the boot-mode magic + triggers a CRU

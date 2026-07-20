@@ -39,9 +39,13 @@ public actor EyescanRunner {
                     onProgress: (@Sendable (String) async -> Void)? = nil) async throws -> String {
         if !transport.isOpen { try transport.open(device: device) }
 
-        // Per-step wall-clock instrumentation (diagnostic; prints to stdout for CLI runs).
+        // Per-step wall-clock instrumentation (diagnostic; goes to stderr so the
+        // CLI's --json stdout stays a pure JSON object — these timing marks are
+        // progress, not the result).
         let t0 = Date()
-        func mark(_ label: String) { print(String(format: "  [+%5.1fs] %@", Date().timeIntervalSince(t0), label)) }
+        func mark(_ label: String) {
+            FileHandle.standardError.write(Data(String(format: "  [+%5.1fs] %@\n", Date().timeIntervalSince(t0), label).utf8))
+        }
 
         let dttItem = CfgItem(name: "ddrtesttool", pathHint: nil, nameOffset: 0,
                               payloadOffset: 0, payloadLength: ddrTestTool.count)
@@ -80,9 +84,12 @@ public actor EyescanRunner {
             }
             if !booted { throw DDRToolError.transportError("DTT boot failed") }
         } else {
-            // ② only. No train-only step (e.g. RK3576 option-B: the eyescan-item
-            //    self-trains). Boot the DTT tolerantly — a lost final-chunk ACK means
-            //    the long-running 0x471 bin launched, not that it failed.
+            // ② only. No train-only step (e.g. RK3576/RK3588: the eyescan-item
+            //    self-trains). Boot the DTT on the already-open handle, strict FIRST
+            //    (a full final-chunk ACK = the resident 2-core service fully loaded);
+            //    only if that fails retry lenient. Do NOT close+re-open here — the
+            //    fresh maskrom handle is already good, and re-opening re-issues
+            //    SET_CONFIGURATION which can leave the DTT half-initialised.
             do {
                 try transport.downloadBoot(item: dttItem, payload: ddrTestTool, lenientFinalChunk: false)
             } catch {
@@ -134,15 +141,22 @@ public actor EyescanRunner {
         // throughput limit; empty-read time = pure waste (ring was empty when we polled).
         var dataBytes = 0, nData = 0, nEmpty = 0, maxChunk = 0
         var tData = 0.0, tEmpty = 0.0
-        // DECOUPLE the UI from the USB drain. The drain MUST NEVER await onProgress: a slow UI
-        // render must not be able to stall readPrintf / the device link. (That coupling — the
-        // drain awaiting the main-actor UI callback per chunk — let a display change throttle the
-        // USB pipeline.) Chunks go to a buffered, order-preserving stream; a SEPARATE task hands
-        // them to onProgress at the UI's own pace. If the UI lags, chunks just queue here — the
-        // drain keeps reading the device at full speed, structurally untouched by UI work.
+        // DECOUPLE the UI from the USB drain — STRUCTURALLY, not best-effort. The USB link must be
+        // PHYSICALLY INCAPABLE of being stalled, starved, or grown without bound by UI work: a slow
+        // (or hung) display can never drag down readPrintf / the device link. Two guarantees:
+        //   1. The drain NEVER awaits onProgress — chunks are handed off via `yield` (which never
+        //      suspends the producer) and a SEPARATE task feeds onProgress at the UI's own pace.
+        //   2. The hand-off buffer is BOUNDED + drop-oldest (`.bufferingNewest`). If the UI can't
+        //      keep up, the DISPLAY drops its oldest queued chunks — purely cosmetic, since
+        //      `transcript` below keeps EVERY byte for the verdict — while memory stays capped and
+        //      the end-of-run `await uiTask.value` can only ever wait on a bounded backlog.
+        // (The prior `.unbounded` policy let a pathologically slow UI grow memory and delay run()'s
+        // return; the drain loop itself was already non-blocking, but this makes the whole path
+        // provably immune to UI speed.)
         var uiEmit: AsyncStream<String>.Continuation!
-        let uiStream = AsyncStream<String>(bufferingPolicy: .unbounded) { uiEmit = $0 }
+        let uiStream = AsyncStream<String>(bufferingPolicy: .bufferingNewest(2048)) { uiEmit = $0 }
         let uiTask = Task { for await chunk in uiStream { await onProgress?(chunk) } }
+        var uiDropped = 0
         let deadline = Date().addingTimeInterval(timeout)
         drain: while Date() < deadline {
             let t0 = Date()
@@ -152,7 +166,7 @@ public actor EyescanRunner {
                 let n = s.utf8.count
                 transcript += s
                 dataBytes += n; nData += 1; tData += dt; maxChunk = max(maxChunk, n)
-                uiEmit.yield(s)          // non-blocking + ordered: NEVER stall the drain on UI
+                if case .dropped = uiEmit.yield(s) { uiDropped += 1 }   // non-blocking; drop-oldest if UI lags
                 continue                 // keep draining fast — do NOT probe status while data flows
             }
             nEmpty += 1; tEmpty += dt
@@ -163,7 +177,7 @@ public actor EyescanRunner {
             if status.phase == .finished || status.phase == .error {
                 while let s = try? transport.readPrintf(acknowledge: false), !s.isEmpty {
                     transcript += s; dataBytes += s.utf8.count; nData += 1
-                    uiEmit.yield(s)
+                    if case .dropped = uiEmit.yield(s) { uiDropped += 1 }
                 }
                 mark("③ done via status (\(transcript.utf8.count)B)")
                 break drain
@@ -171,8 +185,8 @@ public actor EyescanRunner {
         }
         if Date() >= deadline { mark("③ drain hit \(Int(timeout))s deadline (device never reported done)") }
         let rate = tData > 0 ? Double(dataBytes)/tData : 0
-        mark(String(format: "③ drain stats: %dB | data-reads %d in %.2fs = %.0f B/s (USB limit-when-data, avgchunk %dB, max %dB) | empty-reads %d in %.2fs (100ms-timeout waste)",
-                    dataBytes, nData, tData, rate, nData>0 ? dataBytes/nData : 0, maxChunk, nEmpty, tEmpty))
+        mark(String(format: "③ drain stats: %dB | data-reads %d in %.2fs = %.0f B/s (USB limit-when-data, avgchunk %dB, max %dB) | empty-reads %d in %.2fs (100ms-timeout waste) | UI-dropped %d chunk(s)",
+                    dataBytes, nData, tData, rate, nData>0 ? dataBytes/nData : 0, maxChunk, nEmpty, tEmpty, uiDropped))
         uiEmit.finish()   // USB drain done → no more chunks; the UI task drains its own buffer
 
         // Auto-return to maskrom: after the item returned (status=done, item-runner idle), download
