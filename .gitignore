@@ -9,6 +9,8 @@ DerivedData/
 .swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
 .netrc
 *.dmg
+# standalone CLI distribution tarball (produced by scripts/package.sh, shipped via release)
+RockchipDDRTestUtilityCLI-macos.tar.gz
 
 # DDR auto-detect build tooling — dev-only; the shipped payload is the
 # generated DDRTestFiles/<soc>/DDR自动探测.cfg, not these intermediates.

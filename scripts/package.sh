@@ -25,6 +25,12 @@ fi
 
 cd "$PROJECT_DIR"
 
+# ── Step 0: Refresh the embedded cfg blob (single-file CLI) ──
+# The CLI embeds the whole DDRTestFiles/ library via .incbin (Sources/CDDRBlob);
+# regenerate it so the built binary carries the current cfgs. Deterministic, ~6s.
+echo "=== Refreshing embedded cfg blob ==="
+bash "$PROJECT_DIR/scripts/embed_cfgs.sh"
+
 # ── Step 1: Build universal libusb if needed ──
 
 if [ ${#ARCHES[@]} -gt 1 ]; then
@@ -188,6 +194,34 @@ echo "Dynamic libraries:"
 otool -L "$BUNDLE_DIR/Contents/MacOS/RockchipDDRTestUtility" | grep -E "libusb|rpath"
 echo "Rpaths:"
 otool -l "$BUNDLE_DIR/Contents/MacOS/RockchipDDRTestUtility" | grep -A2 LC_RPATH
+
+# ── Step 7.5: Assemble standalone CLI distribution ──
+# The CLI ships as a self-contained tarball (binary + a sibling libusb dylib),
+# NOT the .app: it embeds the whole cfg library (Sources/CDDRBlob), so it needs
+# no DDRTestFiles/, and it uses @loader_path so the bundled libusb sits next to
+# it — the same universal libusb + rewrite approach as the GUI, keeping OS
+# compatibility identical (universal arm64+x86_64, macOS 12+, no brew required).
+echo "=== Packaging standalone CLI ==="
+CLI_DIST="$STAGING_DIR/cli"
+CLI_TARBALL="$PROJECT_DIR/RockchipDDRTestUtilityCLI-macos.tar.gz"
+rm -rf "$CLI_DIST"
+mkdir -p "$CLI_DIST"
+cp "$BUILD_DIR/RockchipDDRTestUtilityCLI" "$CLI_DIST/ddrtest"
+cp "$UNIVERSAL_LIBUSB" "$CLI_DIST/libusb-1.0.0.dylib"
+chmod u+w "$CLI_DIST/ddrtest" "$CLI_DIST/libusb-1.0.0.dylib"
+
+# Point the bundled dylib at itself and the binary at its sibling copy.
+install_name_tool -id "@loader_path/libusb-1.0.0.dylib" "$CLI_DIST/libusb-1.0.0.dylib"
+CLI_LIBUSB_REF="$(otool -L "$CLI_DIST/ddrtest" | awk '/libusb-1\.0\.0\.dylib/{print $1; exit}')"
+if [ -n "$CLI_LIBUSB_REF" ]; then
+    install_name_tool -change "$CLI_LIBUSB_REF" "@loader_path/libusb-1.0.0.dylib" "$CLI_DIST/ddrtest"
+fi
+
+echo "CLI arch:"; lipo -info "$CLI_DIST/ddrtest"
+echo "CLI libusb ref:"; otool -L "$CLI_DIST/ddrtest" | grep -E "libusb|loader_path"
+
+tar -czf "$CLI_TARBALL" -C "$CLI_DIST" ddrtest libusb-1.0.0.dylib
+echo "=== CLI tarball: $CLI_TARBALL ($(du -sh "$CLI_TARBALL" | cut -f1)) ==="
 
 # ── Step 8: Create DMG ──
 
