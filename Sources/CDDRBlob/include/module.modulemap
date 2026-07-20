@@ -1,0 +1,4 @@
+module CDDRBlob {
+    header "CDDRBlob.h"
+    export *
+}
