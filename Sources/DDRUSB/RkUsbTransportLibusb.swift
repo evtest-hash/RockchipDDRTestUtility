@@ -10,7 +10,10 @@ public final class RkUsbTransportLibusb: UsbTransport {
     private static let bootControlChunkSize = 4096
 
     private static let downloadChunkSize = 0x4000
-    private static let pollReadLength: UInt32 = 0x200
+    private static let pollReadLength: UInt32 = 0x200   // 512B (1 max-packet). Was 0x2000 for the eyescan
+    // DTT ring, but that broke the SOLDER test: a 0x2000 printf-poll command the solder DTT can't
+    // service leaves it unresponsive → the next testDeviceReady times out (bulk IN timeout) at the
+    // "connect" item. The eyescan's putc watermark backpressure keeps unread ≤256, so 512 drains it.
     private static let pollOpcode: UInt32 = 0x80
     private static let writeOpcode: UInt32 = 0x02
     private static let runOpcode: UInt32 = 0x03
@@ -208,7 +211,7 @@ public final class RkUsbTransportLibusb: UsbTransport {
         _ = libusb_clear_halt(selected, bulkInEndpoint)
     }
 
-    public func downloadBoot(item: CfgItem, payload: Data) throws {
+    public func downloadBoot(item: CfgItem, payload: Data, lenientFinalChunk: Bool = false) throws {
         ioLock.lock(); defer { ioLock.unlock() }
         try ensureOpened()
         guard payload.count > 0 else {
@@ -244,7 +247,16 @@ public final class RkUsbTransportLibusb: UsbTransport {
         while offset < bootPayload.count {
             let chunkLen = min(Self.bootControlChunkSize, bootPayload.count - offset)
             let chunk = bootPayload.subdata(in: offset..<(offset + chunkLen))
-            try sendBootControlChunk(chunk)
+            let isFinal = (offset + chunkLen >= bootPayload.count)
+            do {
+                try sendBootControlChunk(chunk)
+            } catch {
+                if isFinal && lenientFinalChunk {
+                    debug("final chunk not ACKed — treating blob as launched")
+                } else {
+                    throw error
+                }
+            }
             offset += chunkLen
             if bootChunkDelayUs > 0 {
                 usleep(bootChunkDelayUs)
@@ -370,6 +382,10 @@ public final class RkUsbTransportLibusb: UsbTransport {
     }
 
     public func readPrintf() throws -> String? {
+        try readPrintf(acknowledge: true)
+    }
+
+    public func readPrintf(acknowledge: Bool) throws -> String? {
         ioLock.lock(); defer { ioLock.unlock() }
         try ensureOpened()
 
@@ -384,7 +400,10 @@ public final class RkUsbTransportLibusb: UsbTransport {
             return nil
         }
 
-        if data.count >= 128 {
+        // The runtime-log handshake is what the firmware answers slowly during
+        // streaming (~500ms/read). Skip it for high-rate drains — the DDR Test
+        // Tool ring advances on the read itself, so it is not needed there.
+        if acknowledge, data.count >= 128 {
             try acknowledgeRuntimeLog()
         }
 

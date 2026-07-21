@@ -3,8 +3,35 @@ import Foundation
 public final class CfgRepository {
     public let rootURL: URL
 
+    /// Filename marker of an eye-scan container cfg. Single source — used both to
+    /// exclude it from the selectable list here and to locate it (MainViewModel).
+    public static let eyescanCfgMarker = "眼图"
+
+    /// Filename markers of internal container cfgs excluded from the selectable
+    /// test-file list (see `discoverTestFiles`). Single source — extend here.
+    private static let containerCfgMarkers = ["自动探测", eyescanCfgMarker]
+
     public init(rootURL: URL) {
         self.rootURL = rootURL
+    }
+
+    /// Optional fallback that materializes a DDRTestFiles/ root when none is
+    /// found on disk. The single-file CLI sets this to extract its embedded
+    /// (LZMA-compressed) cfg library to a temp dir — so a lone binary with no
+    /// sibling DDRTestFiles/ still resolves cfgs. Unset in the GUI (which bundles
+    /// the directory in Resources) and in tests. Consulted by `makeDefaultRootURL`
+    /// AFTER the disk probes, so a real on-disk directory always wins.
+    public static var embeddedRootProvider: (() -> URL?)?
+
+    /// Locate a SoC's packaged eye-scan cfg (`DDRTestFiles/<soc>/…眼图.cfg`). SINGLE SOURCE shared by
+    /// the GUI (`MainViewModel.locateEyescanCfg`) and the CLI `--eyescan` mode, so both drive the
+    /// eye-scan from the packaged cfg (like detect/solder) instead of hand-specified per-bin paths.
+    public func eyescanCfgURL(forSoc soc: String) -> URL? {
+        let dir = rootURL.appendingPathComponent(soc)
+        guard let files = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)
+        else { return nil }
+        return files.first { $0.pathExtension.lowercased() == "cfg"
+            && $0.lastPathComponent.contains(Self.eyescanCfgMarker) }
     }
 
     public static func makeDefaultRootURL() -> URL {
@@ -26,11 +53,21 @@ public final class CfgRepository {
             }
             log("Executable-sibling DDRTestFiles not found at: \(candidate.path)")
         }
-        // Final fallback: CWD relative
-        let fallback = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        // CWD relative (dev: `swift run` from the package root)
+        let cwdRelative = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             .appendingPathComponent("DDRTestFiles").standardizedFileURL
-        log("Falling back to CWD-relative DDRTestFiles: \(fallback.path)")
-        return fallback
+        if FileManager.default.fileExists(atPath: cwdRelative.path) {
+            log("Using CWD-relative DDRTestFiles: \(cwdRelative.path)")
+            return cwdRelative
+        }
+        // Embedded fallback (single-file CLI): extract the compiled-in library.
+        if let embedded = embeddedRootProvider?() {
+            log("Using embedded DDRTestFiles: \(embedded.path)")
+            return embedded
+        }
+        // Last resort: the (missing) CWD-relative path, so callers get a stable URL.
+        log("Falling back to CWD-relative DDRTestFiles: \(cwdRelative.path)")
+        return cwdRelative
     }
 
     public func loadSettings() throws -> (settings: ConfigSettings, languages: [AppLanguage], selectedLanguageTag: String) {
@@ -110,7 +147,12 @@ public final class CfgRepository {
             // TestExecutionEngine (which would otherwise run its osregdump/reboot
             // items as if they were a memory test). DdrDetector loads it directly
             // by path, so this doesn't affect detection.
-            if url.lastPathComponent.contains("自动探测") { continue }
+            // Skip internal container cfgs: they package payloads driven directly
+            // by DdrDetector ("自动探测") / EyescanRunner ("眼图"), NOT user-selectable
+            // soldering-test cfgs. Their names carry one of these markers and never
+            // "焊接" (by design), so a filename denylist identifies them. (Keep this
+            // the single source; add a marker here rather than a new inline guard.)
+            if Self.containerCfgMarkers.contains(where: url.lastPathComponent.contains) { continue }
             let fullPath = url.path
             guard fullPath.hasPrefix(rootPath + "/") else { continue }
             let relative = String(fullPath.dropFirst(rootPath.count + 1))

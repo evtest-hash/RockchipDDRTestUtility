@@ -52,9 +52,7 @@ public actor DdrDetector {
         let plan = try parser.parse(url: cfgURL)
 
         // Pull each payload out of the packaged cfg by (case-insensitive) name.
-        func payload(_ name: String) -> Data? {
-            plan.embeddedBins.first { $0.key.caseInsensitiveCompare(name) == .orderedSame }?.value
-        }
+        func payload(_ name: String) -> Data? { plan.payload(named: name) }
         guard let ddrBin = payload("ddrbin") else {
             throw DetectError.cfgPayloadMissing("ddrbin")
         }
@@ -154,6 +152,19 @@ public actor DdrDetector {
                      : "④ reboot SKIPPED (unified detect→test; transport kept open)")
         return DetectOutcome(rawOsReg: words, geometry: geo, candidates: candidates,
                              matchTier: tier, rebootedToMaskrom: rebooted)
+    }
+
+    /// Reboot a RESIDENT (post-test) device back to maskrom using the SoC's detect-cfg reboot payload,
+    /// on the still-open transport. For one-shot CLI flows (`--detect-then-test`, `--cfg`) that have no
+    /// persistent keep-alive handle: leaving the device in a booted state is fragile, so the CLI
+    /// returns it to a clean bootrom. (The GUI instead holds its handle open across clicks.) Returns
+    /// whether the device re-enumerated. No-op (false) if the SoC/cfg/reboot payload is unavailable.
+    public func rebootToMaskrom(transport: UsbTransport, device: UsbDevice) async -> Bool {
+        guard let profile = DetectProfiles.forPID(device.productID),
+              let plan = try? parser.parse(url: resourcesDir.appendingPathComponent(profile.detectCfgName)),
+              let rebootBin = plan.payload(named: "reboot") else { return false }
+        return (try? await rebootToMaskrom(transport: transport, payload: rebootBin,
+                                           base: plan.downloadBaseAddress, device: device)) ?? false
     }
 
     /// Runs the reboot-to-maskrom payload (extracted from the detect cfg) on the

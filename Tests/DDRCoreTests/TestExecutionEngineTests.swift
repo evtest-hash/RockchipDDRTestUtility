@@ -230,7 +230,7 @@ private final class MockUsbTransport: UsbTransport {
         openCount += 1
     }
 
-    func downloadBoot(item: CfgItem, payload: Data) throws {
+    func downloadBoot(item: CfgItem, payload: Data, lenientFinalChunk: Bool) throws {
         try phase("downloadBoot")
     }
 

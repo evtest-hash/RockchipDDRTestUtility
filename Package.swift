@@ -36,6 +36,12 @@ let package = Package(
         .target(
             name: "DDRCore"
         ),
+        // Embeds the entire DDRTestFiles/ cfg library (LZMA-compressed, ~2MB) via
+        // .incbin so the CLI can ship as ONE self-contained file. Regenerate the
+        // blob with `bash scripts/embed_cfgs.sh`.
+        .target(
+            name: "CDDRBlob"
+        ),
         .target(
             name: "DDRUSB",
             dependencies: [
@@ -56,6 +62,7 @@ let package = Package(
             dependencies: [
                 "DDRCore",
                 "DDRUSB",
+                "CDDRBlob",
             ],
             path: "Sources/RockchipDDRTestUtilityCLI"
         ),
