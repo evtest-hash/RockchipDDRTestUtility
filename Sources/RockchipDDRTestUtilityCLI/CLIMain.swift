@@ -198,9 +198,18 @@ func tierString(_ t: CfgAutoSelect.MatchTier) -> String {
     }
 }
 
-/// Eye-scan GO verdict — the done marker, matching the CLI's shipped check.
+/// Eye-scan PASS verdict — mirrors the GUI's `eyescanVerdict` (MainViewModel).
+/// Completion alone is NOT pass: the firmware prints one `all result:` summary
+/// line per channel (pass / `  fail`) after scanning every DQ. Pass requires the
+/// done marker AND at least one `all result:` line AND every such line == pass.
+/// (The old check only looked for the done marker, so a failed eye still "GO"ed.)
 func eyescanGo(_ transcript: String) -> Bool {
-    transcript.contains("all dq eye scan done")
+    guard transcript.contains("all dq eye scan done") else { return false }
+    let resultLines = transcript
+        .split(whereSeparator: \.isNewline)
+        .map { $0.trimmingCharacters(in: .whitespaces) }
+        .filter { $0.contains("all result:") }
+    return !resultLines.isEmpty && resultLines.allSatisfy { $0.contains("pass") }
 }
 
 func printUsageAndExit() -> Never {
