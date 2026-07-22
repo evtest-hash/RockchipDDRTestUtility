@@ -5,26 +5,17 @@ import Foundation
 struct CLIArguments {
     var cfgPath: String?
     var selectedDeviceID: String?
-    var outputLogPath: String?
     var listOnly = false
     var probeBulk = false
     /// DDR auto-detect spike: download the auto-probing rkbin DDR bin (0x471),
     /// run the osregdump probe cfg, read OS_REG over USB, decode + shortlist cfg.
     var detect = false
     var detectCfgPath: String?
-    /// EXPERIMENT (Step 2): unified detect→test on ONE transport, no reboot.
+    /// SOLDER (T02): detect → soldering test on ONE transport, no reboot between.
     /// detect(reboot:false) leaves the DDR Test Tool Boot resident + transport
-    /// open; the matched cfg then runs with skipBoot:true on that same Boot.
-    /// Validates that the reboot-to-maskrom step is avoidable (→ dodges the
-    /// RK3288 populated-eMMC reboot limitation). Reuses both executors' existing
-    /// steps unchanged — only the sequencing differs.
-    var detectThenTest = false
-    /// AUTO: one-shot factory-line composite — detect → soldering test → eye-scan
-    /// → reboot to maskrom, all on the auto-selected cfg. Exits 0 only if the
-    /// unique cfg matched AND soldering passed AND the eye-scan reported GO. This
-    /// is the automation entry point; pair with `--json` for a machine-readable
-    /// result on stdout.
-    var auto = false
+    /// open; the matched cfg then runs with skipBoot:true on that same Boot, then
+    /// reboots to maskrom. The device USB printf is embedded in the JSON result.
+    var solder = false
     /// How many times to run the full cfg in one process. >1 exercises the
     /// repeat-test / boot-skip path: the first run boots, and subsequent runs
     /// pass `skipBoot: true` (mirroring MainViewModel's `deviceNeedsBoot`
@@ -33,9 +24,9 @@ struct CLIArguments {
     var repeatCount: Int = 1
     /// EYE-SCAN mode: like --detect / --cfg, driven by the SoC's packaged `DDR眼图.cfg` (auto-located
     /// by the connected device's PID → SoC). All payloads (DTT/item/trainonly/reboot) + the item base
-    /// come from that cfg — no per-bin flags. `--eye-out`/`--eye-timeout` are run options.
+    /// come from that cfg — no per-bin flags. `--eye-timeout` is a run option.
+    /// The full transcript is embedded in the JSON result (no side file).
     var eyescan = false
-    var eyescanOut = "/tmp/eyescan.txt"
     var eyescanTimeout: TimeInterval = 120
     /// Emit a single machine-readable JSON object on stdout; route all human
     /// progress/log lines to stderr so stdout carries ONLY the JSON.
@@ -63,22 +54,14 @@ struct CLIArguments {
                     throw DDRToolError.invalidFormat("Missing value for --device-id")
                 }
                 args.selectedDeviceID = argv[idx]
-            case "--output-log":
-                idx += 1
-                guard idx < argv.count else {
-                    throw DDRToolError.invalidFormat("Missing value for --output-log")
-                }
-                args.outputLogPath = argv[idx]
             case "--list":
                 args.listOnly = true
             case "--probe-bulk":
                 args.probeBulk = true
             case "--detect":
                 args.detect = true
-            case "--detect-then-test":
-                args.detectThenTest = true
-            case "--auto":
-                args.auto = true
+            case "--solder":
+                args.solder = true
             case "--detect-cfg":
                 idx += 1
                 guard idx < argv.count else {
@@ -93,9 +76,6 @@ struct CLIArguments {
                 args.repeatCount = n
             case "--eyescan":
                 args.eyescan = true
-            case "--eye-out":
-                idx += 1; guard idx < argv.count else { throw DDRToolError.invalidFormat("Missing value for --eye-out") }
-                args.eyescanOut = argv[idx]
             case "--eye-timeout":
                 idx += 1
                 guard idx < argv.count, let n = Double(argv[idx]), n >= 1 else {
@@ -202,12 +182,16 @@ struct SolderJSON: Encodable {
     let state: String
     let cfg: String
     let bootSucceeded: Bool
+    /// Device USB printf (INFO_PRINTF, framing stripped), embedded so the JSON
+    /// is self-contained (逐项 DQS/DQ/DM/CA/CS/ZQ 检查过程 + 结果).
+    let log: String?
 }
 
 struct EyescanJSON: Encodable {
     let go: Bool
     let bytes: Int
-    let out: String
+    /// Full eye-scan transcript captured over USB, embedded so the JSON is self-contained.
+    let transcript: String
 }
 
 struct CLIResult: Encodable {
@@ -249,32 +233,40 @@ func eyescanGo(_ transcript: String) -> Bool {
 func printUsageAndExit() -> Never {
     let usage = """
     Rockchip DDR Test Utility CLI
-      --list
-      --probe-bulk [--device-id <id>]
-      --cfg <cfg_path> [--device-id <id>] [--output-log <txt_path>] [--repeat N]
-      --detect [--detect-cfg <detect.cfg>] [--device-id <id>]
-      --detect-then-test [--device-id <id>]   (detect→test on one transport, then reboot)
-      --eyescan [--device-id <id>] [--eye-out <txt>] [--eye-timeout <s>]
-                          (eye-scan driven by the SoC's packaged DDR眼图.cfg,
-                           auto-located by the connected device — like --detect)
-      --auto [--device-id <id>] [--eye-out <txt>] [--eye-timeout <s>]
-                          (factory one-shot: detect → soldering → eye-scan → reboot)
+
+    Three DDR test items (run each on a board in Maskrom; each returns to maskrom when done).
+    Pass --json for one machine-readable object on stdout (verdict + full device output embedded):
+      --detect  [--device-id <id>] [--detect-cfg <detect.cfg>]
+                          T01 规格验证 — probe DDR geometry (type/capacity/channels/CS +
+                          per-channel rank/col/bank/row/busWidth/dieWidth) and match a cfg.
+      --solder  [--device-id <id>]
+                          T02 焊接检测 — detect→soldering test on one transport, then reboot.
+                          Device USB printf embedded in JSON as solder.log.
+      --eyescan [--device-id <id>] [--eye-timeout <s>]
+                          T03 DQ眼图 — eye-scan via the SoC's packaged DDR眼图.cfg.
+                          Verdict = scan completed AND all `all result:` lines pass.
+                          Full transcript embedded in JSON as eyescan.transcript.
+
+    Other:
+      --list                          list connected Rockchip devices
+      --cfg <cfg_path> [--repeat N]   run a specific cfg (diagnostic)
+      --probe-bulk                    bulk-transfer probe (diagnostic)
 
     Global options:
-      --json    emit one JSON object on stdout; all human logs go to stderr
-      --quiet   suppress progress lines (final summary still shown unless --json)
+      --json          emit one JSON object on stdout; all human logs go to stderr
+      --quiet         suppress progress lines (final summary still shown unless --json)
+      --help, -h      show this help
 
     Exit codes:
-      0  success — all requested checks passed
+      0  success — the requested check passed
       1  error   — no device / parse / transport / unsupported SoC
-      2  fail    — a soldering test FAILED or an eye-scan was not GO / no unique cfg
+      2  fail    — soldering FAILED, eye-scan not PASS, or detect found no unique cfg
 
     Examples:
       RockchipDDRTestUtilityCLI --list
-      RockchipDDRTestUtilityCLI --detect --json
-      RockchipDDRTestUtilityCLI --auto --json --quiet        # factory line, machine output
-      RockchipDDRTestUtilityCLI --cfg "/path/to/test.cfg" --output-log "/tmp/ddr_result.txt"
-      RockchipDDRTestUtilityCLI --cfg "/path/to/test.cfg" --repeat 3   # boot once, then re-test
+      RockchipDDRTestUtilityCLI --detect  --json
+      RockchipDDRTestUtilityCLI --solder  --json
+      RockchipDDRTestUtilityCLI --eyescan --json
     """
     print(usage)
     Foundation.exit(0)
@@ -324,11 +316,6 @@ struct RockchipDDRTestUtilityCLI {
                 return
             }
 
-            if args.auto {
-                try await runAuto(args: args)
-                return
-            }
-
             if args.eyescan {
                 try await runEyescan(args: args)
                 return
@@ -339,8 +326,8 @@ struct RockchipDDRTestUtilityCLI {
                 return
             }
 
-            if args.detectThenTest {
-                try await runDetectThenTest(args: args)
+            if args.solder {
+                try await runSolder(args: args)
                 return
             }
 
@@ -382,14 +369,6 @@ struct RockchipDDRTestUtilityCLI {
                 if result.outcome == .failed {
                     anyFailed = true
                 }
-
-                if let out = args.outputLogPath {
-                    let suffix = args.repeatCount > 1 ? ".run\(run)" : ""
-                    let url = URL(fileURLWithPath: out + suffix)
-                    let writer = ResultLogWriter()
-                    _ = try writer.write(result: result, sourceCfgPath: cfgPath, outputURL: url)
-                    CLIOut.log("Saved log: \(url.path)")
-                }
             }
 
             CLIOut.summary("\n=== Summary: \(anyFailed ? "SOME RUNS FAILED" : "ALL \(args.repeatCount) RUNS PASSED") ===")
@@ -402,7 +381,8 @@ struct RockchipDDRTestUtilityCLI {
                                     detect: nil,
                                     solder: SolderJSON(pass: !anyFailed, outcome: r.outcome.rawValue,
                                                        state: r.state.rawValue, cfg: lastCfgDisplay,
-                                                       bootSucceeded: r.bootSucceeded),
+                                                       bootSucceeded: r.bootSucceeded,
+                                                       log: ResultLogWriter().render(result: r, sourceCfgPath: lastCfgDisplay)),
                                     eyescan: nil, rebootedToMaskrom: nil,
                                     ok: !anyFailed, error: nil, elapsedMs: 0)
                 out.elapsedMs = 0
@@ -420,118 +400,6 @@ struct RockchipDDRTestUtilityCLI {
             }
             Foundation.exit(1)
         }
-    }
-
-    /// AUTO: factory-line one-shot. detect (no reboot, resident Boot) → soldering
-    /// test on that Boot → reboot to maskrom → eye-scan on a fresh boot → reboot
-    /// to a clean maskrom. Exit 0 only if a unique cfg matched AND soldering
-    /// passed AND the eye-scan reported GO; else exit 2. This is exactly the
-    /// no-replug chain validated across RK3568/RK3576/RK3588 (2026-07-20).
-    static func runAuto(args: CLIArguments) async throws {
-        let start = Date()
-        let transport = try RkUsbTransportLibusb()
-        let devices = try transport.discoverDevices()
-        guard let device = chooseDevice(from: devices, selectedDeviceID: args.selectedDeviceID) else {
-            throw DDRToolError.noDevice
-        }
-        let soc = DetectProfiles.forPID(device.productID)?.soc ?? device.socName ?? ""
-        let pid = "0x" + hex16(device.productID)
-        CLIOut.log("Device: \(device.productName) soc=\(soc) pid=\(pid)")
-
-        let root = CfgRepository.makeDefaultRootURL()
-        let socFiles = ((try? CfgRepository(rootURL: root).discoverTestFiles()) ?? [])
-            .filter { $0.socName == soc }
-        let resourcesDir = args.detectCfgPath.map { URL(fileURLWithPath: ($0 as NSString).deletingLastPathComponent) }
-            ?? root.appendingPathComponent(soc)
-        let detector = DdrDetector(resourcesDir: resourcesDir)
-
-        var result = CLIResult(soc: soc, pid: pid, device: device.productName,
-                               detect: nil, solder: nil, eyescan: nil,
-                               rebootedToMaskrom: nil, ok: false, error: nil, elapsedMs: 0)
-        func finish(exit code: Int32) -> Never {
-            result.elapsedMs = Int(Date().timeIntervalSince(start) * 1000)
-            CLIOut.result(result)
-            Foundation.exit(code)
-        }
-
-        // ① detect WITHOUT reboot — keep the Test Tool Boot resident + transport open.
-        let out = try await detector.detect(transport: transport, device: device,
-                                            socFiles: socFiles, reboot: false)
-        let matched = CfgAutoSelect.firstAvailable(out.candidates, in: socFiles)
-        result.detect = DetectJSON.from(out, cfg: matched?.displayName)
-        CLIOut.log("Detected: \(out.geometry.summary()) tier=\(tierString(out.matchTier)) cfg=\(matched?.displayName ?? "none")")
-
-        guard let matched else {
-            CLIOut.summary("\n=== AUTO: detect produced no unique cfg (tier=\(tierString(out.matchTier))) — STOP ===")
-            try? transport.close()
-            result.error = "detect-no-unique-cfg"
-            finish(exit: 2)
-        }
-
-        // ② soldering test on the resident Boot (skipBoot), keep open for reboot.
-        let engine = TestExecutionEngine(parser: CfgBinaryParser(), transport: transport) { entry in
-            CLIOut.log("[\(entry.level.rawValue)] \(entry.code) \(entry.message)")
-        }
-        let solder = await engine.run(cfgPath: matched.absolutePath,
-                                      selectedDeviceID: args.selectedDeviceID,
-                                      skipBoot: true, keepTransportOpen: true)
-        let solderPass = (solder.outcome == .passed)
-        result.solder = SolderJSON(pass: solderPass, outcome: solder.outcome.rawValue,
-                                   state: solder.state.rawValue, cfg: matched.displayName,
-                                   bootSucceeded: solder.bootSucceeded)
-        CLIOut.log("Solder: \(solder.outcome.rawValue) (state=\(solder.state.rawValue))")
-
-        // ③ reboot to maskrom so the eye-scan can fresh-boot its own DTT.
-        let rebooted = await detector.rebootToMaskrom(transport: transport, device: device)
-        result.rebootedToMaskrom = rebooted
-        CLIOut.log("reboot to maskrom (post-solder): \(rebooted ? "OK" : "sent")")
-
-        // ④ eye-scan on a fresh transport + re-enumerated device. The post-solder
-        //    reboot drops the device and it reappears in maskrom; unlike the
-        //    validated two-invocation chain (process teardown gives a natural gap),
-        //    here we chain in-process, so POLL for the device to reappear (fresh
-        //    libusb context per probe) + settle before the eye-scan boots its DTT.
-        var eyeGo = false
-        var eyeBytes = 0
-        if let eyeCfg = CfgRepository(rootURL: root).eyescanCfgURL(forSoc: soc) {
-            var dev2: UsbDevice? = nil
-            for _ in 0..<50 {   // up to ~10s
-                if let probe = try? RkUsbTransportLibusb(),
-                   let d = (try? probe.discoverDevices())?.first(where: { $0.productID == device.productID }) {
-                    dev2 = d; break
-                }
-                try? await Task.sleep(nanoseconds: 200_000_000)
-            }
-            if let dev2 {
-                try? await Task.sleep(nanoseconds: 500_000_000)   // settle before downloadBoot
-                let eyeTransport = try RkUsbTransportLibusb()
-                let plan = try CfgBinaryParser().parse(url: eyeCfg)
-                if let p = plan.eyescanPayloads() {
-                    let box = ProgressBox()
-                    let est = Date()
-                    let transcript = try await EyescanRunner().run(
-                        transport: eyeTransport, device: dev2,
-                        ddrBin: p.trainOnly, ddrTestTool: p.dtt, itemBin: p.item,
-                        itemBase: p.itemBase, timeout: args.eyescanTimeout, rebootBin: p.reboot,
-                        onProgress: { chunk in box.note(chunk, since: est) })
-                    try? transcript.write(toFile: args.eyescanOut, atomically: true, encoding: .utf8)
-                    eyeGo = eyescanGo(transcript)
-                    eyeBytes = transcript.utf8.count
-                    _ = await detector.rebootToMaskrom(transport: eyeTransport, device: dev2)
-                }
-                try? eyeTransport.close()
-            } else {
-                CLIOut.log("eye-scan: device did not re-enumerate after reboot — skipping")
-            }
-        } else {
-            CLIOut.log("eye-scan: no …眼图.cfg for \(soc) — skipping")
-        }
-        result.eyescan = EyescanJSON(go: eyeGo, bytes: eyeBytes, out: args.eyescanOut)
-
-        let ok = solderPass && eyeGo
-        result.ok = ok
-        CLIOut.summary("\n=== AUTO: soc=\(soc)  detect=\(matched.displayName)  solder=\(solder.outcome.rawValue)  eyescan=\(eyeGo ? "GO" : "NO-GO")  →  \(ok ? "OK" : "FAIL") ===")
-        finish(exit: ok ? 0 : 2)
     }
 
     /// EYE-SCAN, driven by the SoC's packaged `DDR眼图.cfg` — same shape as `--detect` / `--cfg`.
@@ -568,24 +436,21 @@ struct RockchipDDRTestUtilityCLI {
             itemBase: p.itemBase, timeout: args.eyescanTimeout, rebootBin: p.reboot,
             onProgress: { chunk in box.note(chunk, since: start) })
         try? transport.close()
-        try? transcript.write(toFile: args.eyescanOut, atomically: true, encoding: .utf8)
 
-        let done = eyescanGo(transcript)
+        let pass = eyescanGo(transcript)
         CLIOut.summary("\n=== EYE-SCAN SUMMARY ===")
         CLIOut.summary("  bytes captured : \(transcript.utf8.count)")
-        CLIOut.summary("  saw done marker: \(done)")
-        CLIOut.summary("  output written : \(args.eyescanOut)")
-        CLIOut.summary("  VERDICT: \(done ? "GO — full eye-scan log captured over USB 0x80" : "incomplete — inspect \(args.eyescanOut)")")
+        CLIOut.summary("  verdict        : \(pass ? "PASS — all DQ eye margins pass" : "FAIL — a DQ eye failed or the scan did not complete")  (done + all result: pass)")
 
         if args.json {
             let soc2 = DetectProfiles.forPID(device.productID)?.soc ?? soc
             CLIOut.result(CLIResult(soc: soc2, pid: "0x" + hex16(device.productID),
                                     device: device.productName, detect: nil, solder: nil,
-                                    eyescan: EyescanJSON(go: done, bytes: transcript.utf8.count, out: args.eyescanOut),
-                                    rebootedToMaskrom: nil, ok: done, error: nil,
+                                    eyescan: EyescanJSON(go: pass, bytes: transcript.utf8.count, transcript: transcript),
+                                    rebootedToMaskrom: nil, ok: pass, error: nil,
                                     elapsedMs: Int(Date().timeIntervalSince(start) * 1000)))
         }
-        if !done { Foundation.exit(2) }
+        if !pass { Foundation.exit(2) }
     }
 
     /// Thread-safe progress heartbeat for the streaming drain.
@@ -674,7 +539,7 @@ struct RockchipDDRTestUtilityCLI {
     }
 
     /// detect → test on ONE transport, then reboot to bootrom.
-    static func runDetectThenTest(args: CLIArguments) async throws {
+    static func runSolder(args: CLIArguments) async throws {
         let transport = try RkUsbTransportLibusb()
         let devices = try transport.discoverDevices()
         guard let device = chooseDevice(from: devices, selectedDeviceID: args.selectedDeviceID) else {
@@ -736,7 +601,8 @@ struct RockchipDDRTestUtilityCLI {
                                     detect: DetectJSON.from(out, cfg: matched.displayName),
                                     solder: SolderJSON(pass: solderPass, outcome: result.outcome.rawValue,
                                                        state: result.state.rawValue, cfg: matched.displayName,
-                                                       bootSucceeded: result.bootSucceeded),
+                                                       bootSucceeded: result.bootSucceeded,
+                                                       log: ResultLogWriter().render(result: result, sourceCfgPath: matched.absolutePath)),
                                     eyescan: nil, rebootedToMaskrom: rebooted,
                                     ok: solderPass, error: nil, elapsedMs: 0))
         }
