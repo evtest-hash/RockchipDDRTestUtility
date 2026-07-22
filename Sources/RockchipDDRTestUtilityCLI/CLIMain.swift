@@ -152,14 +152,48 @@ enum CLIOut {
 
 // MARK: - Machine-readable result model
 
+/// Per-channel decoded geometry — the fields the DDR bin itself prints
+/// (`BW=.. Col=.. Bk=.. Row=.. CS=.. Die BW=..`), surfaced so callers can do
+/// spec verification straight from JSON instead of scraping printf/stderr.
+struct ChannelJSON: Encodable {
+    let rank: Int          // CS count in this channel (1 or 2)
+    let col: Int           // column address bits
+    let bank: Int          // bank address bits (3 → 8 banks)
+    let cs0Row: Int        // CS0 row address bits
+    let cs1Row: Int        // CS1 row address bits (valid when rank==2)
+    let busWidthBits: Int  // channel bus width (8/16/32)
+    let dieWidthBits: Int  // per-die width (8/16/32)
+
+    init(from c: ChannelGeometry) {
+        rank = c.rank; col = c.col; bank = c.bank
+        cs0Row = c.cs0Row; cs1Row = c.cs1Row
+        busWidthBits = c.busWidthBits; dieWidthBits = c.dieWidthBits
+    }
+}
+
 struct DetectJSON: Encodable {
     let type: String?
     let capacityMB: Int
     let channels: Int
     let sysRegVersion: Int
+    let csPerDie: Int
+    let geometry: [ChannelJSON]
     let cfg: String?
     let tier: String
     let candidates: Int
+
+    /// Build from a `DetectOutcome`; `cfg` is the matched soldering cfg name (or nil).
+    static func from(_ out: DetectOutcome, cfg: String?) -> DetectJSON {
+        DetectJSON(type: out.geometry.dramType?.displayName,
+                   capacityMB: out.geometry.totalSizeMB,
+                   channels: out.geometry.numChannels,
+                   sysRegVersion: out.geometry.sysRegVersion,
+                   csPerDie: out.geometry.csPerDie,
+                   geometry: out.geometry.channels.map(ChannelJSON.init(from:)),
+                   cfg: cfg,
+                   tier: tierString(out.matchTier),
+                   candidates: out.candidates.count)
+    }
 }
 
 struct SolderJSON: Encodable {
@@ -424,13 +458,7 @@ struct RockchipDDRTestUtilityCLI {
         let out = try await detector.detect(transport: transport, device: device,
                                             socFiles: socFiles, reboot: false)
         let matched = CfgAutoSelect.firstAvailable(out.candidates, in: socFiles)
-        result.detect = DetectJSON(type: out.geometry.dramType?.displayName,
-                                   capacityMB: out.geometry.totalSizeMB,
-                                   channels: out.geometry.numChannels,
-                                   sysRegVersion: out.geometry.sysRegVersion,
-                                   cfg: matched?.displayName,
-                                   tier: tierString(out.matchTier),
-                                   candidates: out.candidates.count)
+        result.detect = DetectJSON.from(out, cfg: matched?.displayName)
         CLIOut.log("Detected: \(out.geometry.summary()) tier=\(tierString(out.matchTier)) cfg=\(matched?.displayName ?? "none")")
 
         guard let matched else {
@@ -637,13 +665,7 @@ struct RockchipDDRTestUtilityCLI {
             let matched = CfgAutoSelect.firstAvailable(out.candidates, in: socFiles)
             CLIOut.result(CLIResult(soc: socName, pid: "0x" + hex16(device.productID),
                                     device: device.productName,
-                                    detect: DetectJSON(type: out.geometry.dramType?.displayName,
-                                                       capacityMB: out.geometry.totalSizeMB,
-                                                       channels: out.geometry.numChannels,
-                                                       sysRegVersion: out.geometry.sysRegVersion,
-                                                       cfg: matched?.displayName,
-                                                       tier: tierString(out.matchTier),
-                                                       candidates: out.candidates.count),
+                                    detect: DetectJSON.from(out, cfg: matched?.displayName),
                                     solder: nil, eyescan: nil,
                                     rebootedToMaskrom: out.rebootedToMaskrom,
                                     ok: matched != nil, error: nil,
@@ -679,12 +701,7 @@ struct RockchipDDRTestUtilityCLI {
             if args.json {
                 CLIOut.result(CLIResult(soc: socName, pid: "0x" + hex16(device.productID),
                                         device: device.productName,
-                                        detect: DetectJSON(type: out.geometry.dramType?.displayName,
-                                                           capacityMB: out.geometry.totalSizeMB,
-                                                           channels: out.geometry.numChannels,
-                                                           sysRegVersion: out.geometry.sysRegVersion,
-                                                           cfg: nil, tier: tierString(out.matchTier),
-                                                           candidates: out.candidates.count),
+                                        detect: DetectJSON.from(out, cfg: nil),
                                         solder: nil, eyescan: nil, rebootedToMaskrom: nil,
                                         ok: false, error: "detect-no-unique-cfg", elapsedMs: 0))
             }
@@ -716,12 +733,7 @@ struct RockchipDDRTestUtilityCLI {
         if args.json {
             CLIOut.result(CLIResult(soc: socName, pid: "0x" + hex16(device.productID),
                                     device: device.productName,
-                                    detect: DetectJSON(type: out.geometry.dramType?.displayName,
-                                                       capacityMB: out.geometry.totalSizeMB,
-                                                       channels: out.geometry.numChannels,
-                                                       sysRegVersion: out.geometry.sysRegVersion,
-                                                       cfg: matched.displayName, tier: tierString(out.matchTier),
-                                                       candidates: out.candidates.count),
+                                    detect: DetectJSON.from(out, cfg: matched.displayName),
                                     solder: SolderJSON(pass: solderPass, outcome: result.outcome.rawValue,
                                                        state: result.state.rawValue, cfg: matched.displayName,
                                                        bootSucceeded: result.bootSucceeded),
