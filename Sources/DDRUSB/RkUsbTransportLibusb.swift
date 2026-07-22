@@ -2,6 +2,43 @@ import CLibusb
 import DDRCore
 import Foundation
 
+/// The one libusb context for the whole process.
+///
+/// libusb contexts are meant to be long-lived; on macOS each `libusb_init`
+/// spins up a darwin hotplug event thread and each `libusb_exit` tears it down.
+/// Calling `libusb_exit` while that event thread is mid-callback servicing a
+/// device *detach* (`darwin_devices_detached`) deadlocks: `darwin_exit` takes
+/// the global `active_contexts_lock` and waits for the event thread to stop,
+/// while the event thread is blocked trying to take that same lock. Because the
+/// old design created and destroyed a context per `RkUsbTransportLibusb` — and
+/// tore one down exactly on unplug (`MainViewModel.tearDownActiveTransport`) —
+/// that race was reachable and froze the main thread for ~22s.
+///
+/// A single context created once and *never* exited removes the teardown path
+/// entirely, so the deadlock can't occur. It also drops the redundant
+/// init/exit churn on every enumerate/poll/CLI command. The context is a
+/// deliberate process-lifetime "leak" — the OS reclaims it at exit; not exiting
+/// it is the whole point. libusb contexts are thread-safe, so sharing one
+/// across transports (and across the enumerate + I/O paths) is supported.
+enum LibusbSharedContext {
+    /// `static let` is initialized exactly once, lazily and thread-safely.
+    private static let initialized: (context: OpaquePointer?, rc: Int32) = {
+        var ctx: OpaquePointer?
+        let rc = libusb_init(&ctx)
+        return (ctx, rc)
+    }()
+
+    /// The shared context, initializing it on first use. Throws if the one-time
+    /// `libusb_init` failed.
+    static func acquire() throws -> OpaquePointer {
+        let result = initialized
+        guard result.rc == 0, let ctx = result.context else {
+            throw DDRToolError.transportError("libusb_init failed (code \(result.rc))")
+        }
+        return ctx
+    }
+}
+
 public final class RkUsbTransportLibusb: UsbTransport {
     private static let rockchipVendorID: UInt16 = 0x2207
     private static let bootControlRequestType: UInt8 = 0x40
@@ -37,7 +74,6 @@ public final class RkUsbTransportLibusb: UsbTransport {
         0x350A, 0x350B, 0x350C, 0x350D, 0x350E, 0x110F,
     ]
 
-    private var context: OpaquePointer?
     private var handle: OpaquePointer?
     private var claimedInterface: Int32 = -1
     private var claimedAltSetting: Int32 = 0
@@ -62,18 +98,22 @@ public final class RkUsbTransportLibusb: UsbTransport {
     private let transferTimeoutMs: UInt32 = RkUsbTransportLibusb.timeoutMs
 
     public init() throws {
-        try initializeContext()
+        // Force the one-time shared-context init so construction fails fast if
+        // libusb_init failed. The context is a process global (see
+        // `LibusbSharedContext`); this instance holds no context state.
+        _ = try LibusbSharedContext.acquire()
     }
 
     deinit {
+        // Only release this transport's device handle. The libusb context is
+        // process-shared and intentionally never `libusb_exit`'d — see
+        // `LibusbSharedContext`. Calling `libusb_exit` here (on the main actor,
+        // on the unplug path) is what deadlocked against libusb's device-detach
+        // handler and hung the UI.
         try? close()
-        if let context {
-            libusb_exit(context)
-        }
     }
 
     public func discoverDevices() throws -> [UsbDevice] {
-        try ensureContext()
         let list = try enumerateDevices()
         defer {
             for dev in list {
@@ -136,7 +176,6 @@ public final class RkUsbTransportLibusb: UsbTransport {
 
     public func open(device: UsbDevice) throws {
         ioLock.lock(); defer { ioLock.unlock() }
-        try ensureContext()
         try close()
 
         let list = try enumerateDevices()
@@ -176,8 +215,9 @@ public final class RkUsbTransportLibusb: UsbTransport {
             }
         }
 
-        if selected == nil, let context {
-            selected = libusb_open_device_with_vid_pid(context, device.vendorID, device.productID)
+        if selected == nil {
+            selected = libusb_open_device_with_vid_pid(
+                try LibusbSharedContext.acquire(), device.vendorID, device.productID)
         }
 
         guard let selected else {
@@ -534,21 +574,6 @@ public final class RkUsbTransportLibusb: UsbTransport {
             ?? String(bytes: buf[..<safeLen], encoding: .utf8)
     }
 
-    private func initializeContext() throws {
-        var newContext: OpaquePointer?
-        let rc = libusb_init(&newContext)
-        guard rc == 0, let newContext else {
-            throw makeUSBError("libusb_init failed", code: rc)
-        }
-        context = newContext
-    }
-
-    private func ensureContext() throws {
-        if context == nil {
-            try initializeContext()
-        }
-    }
-
     private func ensureOpened() throws {
         guard handle != nil else {
             throw DDRToolError.transportError("USB device is not opened")
@@ -557,7 +582,7 @@ public final class RkUsbTransportLibusb: UsbTransport {
 
     private func enumerateDevices() throws -> [OpaquePointer] {
         var listPtr: UnsafeMutablePointer<OpaquePointer?>?
-        let count = libusb_get_device_list(context, &listPtr)
+        let count = libusb_get_device_list(try LibusbSharedContext.acquire(), &listPtr)
         guard count >= 0 else {
             throw makeUSBError("libusb_get_device_list failed", code: Int32(count))
         }
