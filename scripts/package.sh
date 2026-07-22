@@ -233,6 +233,15 @@ verify_libusb "$CLI_DIST/$CLI_BIN"
 echo "CLI arch:"; lipo -info "$CLI_DIST/$CLI_BIN"
 echo "CLI libusb + rpath:"; otool -L "$CLI_DIST/$CLI_BIN" | grep -E "libusb"; otool -l "$CLI_DIST/$CLI_BIN" | grep -A2 LC_RPATH
 
+# Ad-hoc codesign — lipo (fat binary) + install_name_tool/add_rpath above invalidate
+# the linker's per-slice ad-hoc signature; on Apple Silicon an unsigned/broken-signature
+# binary is killed at launch (SIGKILL). Re-sign dependency (libusb) first, then the
+# executable, so the shipped tarball runs on any arm64/x86_64 machine (macOS 12+).
+echo "=== Ad-hoc codesigning CLI ==="
+codesign --force --sign - "$CLI_DIST/libusb-1.0.0.dylib"
+codesign --force --sign - "$CLI_DIST/$CLI_BIN"
+codesign --verify --verbose "$CLI_DIST/$CLI_BIN"
+
 tar -czf "$CLI_TARBALL" -C "$CLI_DIST" "$CLI_BIN" libusb-1.0.0.dylib
 echo "=== CLI tarball: $CLI_TARBALL ($(du -sh "$CLI_TARBALL" | cut -f1)) ==="
 
