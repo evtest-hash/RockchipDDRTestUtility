@@ -11,7 +11,7 @@ struct CLIArguments {
     /// run the osregdump probe cfg, read OS_REG over USB, decode + shortlist cfg.
     var detect = false
     var detectCfgPath: String?
-    /// SOLDER (T02): detect → soldering test on ONE transport, no reboot between.
+    /// SOLDER: detect → soldering test on ONE transport, no reboot between.
     /// detect(reboot:false) leaves the DDR Test Tool Boot resident + transport
     /// open; the matched cfg then runs with skipBoot:true on that same Boot, then
     /// reboots to maskrom. The device USB printf is embedded in the JSON result.
@@ -234,16 +234,16 @@ func printUsageAndExit() -> Never {
     let usage = """
     Rockchip DDR Test Utility CLI
 
-    Three DDR test items (run each on a board in Maskrom; each returns to maskrom when done).
+    Three DDR checks (run each on a board in Maskrom; each returns to maskrom when done).
     Pass --json for one machine-readable object on stdout (verdict + full device output embedded):
       --detect  [--device-id <id>] [--detect-cfg <detect.cfg>]
-                          T01 规格验证 — probe DDR geometry (type/capacity/channels/CS +
+                          DDR 自动探测 — probe DDR geometry (type/capacity/channels/CS +
                           per-channel rank/col/bank/row/busWidth/dieWidth) and match a cfg.
       --solder  [--device-id <id>]
-                          T02 焊接检测 — detect→soldering test on one transport, then reboot.
+                          焊接检测 — detect→soldering test on one transport, then reboot.
                           Device USB printf embedded in JSON as solder.log.
       --eyescan [--device-id <id>] [--eye-timeout <s>]
-                          T03 DQ眼图 — eye-scan via the SoC's packaged DDR眼图.cfg.
+                          DQ 眼图 — eye-scan via the SoC's packaged DDR眼图.cfg.
                           Verdict = scan completed AND all `all result:` lines pass.
                           Full transcript embedded in JSON as eyescan.transcript.
 
