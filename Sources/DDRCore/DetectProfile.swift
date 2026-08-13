@@ -7,7 +7,7 @@ import Foundation
 public struct DetectProfile: Sendable {
     public let soc: String            // must match CfgRepository socName / DDRTestFiles dir
     /// Single self-contained detect cfg (basename). Packages every payload the
-    /// detect flow needs — Boot + ddrbin + osregdump + reboot — which DdrDetector
+    /// detect flow needs — Boot + ddrbin + osregdump + otpdump + reboot — which DdrDetector
     /// reads out of `plan.embeddedBins` and drives itself (NOT via the test
     /// engine). Built by tools/ddr-autodetect/build.sh and stored in this SoC's
     /// `DDRTestFiles/<soc>/` dir (so it ships with the real test cfgs). The name
@@ -27,6 +27,8 @@ public struct DetectProfile: Sendable {
     public let maskromMagic: UInt32   // reboot-to-maskrom: magic written to bootModeReg
     public let cruResetReg: UInt32    // CRU global soft-reset register
     public let cruResetValue: UInt32  // value that triggers the reset
+    /// U-Boot's `CFG_CPUID_OFFSET % 4`; nil means this SoC ships no otpdump payload.
+    public let otpCpuidByteOffset: Int?
 }
 
 public enum DetectProfiles {
@@ -45,7 +47,8 @@ public enum DetectProfiles {
             bootModeReg: 0xFDC2_0200,
             maskromMagic: 0xEF08_A53C,
             cruResetReg: 0xFDD2_00D4,
-            cruResetValue: 0x0000_FDB9),
+            cruResetValue: 0x0000_FDB9,
+            otpCpuidByteOffset: 0),
         // RK3588 — addresses confirmed against U-Boot + RE of the rkbin DDR bin:
         //   item base 0xFF004000 (cfg @0x5B6); Boot links 0xFF001000 → puts vector +4.
         //   PMU1_GRF_BASE 0xFD58A000, os_reg0 @+0x200 → 0xFD58A200 (DDR bin STRs the
@@ -61,7 +64,8 @@ public enum DetectProfiles {
             bootModeReg: 0xFD58_8080,   // CONFIG_ROCKCHIP_BOOT_MODE_REG (NOT os_reg0)
             maskromMagic: 0xEF08_A53C,
             cruResetReg: 0xFD7C_0C08,
-            cruResetValue: 0x0000_FDB9),
+            cruResetValue: 0x0000_FDB9,
+            otpCpuidByteOffset: 3),
         // RK3576 — same AArch64 DDR Test Tool Boot as RK356x/RK3588. Addresses:
         //   item base 0xFF... no — cfg @0x5B6 = 0x3FF84000; Boot links 0x3FF81000
         //   → puts vector +4. PMU1_GRF_BASE 0x26026000, os_reg0 @+0x200 → 0x26026200
@@ -78,7 +82,8 @@ public enum DetectProfiles {
             bootModeReg: 0x2602_4040,   // CONFIG_ROCKCHIP_BOOT_MODE_REG (NOT os_reg0)
             maskromMagic: 0xEF08_A53C,
             cruResetReg: 0x2720_0C08,
-            cruResetValue: 0x0000_FDB9),
+            cruResetValue: 0x0000_FDB9,
+            otpCpuidByteOffset: 2),
         // RK3288 (arm32 / SYS_REG **V1**). All addresses confirmed against U-Boot
         // (mixtile rk3288 tree) + RE of the ForceInit item:
         //   Boot links 0xFFFF0000; item base 0xFFFF1500; USB puts service 0xFFFF0020
@@ -103,7 +108,8 @@ public enum DetectProfiles {
             bootModeReg: 0xFF73_0094,   // CONFIG_ROCKCHIP_BOOT_MODE_REG (== os_reg0)
             maskromMagic: 0xEF08_A53C,
             cruResetReg: 0xFF76_01B0,   // glb_srst_fst (clean restart; flag survives)
-            cruResetValue: 0x0000_FDB9),
+            cruResetValue: 0x0000_FDB9,
+            otpCpuidByteOffset: nil),
     ]
     public static func forPID(_ pid: UInt16) -> DetectProfile? { all[pid] }
 }

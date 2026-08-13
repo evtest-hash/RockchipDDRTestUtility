@@ -8,6 +8,8 @@ public struct DetectOutcome: Sendable {
     public let candidates: [CfgAutoSelect.Candidate]
     public let matchTier: CfgAutoSelect.MatchTier
     public let rebootedToMaskrom: Bool
+    /// Raw CPUID from OTP; nil when unsupported or the read did not complete.
+    public let cpuid: [UInt8]?
 }
 
 public enum DetectError: Error, Sendable {
@@ -44,7 +46,8 @@ public actor DdrDetector {
     /// detect→test path that avoids the reboot entirely (and thus the RK3288
     /// populated-eMMC reboot limitation).
     public func detect(transport: UsbTransport, device: UsbDevice,
-                       socFiles: [TestFileEntry], reboot: Bool = true) async throws -> DetectOutcome {
+                       socFiles: [TestFileEntry], reboot: Bool = true,
+                       readIdentity: Bool = false) async throws -> DetectOutcome {
         guard let profile = DetectProfiles.forPID(device.productID) else {
             throw DetectError.unsupportedSoc
         }
@@ -140,6 +143,32 @@ public actor DdrDetector {
             }
         }
 
+        // ③b otpdump: per-chip identity on the same resident Boot. After the geometry capture and
+        // never fatal — a failure just yields no identity. OPT-IN (`readIdentity`), because it is
+        // an extra item download+run on a path the GUI drives for every soldering test, and only
+        // the CLI reports the identity. Callers that do not want it pay nothing.
+        var cpuid: [UInt8]? = nil
+        if readIdentity, let cpuidByteOffset = profile.otpCpuidByteOffset, let otpBin = payload("otpdump") {
+            let otpItem = CfgItem(name: "otpdump", payloadOffset: 0, payloadLength: otpBin.count)
+            do {
+                try transport.downloadItem(item: otpItem, payload: otpBin, address: base)
+                try transport.runItem(item: otpItem, address: base)
+                var otpCaptured = ""
+                for _ in 0..<12 {
+                    if let s = try? transport.readPrintf(), !s.isEmpty { otpCaptured += "\n" + s }
+                    // OTP_END terminates the probe's output, so stop as soon as it parses.
+                    if let parsed = ChipIdentity.parseOtpProbeOutput(otpCaptured, cpuidByteOffset: cpuidByteOffset) {
+                        cpuid = parsed
+                        break
+                    }
+                    try? await Task.sleep(nanoseconds: 40_000_000)
+                }
+            } catch {
+                cpuid = nil
+            }
+            phase("③b otpdump capture (cpuid \(cpuid == nil ? "unavailable" : "ok"))")
+        }
+
         // ④ reboot to maskrom, then wait for re-enumeration. Runs ONLY here,
         // explicitly, after capture — never mid-capture (the whole reason this
         // detector doesn't hand the cfg to TestExecutionEngine).
@@ -151,7 +180,7 @@ public actor DdrDetector {
         phase(reboot ? "④ reboot + re-enum (rebooted=\(rebooted))"
                      : "④ reboot SKIPPED (unified detect→test; transport kept open)")
         return DetectOutcome(rawOsReg: words, geometry: geo, candidates: candidates,
-                             matchTier: tier, rebootedToMaskrom: rebooted)
+                             matchTier: tier, rebootedToMaskrom: rebooted, cpuid: cpuid)
     }
 
     /// Reboot a RESIDENT (post-test) device back to maskrom using the SoC's detect-cfg reboot payload,

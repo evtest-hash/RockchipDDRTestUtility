@@ -2,8 +2,8 @@ import XCTest
 @testable import DDRCore
 
 final class DetectCfgTests: XCTestCase {
-    /// The detect cfg is a self-contained PACKAGING container: it carries all
-    /// four payloads the detect flow needs — Boot + ddrbin + osregdump + reboot.
+    /// The detect cfg is a self-contained PACKAGING container: it carries every
+    /// payload the detect flow needs — Boot + ddrbin + osregdump + otpdump + reboot.
     /// DdrDetector pulls each out of embeddedBins and drives the sequence itself
     /// (it never runs the cfg through TestExecutionEngine), so embedding reboot
     /// here is safe: the detector runs it explicitly, after OS_REG capture.
@@ -16,8 +16,9 @@ final class DetectCfgTests: XCTestCase {
         XCTAssertTrue(names.contains("boot"))
         XCTAssertTrue(names.contains("ddrbin"))
         XCTAssertTrue(names.contains("osregdump"))
+        XCTAssertTrue(names.contains("otpdump"))
         XCTAssertTrue(names.contains("reboot"))
-        XCTAssertEqual(names.count, 4)
+        XCTAssertEqual(names.count, 5)
     }
 
     /// Every packaged payload must round-trip out of the cfg non-empty (Boot raw,
@@ -26,7 +27,7 @@ final class DetectCfgTests: XCTestCase {
         let path = FileManager.default.currentDirectoryPath + "/DDRTestFiles/RK3568&RK3566/DDR自动探测.cfg"
         try XCTSkipUnless(FileManager.default.fileExists(atPath: path))
         let plan = try CfgBinaryParser().parse(url: URL(fileURLWithPath: path))
-        for name in ["Boot", "ddrbin", "osregdump", "reboot"] {
+        for name in ["Boot", "ddrbin", "osregdump", "otpdump", "reboot"] {
             let bin = plan.embeddedBins.first { $0.key.caseInsensitiveCompare(name) == .orderedSame }?.value
             XCTAssertNotNil(bin, "missing payload \(name)")
             XCTAssertGreaterThan(bin?.count ?? 0, 0, "empty payload \(name)")
@@ -43,22 +44,22 @@ final class DetectCfgTests: XCTestCase {
         let plan = try CfgBinaryParser().parse(url: URL(fileURLWithPath: path))
         XCTAssertEqual(plan.downloadBaseAddress, 0xFF00_4000)
         let names = plan.items.map { $0.name.lowercased() }
-        XCTAssertEqual(names.count, 4)
-        for name in ["Boot", "ddrbin", "osregdump", "reboot"] {
+        XCTAssertEqual(names.count, 5)
+        for name in ["Boot", "ddrbin", "osregdump", "otpdump", "reboot"] {
             let bin = plan.embeddedBins.first { $0.key.caseInsensitiveCompare(name) == .orderedSame }?.value
             XCTAssertGreaterThan(bin?.count ?? 0, 0, "empty/missing payload \(name)")
         }
     }
 
-    /// RK3576 detect cfg: same 4-payload packaging, item download base 0x3FF84000.
+    /// RK3576 detect cfg: 5 payloads (otpdump for the CPUID), item base 0x3FF84000.
     func testRK3576DetectCfgPackagesAllPayloads() throws {
         let path = FileManager.default.currentDirectoryPath + "/DDRTestFiles/RK3576/DDR自动探测.cfg"
         try XCTSkipUnless(FileManager.default.fileExists(atPath: path))
         let plan = try CfgBinaryParser().parse(url: URL(fileURLWithPath: path))
         XCTAssertEqual(plan.downloadBaseAddress, 0x3FF8_4000)
         let names = plan.items.map { $0.name.lowercased() }
-        XCTAssertEqual(names.count, 4)
-        for name in ["Boot", "ddrbin", "osregdump", "reboot"] {
+        XCTAssertEqual(names.count, 5)
+        for name in ["Boot", "ddrbin", "osregdump", "otpdump", "reboot"] {
             let bin = plan.embeddedBins.first { $0.key.caseInsensitiveCompare(name) == .orderedSame }?.value
             XCTAssertGreaterThan(bin?.count ?? 0, 0, "empty/missing payload \(name)")
         }

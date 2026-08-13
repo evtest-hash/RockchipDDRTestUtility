@@ -46,10 +46,17 @@ public actor EyescanRunner {
         /// answering altogether — including the reboot item — and a physical replug
         /// is the only recovery.
         public let wedged: Bool
-        /// nil  — the cfg ships no reboot payload, so no auto-return was attempted.
-        /// false — the reboot was skipped (see `completedViaStatus`) or the board
-        ///         never reset.
-        /// true  — the board dropped off the bus and re-enumerated.
+        /// Raw CPUID read from OTP after the scan, or nil when this SoC ships no otpdump payload,
+        /// its eye-scan loader is a different build, or the read did not complete. Never fatal.
+        public let cpuid: [UInt8]?
+        /// true — the reset was OBSERVED (the board left the bus, or came back on the
+        ///        same socket under a new USB address).
+        /// nil  — not attempted, or attempted and not observable. NOT the same as "it
+        ///        did not reset": the absence window can be shorter than any polling
+        ///        interval and the host may hand back the same address, so a reset that
+        ///        did happen is routinely unobservable. The only definitive test is
+        ///        whether the next 0x471 boot download succeeds.
+        /// false — only when the reboot was deliberately skipped.
         public let returnedToMaskrom: Bool?
     }
 
@@ -69,6 +76,10 @@ public actor EyescanRunner {
                     itemBase: UInt32 = 0xFDCC_4000,
                     timeout: TimeInterval,
                     rebootBin: Data? = nil,
+                    /// The detect cfg's otpdump probe, when this SoC's eye-scan loader is the same
+                    /// build the probe expects. Absent ⇒ no identity is read, flow unchanged.
+                    otpBin: Data? = nil,
+                    otpCpuidByteOffset: Int? = nil,
                     // How long the device must have been silent at the deadline before we call the
                     // board wedged rather than merely slow. Injectable so tests need not sleep.
                     stallSilence: TimeInterval = 5,
@@ -271,6 +282,38 @@ public actor EyescanRunner {
                     dataBytes, nData, tData, rate, nData>0 ? dataBytes/nData : 0, maxChunk, nEmpty, tEmpty, uiDropped))
         uiEmit.finish()   // USB drain done → no more chunks; the UI task drains its own buffer
 
+        // ③b otpdump — the per-chip identity, read after the scan and before the reboot. Never
+        // fatal: a failure leaves the identity unknown and the run is otherwise unaffected. An item
+        // is finished when the DEVICE says so, not when its output stops, so this polls for
+        // completion before returning — issuing the next download while the loader is still running
+        // the previous item stops it servicing commands at all.
+        var cpuid: [UInt8]? = nil
+        if let otpBin, let otpCpuidByteOffset {
+            do {
+                let od = CfgItem(name: "otpdump", pathHint: nil, nameOffset: 0,
+                                 payloadOffset: 0, payloadLength: otpBin.count)
+                try transport.downloadItem(item: od, payload: otpBin, address: itemBase)
+                try transport.runItem(item: od, address: itemBase)
+                let otpDeadline = Date().addingTimeInterval(6)
+                var captured = ""
+                var returned = false
+                while Date() < otpDeadline {
+                    if let s = try? transport.readPrintf(), !s.isEmpty { captured += "\n" + s }
+                    if cpuid == nil {
+                        cpuid = ChipIdentity.parseOtpProbeOutput(captured, cpuidByteOffset: otpCpuidByteOffset)
+                    }
+                    if let st = try? transport.testDeviceReady(), st.phase == .finished {
+                        returned = true
+                        break
+                    }
+                    try? await Task.sleep(nanoseconds: 40_000_000)
+                }
+                mark("③b otpdump (cpuid \(cpuid == nil ? "unavailable" : "ok"), item \(returned ? "returned" : "DID NOT return"))")
+            } catch {
+                mark("③b otpdump skipped (\(error))")
+            }
+        }
+
         // ④ Auto-return to maskrom: run the factory reboot payload (per-SoC boot-mode magic + CRU
         // soft-reset, taken from that SoC's DDR自动探测.cfg). The device resets → the next run starts
         // from a clean maskrom with NO manual replug. The runItem ack is lost (the device is
@@ -296,45 +339,66 @@ public actor EyescanRunner {
 
         var returnedToMaskrom: Bool? = nil
         if let rebootBin {
-            if wedged {
-                returnedToMaskrom = false
-                mark("④ reboot SKIPPED — the item stopped, so the device cannot run the reboot either; "
-                     + "the board is wedged and needs a PHYSICAL REPLUG before the next run")
-            } else {
-                let rb = CfgItem(name: "reboot", pathHint: nil, nameOffset: 0, payloadOffset: 0, payloadLength: rebootBin.count)
-                try? transport.downloadItem(item: rb, payload: rebootBin, address: itemBase)
-                try? transport.runItem(item: rb, address: itemBase)
-                mark("④ reboot item sent → device returning to maskrom")
-                let reset = await deviceReset(transport: transport, device: device)
-                returnedToMaskrom = reset
-                mark(reset ? "④ board dropped off the bus and re-enumerated"
-                           : "④ board NEVER reset — the next run's boot download will fail; replug it")
+            // ALWAYS attempt it, even when the run stalled. An earlier version skipped the reboot
+            // on a stalled run, reasoning that the payload is itself an item and a device stuck
+            // inside the previous item could never pick it up. Measured: that is wrong often enough
+            // to matter — a stalled RK3588 recovered on the very next run because the released
+            // build sent the reboot regardless. "The drain timed out" only means we never saw the
+            // completion signal; it does not mean the device stopped answering. Skipping costs a
+            // human walking to the bench; attempting costs a few seconds of USB timeouts.
+            //
+            // `answering` records whether the device was responding at all while we drained, so a
+            // stalled-but-alive run reads differently from one where USB itself had failed — and so
+            // the pairing of that state with whether the reboot then worked accumulates as evidence
+            // rather than staying a guess.
+            let answering = nStatusFail == 0 || nStatusOK > 0
+            let rb = CfgItem(name: "reboot", pathHint: nil, nameOffset: 0, payloadOffset: 0, payloadLength: rebootBin.count)
+            var sent = "download+run ok"
+            do {
+                try transport.downloadItem(item: rb, payload: rebootBin, address: itemBase)
+            } catch { sent = "download FAILED (\(error))" }
+            if sent.hasPrefix("download+run") {
+                // The device resets mid-command, so a lost ack here is expected, not a fault.
+                do { try transport.runItem(item: rb, address: itemBase) }
+                catch { sent = "run returned \(error) (expected if the reset fired)" }
             }
+            mark("④ reboot item: \(sent)" + (wedged ? "  [after a stall; device was \(answering ? "still answering" : "NOT answering")]" : ""))
+            returnedToMaskrom = await deviceReset(transport: transport, device: device)
+            mark(returnedToMaskrom == true
+                 ? "④ reset observed — board re-enumerated"
+                 : "④ reset NOT observed (it may still have happened; the next boot download is the real test)")
         }
         await uiTask.value   // let the decoupled UI delivery finish (overlaps the reboot above)
         return Outcome(transcript: transcript,
                        completedViaStatus: completedViaStatus,
                        wedged: wedged,
+                       cpuid: cpuid,
                        returnedToMaskrom: returnedToMaskrom)
     }
 
-    /// Did the board actually reset? Poll until the pre-reboot identity is gone — either the device
-    /// dropped off the bus, or the same PID came back under a new bus/address (`deviceID` carries
-    /// both) — and then until that PID is present again.
+    /// Was the reset OBSERVED? Returns nil when it could not be, which is not a failure.
     ///
-    /// This proves the RESET FIRED, not that the firmware is maskrom: a re-enumerated maskrom and a
-    /// wedged DTT present byte-identical descriptors, so the next 0x471 download remains the only
-    /// definitive test. It is still worth checking, because "never dropped at all" is unambiguous —
-    /// it means the reboot item did not execute.
-    private func deviceReset(transport: UsbTransport, device: UsbDevice) async -> Bool {
+    /// Two signals, either of which is positive: the device leaving the bus, or coming back on the
+    /// same socket under a new USB address. Neither is guaranteed to be visible — the gap can be
+    /// shorter than any polling interval, and the host may reassign the same address — so a
+    /// negative result means "not observed", never "did not happen". Both were measured giving
+    /// false negatives on boards that had demonstrably rebooted, so this must not be reported as a
+    /// fault: the next 0x471 boot download is the only definitive test.
+    ///
+    /// Note the device id deliberately does NOT change across re-enumeration (it names the socket,
+    /// so a board can be addressed among several of the same model), which is why the address is
+    /// tracked separately here.
+    private func deviceReset(transport: UsbTransport, device: UsbDevice) async -> Bool? {
         try? transport.close()
-        var sawDrop = false
-        for _ in 0..<60 {                                   // up to ~9 s
-            try? await Task.sleep(nanoseconds: 150_000_000)
+        for _ in 0..<200 {                                  // ~6 s at 30 ms, to catch a short gap
+            try? await Task.sleep(nanoseconds: 30_000_000)
             let list = (try? transport.discoverDevices()) ?? []
-            if !list.contains(where: { $0.deviceID == device.deviceID }) { sawDrop = true }
-            if sawDrop, list.contains(where: { $0.productID == device.productID }) { return true }
+            guard let same = list.first(where: { $0.deviceID == device.deviceID }) else {
+                return true                                 // off the bus ⇒ it reset
+            }
+            if same.usbAddress != device.usbAddress { return true }
         }
-        return false
+        return nil                                          // never observed — inconclusive
     }
+
 }

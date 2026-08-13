@@ -9,7 +9,12 @@ import DDRCore
 final class EyescanDecouplingTests: XCTestCase {
 
     private static let dev = UsbDevice(deviceID: "stress", vendorID: 0x2207, productID: 0x350B,
-                                       productName: "RK3588 (stress)", serialNumber: nil)
+                                       productName: "RK3588 (stress)", serialNumber: nil,
+                                       usbAddress: 4)
+    /// The same socket after the board reset: identical id (it names the port), new USB address.
+    private static let devReenumerated = UsbDevice(deviceID: "stress", vendorID: 0x2207, productID: 0x350B,
+                                                   productName: "RK3588 (stress)", serialNumber: nil,
+                                                   usbAddress: 7)
 
     /// One synthetic printf chunk (a realistic eyescan line) + its byte length.
     private static let chunk = "vref 42.1%:----********----[7 ~ -4 ~ -16(23)] dq0 12 34 56 78\n"
@@ -139,20 +144,19 @@ final class EyescanDecouplingTests: XCTestCase {
 
     // MARK: - Auto-return to maskrom
 
-    /// A WEDGED board must not be sent the reboot item: it needs the same device-side runner the
-    /// eye-scan item was using, so a device that never came back from that item cannot run it
-    /// either, and every attempted transfer only burns a full USB timeout. The run must report the
-    /// board as needing a replug.
-    func testWedgedRunSkipsRebootAndReportsReplug() async throws {
+    /// A stalled run must STILL be sent the reboot. Skipping it was measured to be wrong: a
+    /// stalled board recovered on the next run precisely because the reboot was sent anyway. A
+    /// deadline means we never saw the completion signal, not that the device stopped answering,
+    /// and the asymmetry is stark — attempting costs seconds, skipping costs a physical replug.
+    func testWedgedRunStillAttemptsReboot() async throws {
         // The device goes silent immediately and never reports done ⇒ the item stopped.
         let (outcome, _, mock) = try await runScan(chunks: 3, uiDelayMs: 0, timeout: 0.6,
                                                    rebootBin: Data([0xAA]), everFinishes: false,
                                                    stallSilence: 0.2)
         XCTAssertFalse(outcome.completedViaStatus)
         XCTAssertTrue(outcome.wedged, "silent device at the deadline ⇒ wedged")
-        XCTAssertEqual(outcome.returnedToMaskrom, false)
-        XCTAssertFalse(mock.itemsDownloaded.contains("reboot"), "must not download a reboot core 1 cannot run")
-        XCTAssertFalse(mock.itemsRun.contains("reboot"))
+        XCTAssertTrue(mock.itemsDownloaded.contains("reboot"), "a stalled board must still be offered the reboot")
+        XCTAssertTrue(mock.itemsRun.contains("reboot"))
     }
 
     /// HW-observed on RK3576: a stress item streaming steadily at ~1 KB/s simply outlasts the
@@ -161,7 +165,7 @@ final class EyescanDecouplingTests: XCTestCase {
     func testSlowButLiveItemIsNotWedgedAndStillReboots() async throws {
         let (outcome, _, mock) = try await runScan(chunks: 100_000, uiDelayMs: 0, timeout: 0.6,
                                                    rebootBin: Data([0xAA]), everFinishes: false,
-                                                   afterRebootEnumerations: [[], [Self.dev]],
+                                                   afterRebootEnumerations: [[], [Self.devReenumerated]],
                                                    stallSilence: 5)
         XCTAssertFalse(outcome.completedViaStatus, "deadline hit before the item finished")
         XCTAssertFalse(outcome.wedged, "data was still flowing ⇒ NOT wedged")
@@ -173,20 +177,22 @@ final class EyescanDecouplingTests: XCTestCase {
     /// identity disappears from the bus and the PID comes back.
     func testCompletedRunRebootsAndConfirmsReset() async throws {
         let (outcome, _, mock) = try await runScan(chunks: 3, uiDelayMs: 0, rebootBin: Data([0xAA]),
-                                                   afterRebootEnumerations: [[], [Self.dev]])
+                                                   afterRebootEnumerations: [[], [Self.devReenumerated]])
         XCTAssertTrue(outcome.completedViaStatus)
         XCTAssertTrue(mock.itemsRun.contains("reboot"))
-        XCTAssertEqual(outcome.returnedToMaskrom, true, "device dropped then re-enumerated ⇒ reset fired")
+        XCTAssertEqual(outcome.returnedToMaskrom, true, "same socket, new USB address ⇒ reset fired")
     }
 
-    /// The board answering "done" but never leaving the bus means the reset never fired — the next
-    /// run's 0x471 download would fail, so the run must say so rather than report success.
-    func testCompletedRunDetectsBoardThatNeverReset() async throws {
+    /// A reset that is never observed must be reported as UNKNOWN, not as failure. The absence
+    /// window can be shorter than any poll and the host may reassign the same address, so both
+    /// signals give false negatives on boards that did reboot — measured on RK3576. Asserting
+    /// failure here is what sent an earlier investigation chasing a device fault that did not exist.
+    func testUnobservedResetIsReportedAsUnknownNotFailure() async throws {
         let (outcome, _, mock) = try await runScan(chunks: 3, uiDelayMs: 0, timeout: 20,
                                                    rebootBin: Data([0xAA]),
                                                    afterRebootEnumerations: [[Self.dev]])
         XCTAssertTrue(outcome.completedViaStatus)
         XCTAssertTrue(mock.itemsRun.contains("reboot"))
-        XCTAssertEqual(outcome.returnedToMaskrom, false, "never dropped ⇒ the reboot item did not execute")
+        XCTAssertNil(outcome.returnedToMaskrom, "not observed ⇒ unknown, never a claim that it did not reset")
     }
 }

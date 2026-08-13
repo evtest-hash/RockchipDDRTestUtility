@@ -198,6 +198,9 @@ struct CLIResult: Encodable {
     var soc: String
     var pid: String
     var device: String
+    /// Chip identity from OTP. Present whenever the mode read it and the SoC supports it.
+    var cpuid: String? = nil
+    var serial: String? = nil
     var detect: DetectJSON?
     var solder: SolderJSON?
     var eyescan: EyescanJSON?
@@ -428,12 +431,30 @@ struct RockchipDDRTestUtilityCLI {
             + (p.reboot.map { " + reboot \($0.count)B" } ?? "")
             + " @0x\(String(p.itemBase, radix: 16))")
 
+        // The identity probe lives in the DETECT cfg and calls the loader's puts vector at a fixed
+        // address, so it is only safe when the eye-scan loader is the same build. They are built
+        // from one source and differ only in a timing constant, so this checks same-build (identical
+        // size) rather than byte-identical — a byte comparison never matches, because the eye-scan
+        // cfgs ship a speed-patched copy, and the identity would silently never be read.
+        let profile = DetectProfiles.forPID(device.productID)
+        var otpBin: Data?
+        if let profile, profile.otpCpuidByteOffset != nil,
+           let detectPlan = try? CfgBinaryParser().parse(url: root.appendingPathComponent(soc)
+               .appendingPathComponent(profile.detectCfgName)),
+           let detectBoot = detectPlan.payload(named: "Boot"), detectBoot.count == p.dtt.count {
+            otpBin = detectPlan.payload(named: "otpdump")
+        }
+        CLIOut.log("  chip identity  : " + (otpBin == nil
+            ? "not read (no otpdump payload for this SoC, or its eye-scan loader is a different build)"
+            : "otpdump from the detect cfg"))
+
         let start = Date()
         let box = ProgressBox()
         let outcome = try await EyescanRunner().run(
             transport: transport, device: device,
             ddrBin: p.trainOnly, ddrTestTool: p.dtt, itemBin: p.item,
             itemBase: p.itemBase, timeout: args.eyescanTimeout, rebootBin: p.reboot,
+            otpBin: otpBin, otpCpuidByteOffset: profile?.otpCpuidByteOffset,
             onProgress: { chunk in box.note(chunk, since: start) })
         try? transport.close()
 
@@ -453,7 +474,10 @@ struct RockchipDDRTestUtilityCLI {
         if args.json {
             let soc2 = DetectProfiles.forPID(device.productID)?.soc ?? soc
             CLIOut.result(CLIResult(soc: soc2, pid: "0x" + hex16(device.productID),
-                                    device: device.productName, detect: nil, solder: nil,
+                                    device: device.productName,
+                                    cpuid: outcome.cpuid.map(ChipIdentity.hex),
+                                    serial: outcome.cpuid.flatMap(ChipIdentity.serial(fromCpuid:)),
+                                    detect: nil, solder: nil,
                                     eyescan: EyescanJSON(go: pass, bytes: transcript.utf8.count, transcript: transcript),
                                     // Was nil before; the runner now knows. az0x-validator reads only
                                     // eyescan.{go,transcript} + elapsedMs + the exit code, so filling
@@ -507,7 +531,8 @@ struct RockchipDDRTestUtilityCLI {
             ?? root.appendingPathComponent(socName)
 
         let detector = DdrDetector(resourcesDir: resourcesDir)
-        let out = try await detector.detect(transport: transport, device: device, socFiles: socFiles)
+        let out = try await detector.detect(transport: transport, device: device, socFiles: socFiles,
+                                            readIdentity: true)
 
         CLIOut.log("\n=== OS_REG (raw) ===")
         for (i, w) in out.rawOsReg.enumerated() {
@@ -541,6 +566,8 @@ struct RockchipDDRTestUtilityCLI {
             let matched = CfgAutoSelect.firstAvailable(out.candidates, in: socFiles)
             CLIOut.result(CLIResult(soc: socName, pid: "0x" + hex16(device.productID),
                                     device: device.productName,
+                                    cpuid: out.cpuid.map(ChipIdentity.hex),
+                                    serial: out.cpuid.flatMap(ChipIdentity.serial(fromCpuid:)),
                                     detect: DetectJSON.from(out, cfg: matched?.displayName),
                                     solder: nil, eyescan: nil,
                                     rebootedToMaskrom: out.rebootedToMaskrom,
@@ -569,7 +596,7 @@ struct RockchipDDRTestUtilityCLI {
         //    transport open. Steps unchanged; only the ④ reboot is skipped.
         let detector = DdrDetector(resourcesDir: resourcesDir)
         let out = try await detector.detect(transport: transport, device: device,
-                                            socFiles: socFiles, reboot: false)
+                                            socFiles: socFiles, reboot: false, readIdentity: true)
         CLIOut.log("\n=== Detected: \(out.geometry.summary()) ===")
         guard let matched = CfgAutoSelect.firstAvailable(out.candidates, in: socFiles) else {
             CLIOut.summary("No exact-match cfg — cannot run test. Candidates: \(out.candidates.count)")
@@ -577,6 +604,8 @@ struct RockchipDDRTestUtilityCLI {
             if args.json {
                 CLIOut.result(CLIResult(soc: socName, pid: "0x" + hex16(device.productID),
                                         device: device.productName,
+                                        cpuid: out.cpuid.map(ChipIdentity.hex),
+                                        serial: out.cpuid.flatMap(ChipIdentity.serial(fromCpuid:)),
                                         detect: DetectJSON.from(out, cfg: nil),
                                         solder: nil, eyescan: nil, rebootedToMaskrom: nil,
                                         ok: false, error: "detect-no-unique-cfg", elapsedMs: 0))
@@ -609,6 +638,8 @@ struct RockchipDDRTestUtilityCLI {
         if args.json {
             CLIOut.result(CLIResult(soc: socName, pid: "0x" + hex16(device.productID),
                                     device: device.productName,
+                                    cpuid: out.cpuid.map(ChipIdentity.hex),
+                                    serial: out.cpuid.flatMap(ChipIdentity.serial(fromCpuid:)),
                                     detect: DetectJSON.from(out, cfg: matched.displayName),
                                     solder: SolderJSON(pass: solderPass, outcome: result.outcome.rawValue,
                                                        state: result.state.rawValue, cfg: matched.displayName,
