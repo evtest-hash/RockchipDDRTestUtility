@@ -367,7 +367,7 @@ final class MainViewModel: ObservableObject {
             let transport = try makeTransport()
             // async 回调:EyescanRunner 会 `await` 它跑完再读下一段,所以逐段
             // 严格有序(不再用 fire-and-forget 的 Task,那会乱序)。
-            let transcript = try await EyescanRunner().run(
+            let outcome = try await EyescanRunner().run(
                 transport: transport, device: device,
                 ddrBin: payloads.trainOnly, ddrTestTool: payloads.dtt, itemBin: payloads.item,
                 itemBase: payloads.itemBase,
@@ -376,6 +376,7 @@ final class MainViewModel: ObservableObject {
                 onProgress: { [weak self] chunk in
                     await self?.appendEyescanLines(chunk)
                 })
+            let transcript = outcome.transcript
             try? transport.close()
             flushEyescanLineCarry()   // 冲掉最后一行不带换行的残余
 
@@ -387,10 +388,25 @@ final class MainViewModel: ObservableObject {
                 appendEyescanText("判定:\(v.resultLine ?? "all result: (缺失)")\n")
                 statusMessage = v.pass ? "眼图完成:PASS(所有 DQ 裕量达标)"
                                        : "眼图完成:FAIL(存在裕量不足的 DQ)"
-            } else {
-                // overallOutcome 已在开头置 nil,未完成不下 pass/fail 结论,保持 nil。
+                // 跑完了但板子没真正复位 → 下一轮的 0x471 下载会失败,先提示。
+                if outcome.returnedToMaskrom == false {
+                    appendEyescanText("注意:设备未复位回 Maskrom,下次开始前请重新插拔\n")
+                }
+            } else if outcome.wedged {
+                // 设备长时间无输出 = item 没跑完就停了。此时设备整体不再响应,连 reboot item
+                // 也跑不了 —— 唯一的恢复手段是物理重新插拔。overallOutcome 保持 nil,不下结论。
                 setStepState(Self.eyescanStepName, .failed)
-                appendEyescanText("扫描未出现完成标记(all dq eye scan done)—— 可能超时或设备异常\n")
+                appendEyescanText("扫描超时且设备已停止输出 —— 板子已卡死,请重新插拔后再试\n")
+                statusMessage = "眼图未完成:设备卡死,需重新插拔"
+            } else if !outcome.completedViaStatus {
+                // 超时但数据一直在流 = 设备正常,只是比超时慢。板子没坏。
+                setStepState(Self.eyescanStepName, .failed)
+                appendEyescanText("扫描超时,但设备仍在持续输出 —— 板子正常,是耗时超过了上限\n")
+                statusMessage = "眼图未完成:超时(设备正常)"
+            } else {
+                // 设备报了完成,但输出里没有完成标记 → 扫描本身异常,不是链路卡死。
+                setStepState(Self.eyescanStepName, .failed)
+                appendEyescanText("设备已上报完成,但输出缺少完成标记(all dq eye scan done)\n")
                 statusMessage = "眼图未完成,请检查设备"
             }
         } catch {

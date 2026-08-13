@@ -24,22 +24,45 @@ final class EyescanDecouplingTests: XCTestCase {
         let device: UsbDevice
         let chunk: String
         let totalChunks: Int
+        /// When false, `testDeviceReady` reports `.running` forever — the wedged board:
+        /// the item never returns, so the device never signals done.
+        let everFinishes: Bool
+        /// Successive `discoverDevices` answers once the reboot item has been RUN. Simulates the
+        /// board dropping off the bus and coming back. Empty ⇒ the device never disappears.
+        let afterRebootEnumerations: [[UsbDevice]]
         private(set) var readTimestamps: [Date] = []
+        private(set) var itemsDownloaded: [String] = []
+        private(set) var itemsRun: [String] = []
         private var produced = 0
         private var opened = false
+        private var rebootRan = false
+        private var enumIndex = 0
         var isOpen: Bool { opened }
 
-        init(device: UsbDevice, chunk: String, totalChunks: Int) {
+        init(device: UsbDevice, chunk: String, totalChunks: Int,
+             everFinishes: Bool = true, afterRebootEnumerations: [[UsbDevice]] = []) {
             self.device = device; self.chunk = chunk; self.totalChunks = totalChunks
+            self.everFinishes = everFinishes; self.afterRebootEnumerations = afterRebootEnumerations
         }
-        func discoverDevices() throws -> [UsbDevice] { [device] }
+        func discoverDevices() throws -> [UsbDevice] {
+            guard rebootRan, !afterRebootEnumerations.isEmpty else { return [device] }
+            let list = afterRebootEnumerations[min(enumIndex, afterRebootEnumerations.count - 1)]
+            enumIndex += 1
+            return list
+        }
         func open(device: UsbDevice) throws { opened = true }
         func downloadBoot(item: CfgItem, payload: Data, lenientFinalChunk: Bool) throws {}
-        func downloadItem(item: CfgItem, payload: Data, address: UInt32) throws {}
+        func downloadItem(item: CfgItem, payload: Data, address: UInt32) throws {
+            itemsDownloaded.append(item.name)
+        }
         func downloadParam(item: CfgItem, address: UInt32?, params: [CfgParameter]) throws {}
-        func runItem(item: CfgItem, address: UInt32) throws {}
+        func runItem(item: CfgItem, address: UInt32) throws {
+            itemsRun.append(item.name)
+            if item.name == "reboot" { rebootRan = true }
+        }
         func testDeviceReady() throws -> DeviceReadyStatus {
-            DeviceReadyStatus(phase: produced >= totalChunks ? .finished : .running, resultCode: 0)
+            DeviceReadyStatus(phase: (everFinishes && produced >= totalChunks) ? .finished : .running,
+                              resultCode: 0)
         }
         func readPrintf() throws -> String? { try readPrintf(acknowledge: true) }
         func readPrintf(acknowledge: Bool) throws -> String? {
@@ -51,19 +74,25 @@ final class EyescanDecouplingTests: XCTestCase {
         func close() throws { opened = false }
     }
 
-    private func runScan(chunks: Int, uiDelayMs: UInt64, timeout: TimeInterval = 60)
-        async throws -> (transcript: String, delivered: Int, mock: StreamingMockTransport) {
-        let mock = StreamingMockTransport(device: Self.dev, chunk: Self.chunk, totalChunks: chunks)
+    private func runScan(chunks: Int, uiDelayMs: UInt64, timeout: TimeInterval = 60,
+                         rebootBin: Data? = nil, everFinishes: Bool = true,
+                         afterRebootEnumerations: [[UsbDevice]] = [],
+                         stallSilence: TimeInterval = 5)
+        async throws -> (outcome: EyescanRunner.Outcome, delivered: Int, mock: StreamingMockTransport) {
+        let mock = StreamingMockTransport(device: Self.dev, chunk: Self.chunk, totalChunks: chunks,
+                                          everFinishes: everFinishes,
+                                          afterRebootEnumerations: afterRebootEnumerations)
         let counter = Counter()
         let onProgress: @Sendable (String) async -> Void = { _ in
             if uiDelayMs > 0 { try? await Task.sleep(nanoseconds: uiDelayMs * 1_000_000) }
             await counter.inc()
         }
-        let transcript = try await EyescanRunner().run(
+        let outcome = try await EyescanRunner().run(
             transport: mock, device: Self.dev,
             ddrBin: Data(), ddrTestTool: Data([0]), itemBin: Data(count: 16),
-            itemBase: 0xFF00_4000, timeout: timeout, rebootBin: nil, onProgress: onProgress)
-        return (transcript, await counter.value, mock)
+            itemBase: 0xFF00_4000, timeout: timeout, rebootBin: rebootBin,
+            stallSilence: stallSilence, onProgress: onProgress)
+        return (outcome, await counter.value, mock)
     }
 
     /// A slow UI must NOT slow the USB drain: the drain reads every chunk in a tight window even
@@ -71,7 +100,8 @@ final class EyescanDecouplingTests: XCTestCase {
     func testSlowUIDoesNotStallDrain() async throws {
         let n = 500
         let uiDelayMs: UInt64 = 10        // coupled ⇒ drain would take 500×10ms = 5s
-        let (transcript, delivered, mock) = try await runScan(chunks: n, uiDelayMs: uiDelayMs)
+        let (outcome, delivered, mock) = try await runScan(chunks: n, uiDelayMs: uiDelayMs)
+        let transcript = outcome.transcript
 
         // Data integrity: the transcript captured EVERY produced byte, in order.
         XCTAssertEqual(transcript.utf8.count, n * Self.chunkBytes)
@@ -91,10 +121,10 @@ final class EyescanDecouplingTests: XCTestCase {
     /// its oldest queued chunks — but the transcript (verdict/save data) stays complete.
     func testUIOverloadDropsDisplayNeverData() async throws {
         let n = 6000                       // > the 2048 bounded hand-off buffer
-        let (transcript, delivered, mock) = try await runScan(chunks: n, uiDelayMs: 1)
+        let (outcome, delivered, mock) = try await runScan(chunks: n, uiDelayMs: 1)
 
         XCTAssertEqual(mock.readTimestamps.count, n)
-        XCTAssertEqual(transcript.utf8.count, n * Self.chunkBytes, "data must be COMPLETE regardless of UI")
+        XCTAssertEqual(outcome.transcript.utf8.count, n * Self.chunkBytes, "data must be COMPLETE regardless of UI")
         XCTAssertGreaterThan(delivered, 0)
         XCTAssertLessThan(delivered, n, "an overloaded display must drop chunks (bounded buffer), not the data")
     }
@@ -102,8 +132,61 @@ final class EyescanDecouplingTests: XCTestCase {
     /// Fast UI, large scan: everything is delivered and captured (no spurious drops when UI keeps up).
     func testFastUIDeliversEverything() async throws {
         let n = 1500
-        let (transcript, delivered, _) = try await runScan(chunks: n, uiDelayMs: 0)
-        XCTAssertEqual(transcript.utf8.count, n * Self.chunkBytes)
+        let (outcome, delivered, _) = try await runScan(chunks: n, uiDelayMs: 0)
+        XCTAssertEqual(outcome.transcript.utf8.count, n * Self.chunkBytes)
         XCTAssertEqual(delivered, n)
+    }
+
+    // MARK: - Auto-return to maskrom
+
+    /// A WEDGED board must not be sent the reboot item: it needs the same device-side runner the
+    /// eye-scan item was using, so a device that never came back from that item cannot run it
+    /// either, and every attempted transfer only burns a full USB timeout. The run must report the
+    /// board as needing a replug.
+    func testWedgedRunSkipsRebootAndReportsReplug() async throws {
+        // The device goes silent immediately and never reports done ⇒ the item stopped.
+        let (outcome, _, mock) = try await runScan(chunks: 3, uiDelayMs: 0, timeout: 0.6,
+                                                   rebootBin: Data([0xAA]), everFinishes: false,
+                                                   stallSilence: 0.2)
+        XCTAssertFalse(outcome.completedViaStatus)
+        XCTAssertTrue(outcome.wedged, "silent device at the deadline ⇒ wedged")
+        XCTAssertEqual(outcome.returnedToMaskrom, false)
+        XCTAssertFalse(mock.itemsDownloaded.contains("reboot"), "must not download a reboot core 1 cannot run")
+        XCTAssertFalse(mock.itemsRun.contains("reboot"))
+    }
+
+    /// HW-observed on RK3576: a stress item streaming steadily at ~1 KB/s simply outlasts the
+    /// timeout, with data still arriving as it fires. That board is HEALTHY — it must not be
+    /// called wedged, and the reboot must still be sent.
+    func testSlowButLiveItemIsNotWedgedAndStillReboots() async throws {
+        let (outcome, _, mock) = try await runScan(chunks: 100_000, uiDelayMs: 0, timeout: 0.6,
+                                                   rebootBin: Data([0xAA]), everFinishes: false,
+                                                   afterRebootEnumerations: [[], [Self.dev]],
+                                                   stallSilence: 5)
+        XCTAssertFalse(outcome.completedViaStatus, "deadline hit before the item finished")
+        XCTAssertFalse(outcome.wedged, "data was still flowing ⇒ NOT wedged")
+        XCTAssertTrue(mock.itemsRun.contains("reboot"), "a live board must still be rebooted")
+        XCTAssertEqual(outcome.returnedToMaskrom, true)
+    }
+
+    /// A completed run sends the reboot and confirms the board actually reset: the pre-reboot
+    /// identity disappears from the bus and the PID comes back.
+    func testCompletedRunRebootsAndConfirmsReset() async throws {
+        let (outcome, _, mock) = try await runScan(chunks: 3, uiDelayMs: 0, rebootBin: Data([0xAA]),
+                                                   afterRebootEnumerations: [[], [Self.dev]])
+        XCTAssertTrue(outcome.completedViaStatus)
+        XCTAssertTrue(mock.itemsRun.contains("reboot"))
+        XCTAssertEqual(outcome.returnedToMaskrom, true, "device dropped then re-enumerated ⇒ reset fired")
+    }
+
+    /// The board answering "done" but never leaving the bus means the reset never fired — the next
+    /// run's 0x471 download would fail, so the run must say so rather than report success.
+    func testCompletedRunDetectsBoardThatNeverReset() async throws {
+        let (outcome, _, mock) = try await runScan(chunks: 3, uiDelayMs: 0, timeout: 20,
+                                                   rebootBin: Data([0xAA]),
+                                                   afterRebootEnumerations: [[Self.dev]])
+        XCTAssertTrue(outcome.completedViaStatus)
+        XCTAssertTrue(mock.itemsRun.contains("reboot"))
+        XCTAssertEqual(outcome.returnedToMaskrom, false, "never dropped ⇒ the reboot item did not execute")
     }
 }

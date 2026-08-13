@@ -12,13 +12,9 @@ DerivedData/
 # standalone CLI distribution tarball (produced by scripts/package.sh, shipped via release)
 RockchipDDRTestUtilityCLI-macos.tar.gz
 
-# DDR auto-detect build tooling — dev-only; the shipped payload is the
-# generated DDRTestFiles/<soc>/DDR自动探测.cfg, not these intermediates.
-/tools/ddr-autodetect/
-
-# Eye-scan RE + build tooling — dev-only; contains extracted proprietary
-# blobs (DDR Test Tool) and analysis artifacts, nothing shipped.
-/tools/ddr-eyescan/
+# Local dev tooling. Not part of the product; only the generated
+# DDRTestFiles/<soc>/*.cfg are tracked.
+/tools/
 
 # Local design docs / specs / plans — dev-only, not shipped
 /docs/

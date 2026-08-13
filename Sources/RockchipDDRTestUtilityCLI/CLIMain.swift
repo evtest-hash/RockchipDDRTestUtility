@@ -430,24 +430,35 @@ struct RockchipDDRTestUtilityCLI {
 
         let start = Date()
         let box = ProgressBox()
-        let transcript = try await EyescanRunner().run(
+        let outcome = try await EyescanRunner().run(
             transport: transport, device: device,
             ddrBin: p.trainOnly, ddrTestTool: p.dtt, itemBin: p.item,
             itemBase: p.itemBase, timeout: args.eyescanTimeout, rebootBin: p.reboot,
             onProgress: { chunk in box.note(chunk, since: start) })
         try? transport.close()
 
+        let transcript = outcome.transcript
         let pass = eyescanGo(transcript)
         CLIOut.summary("\n=== EYE-SCAN SUMMARY ===")
         CLIOut.summary("  bytes captured : \(transcript.utf8.count)")
         CLIOut.summary("  verdict        : \(pass ? "PASS — all DQ eye margins pass" : "FAIL — a DQ eye failed or the scan did not complete")  (done + all result: pass)")
+        if outcome.wedged {
+            CLIOut.summary("  device         : WEDGED — stopped responding; PHYSICALLY REPLUG the board before the next run")
+        } else if !outcome.completedViaStatus {
+            CLIOut.summary("  device         : still streaming at the deadline — raise --eye-timeout, the board is fine")
+        } else if outcome.returnedToMaskrom == false {
+            CLIOut.summary("  device         : did NOT reset — replug before the next run")
+        }
 
         if args.json {
             let soc2 = DetectProfiles.forPID(device.productID)?.soc ?? soc
             CLIOut.result(CLIResult(soc: soc2, pid: "0x" + hex16(device.productID),
                                     device: device.productName, detect: nil, solder: nil,
                                     eyescan: EyescanJSON(go: pass, bytes: transcript.utf8.count, transcript: transcript),
-                                    rebootedToMaskrom: nil, ok: pass, error: nil,
+                                    // Was nil before; the runner now knows. az0x-validator reads only
+                                    // eyescan.{go,transcript} + elapsedMs + the exit code, so filling
+                                    // this in is additive (see the CLI contract).
+                                    rebootedToMaskrom: outcome.returnedToMaskrom, ok: pass, error: nil,
                                     elapsedMs: Int(Date().timeIntervalSince(start) * 1000)))
         }
         if !pass { Foundation.exit(2) }
