@@ -262,14 +262,20 @@ public struct UsbDevice: Identifiable, Hashable, Sendable {
     public let productName: String
     public let serialNumber: String?
     public let socName: String?
+    /// The USB address the host assigned this device. Unlike `deviceID` — which is
+    /// deliberately stable across re-enumeration so a board can be addressed by the
+    /// socket it is plugged into — this CHANGES every time the device re-enumerates,
+    /// which is what makes it the signal for "did the board actually reset".
+    public let usbAddress: UInt8
 
-    public init(deviceID: String, vendorID: UInt16, productID: UInt16, productName: String, serialNumber: String?, socName: String? = nil) {
+    public init(deviceID: String, vendorID: UInt16, productID: UInt16, productName: String, serialNumber: String?, socName: String? = nil, usbAddress: UInt8 = 0) {
         self.deviceID = deviceID
         self.vendorID = vendorID
         self.productID = productID
         self.productName = productName
         self.serialNumber = serialNumber
         self.socName = socName
+        self.usbAddress = usbAddress
     }
 }
 

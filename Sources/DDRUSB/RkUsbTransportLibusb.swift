@@ -113,6 +113,14 @@ public final class RkUsbTransportLibusb: UsbTransport {
         try? close()
     }
 
+    /// Hub port chain from the root, "1.4", stable for as long as the cable stays put.
+    private static func portChain(_ dev: OpaquePointer?) -> String {
+        var ports = [UInt8](repeating: 0, count: 8)
+        let n = libusb_get_port_numbers(dev, &ports, Int32(ports.count))
+        guard n > 0 else { return "0" }
+        return ports.prefix(Int(n)).map(String.init).joined(separator: ".")
+    }
+
     public func discoverDevices() throws -> [UsbDevice] {
         let list = try enumerateDevices()
         defer {
@@ -151,10 +159,14 @@ public final class RkUsbTransportLibusb: UsbTransport {
                 }
             }
 
+            // Second field is the physical port chain, NOT the USB address: the
+            // address is reassigned on every re-enumeration and is recycled
+            // between devices, so it cannot address one board among several of
+            // the same model. The port chain is a property of the socket.
             let deviceID = String(
-                format: "%03u-%03u-%04X-%04X-%@",
+                format: "%03u-%@-%04X-%04X-%@",
                 bus,
-                addr,
+                Self.portChain(dev),
                 descriptor.idVendor,
                 descriptor.idProduct,
                 serialNumber ?? "NA"
@@ -166,7 +178,8 @@ public final class RkUsbTransportLibusb: UsbTransport {
                     productID: descriptor.idProduct,
                     productName: productName,
                     serialNumber: serialNumber,
-                    socName: socName
+                    socName: socName,
+                    usbAddress: addr
                 )
             )
         }
@@ -196,11 +209,10 @@ public final class RkUsbTransportLibusb: UsbTransport {
             }
 
             let bus = libusb_get_bus_number(dev)
-            let addr = libusb_get_device_address(dev)
             let candidate = String(
-                format: "%03u-%03u-%04X-%04X-",
+                format: "%03u-%@-%04X-%04X-",
                 bus,
-                addr,
+                Self.portChain(dev),
                 descriptor.idVendor,
                 descriptor.idProduct
             )
@@ -215,11 +227,8 @@ public final class RkUsbTransportLibusb: UsbTransport {
             }
         }
 
-        if selected == nil {
-            selected = libusb_open_device_with_vid_pid(
-                try LibusbSharedContext.acquire(), device.vendorID, device.productID)
-        }
-
+        // No fallback to "first device with this VID/PID": with several boards of
+        // one model attached that silently opens an arbitrary one.
         guard let selected else {
             throw DDRToolError.transportError("Failed to open USB device \(device.deviceID)")
         }
