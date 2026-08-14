@@ -27,8 +27,27 @@ public struct DetectProfile: Sendable {
     public let maskromMagic: UInt32   // reboot-to-maskrom: magic written to bootModeReg
     public let cruResetReg: UInt32    // CRU global soft-reset register
     public let cruResetValue: UInt32  // value that triggers the reset
-    /// U-Boot's `CFG_CPUID_OFFSET % 4`; nil means this SoC ships no otpdump payload.
-    public let otpCpuidByteOffset: Int?
+    /// Which variant (grade/package) rules this SoC follows — see `ChipVariant`.
+    /// Nil for SoCs whose variants we do not decode.
+    public let family: ChipFamily?
+    /// What the cfg's "otpdump" payload reads back. Nil means this SoC ships no
+    /// such payload.
+    public let idProbe: IdProbe?
+}
+
+/// The OTP dump payload packaged in a detect cfg under the name "otpdump".
+public struct IdProbe: Sendable, Equatable {
+    /// The OTP byte offset the payload's first word came from BEFORE probes started
+    /// stating it themselves (see `ChipIdentity.parseOtpDump`). Keeps a stale cfg
+    /// reporting a correct CPUID instead of a wrong one.
+    public let legacyBaseByte: Int
+    /// U-Boot's `CFG_CPUID_OFFSET`.
+    public let cpuidOffset: Int
+
+    public init(legacyBaseByte: Int, cpuidOffset: Int) {
+        self.legacyBaseByte = legacyBaseByte
+        self.cpuidOffset = cpuidOffset
+    }
 }
 
 public enum DetectProfiles {
@@ -48,7 +67,8 @@ public enum DetectProfiles {
             maskromMagic: 0xEF08_A53C,
             cruResetReg: 0xFDD2_00D4,
             cruResetValue: 0x0000_FDB9,
-            otpCpuidByteOffset: 0),
+            family: .rk356x,
+            idProbe: IdProbe(legacyBaseByte: 0x0A, cpuidOffset: 0x0A)),
         // RK3588 — addresses confirmed against U-Boot + RE of the rkbin DDR bin:
         //   item base 0xFF004000 (cfg @0x5B6); Boot links 0xFF001000 → puts vector +4.
         //   PMU1_GRF_BASE 0xFD58A000, os_reg0 @+0x200 → 0xFD58A200 (DDR bin STRs the
@@ -65,7 +85,8 @@ public enum DetectProfiles {
             maskromMagic: 0xEF08_A53C,
             cruResetReg: 0xFD7C_0C08,
             cruResetValue: 0x0000_FDB9,
-            otpCpuidByteOffset: 3),
+            family: .rk3588,
+            idProbe: IdProbe(legacyBaseByte: 0x04, cpuidOffset: 0x07)),
         // RK3576 — same AArch64 DDR Test Tool Boot as RK356x/RK3588. Addresses:
         //   item base 0xFF... no — cfg @0x5B6 = 0x3FF84000; Boot links 0x3FF81000
         //   → puts vector +4. PMU1_GRF_BASE 0x26026000, os_reg0 @+0x200 → 0x26026200
@@ -83,7 +104,8 @@ public enum DetectProfiles {
             maskromMagic: 0xEF08_A53C,
             cruResetReg: 0x2720_0C08,
             cruResetValue: 0x0000_FDB9,
-            otpCpuidByteOffset: 2),
+            family: .rk3576,
+            idProbe: IdProbe(legacyBaseByte: 0x08, cpuidOffset: 0x0A)),
         // RK3288 (arm32 / SYS_REG **V1**). All addresses confirmed against U-Boot
         // (mixtile rk3288 tree) + RE of the ForceInit item:
         //   Boot links 0xFFFF0000; item base 0xFFFF1500; USB puts service 0xFFFF0020
@@ -109,7 +131,8 @@ public enum DetectProfiles {
             maskromMagic: 0xEF08_A53C,
             cruResetReg: 0xFF76_01B0,   // glb_srst_fst (clean restart; flag survives)
             cruResetValue: 0x0000_FDB9,
-            otpCpuidByteOffset: nil),
+            family: nil,        // RK3288 变体(RK3288W)不做识别
+            idProbe: nil),
     ]
     public static func forPID(_ pid: UInt16) -> DetectProfile? { all[pid] }
 }

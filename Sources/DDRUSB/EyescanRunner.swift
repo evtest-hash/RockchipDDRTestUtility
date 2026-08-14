@@ -49,6 +49,9 @@ public actor EyescanRunner {
         /// Raw CPUID read from OTP after the scan, or nil when this SoC ships no otpdump payload,
         /// its eye-scan loader is a different build, or the read did not complete. Never fatal.
         public let cpuid: [UInt8]?
+        /// Model variant decoded from the same capture (RK3588S2, RK3566PRO, …); nil when the
+        /// probe read no variant field or the fields don't justify a conclusion.
+        public let variant: ChipVariant?
         /// true — the reset was OBSERVED (the board left the bus, or came back on the
         ///        same socket under a new USB address).
         /// nil  — not attempted, or attempted and not observable. NOT the same as "it
@@ -79,7 +82,8 @@ public actor EyescanRunner {
                     /// The detect cfg's otpdump probe, when this SoC's eye-scan loader is the same
                     /// build the probe expects. Absent ⇒ no identity is read, flow unchanged.
                     otpBin: Data? = nil,
-                    otpCpuidByteOffset: Int? = nil,
+                    idProbe: IdProbe? = nil,
+                    family: ChipFamily? = nil,
                     // How long the device must have been silent at the deadline before we call the
                     // board wedged rather than merely slow. Injectable so tests need not sleep.
                     stallSilence: TimeInterval = 5,
@@ -288,7 +292,8 @@ public actor EyescanRunner {
         // completion before returning — issuing the next download while the loader is still running
         // the previous item stops it servicing commands at all.
         var cpuid: [UInt8]? = nil
-        if let otpBin, let otpCpuidByteOffset {
+        var variant: ChipVariant? = nil
+        if let otpBin, let idProbe {
             do {
                 let od = CfgItem(name: "otpdump", pathHint: nil, nameOffset: 0,
                                  payloadOffset: 0, payloadLength: otpBin.count)
@@ -299,8 +304,11 @@ public actor EyescanRunner {
                 var returned = false
                 while Date() < otpDeadline {
                     if let s = try? transport.readPrintf(), !s.isEmpty { captured += "\n" + s }
-                    if cpuid == nil {
-                        cpuid = ChipIdentity.parseOtpProbeOutput(captured, cpuidByteOffset: otpCpuidByteOffset)
+                    if let dump = ChipIdentity.parseOtpDump(captured,
+                                                            fallbackBaseByte: idProbe.legacyBaseByte) {
+                        if let family { variant = ChipVariant.resolve(family: family, dump: dump) }
+                        cpuid = cpuid ?? dump.slice(at: idProbe.cpuidOffset,
+                                                    count: ChipIdentity.cpuidLength)
                     }
                     if let st = try? transport.testDeviceReady(), st.phase == .finished {
                         returned = true
@@ -373,6 +381,7 @@ public actor EyescanRunner {
                        completedViaStatus: completedViaStatus,
                        wedged: wedged,
                        cpuid: cpuid,
+                       variant: variant,
                        returnedToMaskrom: returnedToMaskrom)
     }
 

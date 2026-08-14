@@ -201,6 +201,13 @@ struct CLIResult: Encodable {
     /// Chip identity from OTP. Present whenever the mode read it and the SoC supports it.
     var cpuid: String? = nil
     var serial: String? = nil
+    /// Model variant within the family (RK3588S2, RK3566PRO, RK3288W …), and the raw
+    /// OTP fields it was decoded from. Absent when the probe read no variant field.
+    var chipVariant: String? = nil
+    var cpuCode: String? = nil
+    var otpSpec: String? = nil
+    var otpPackage: String? = nil
+    var otpTestVersion: String? = nil
     var detect: DetectJSON?
     var solder: SolderJSON?
     var eyescan: EyescanJSON?
@@ -208,6 +215,19 @@ struct CLIResult: Encodable {
     var ok: Bool
     var error: String?
     var elapsedMs: Int
+}
+
+extension CLIResult {
+    /// Fill in the variant columns from a decoded ChipVariant. Purely additive:
+    /// az0x-validator's contract reads none of these fields.
+    mutating func fill(variant: ChipVariant?) {
+        guard let variant else { return }
+        chipVariant = variant.name
+        cpuCode = variant.cpuCode.map { String(format: "0x%04x", $0) }
+        otpSpec = variant.spec.map { String(format: "0x%02x", $0) }
+        otpPackage = variant.package.map { String(format: "0x%x", $0) }
+        otpTestVersion = variant.testVersion.map { String(format: "0x%x", $0) }
+    }
 }
 
 func tierString(_ t: CfgAutoSelect.MatchTier) -> String {
@@ -438,7 +458,7 @@ struct RockchipDDRTestUtilityCLI {
         // cfgs ship a speed-patched copy, and the identity would silently never be read.
         let profile = DetectProfiles.forPID(device.productID)
         var otpBin: Data?
-        if let profile, profile.otpCpuidByteOffset != nil,
+        if let profile, profile.idProbe != nil,
            let detectPlan = try? CfgBinaryParser().parse(url: root.appendingPathComponent(soc)
                .appendingPathComponent(profile.detectCfgName)),
            let detectBoot = detectPlan.payload(named: "Boot"), detectBoot.count == p.dtt.count {
@@ -454,7 +474,7 @@ struct RockchipDDRTestUtilityCLI {
             transport: transport, device: device,
             ddrBin: p.trainOnly, ddrTestTool: p.dtt, itemBin: p.item,
             itemBase: p.itemBase, timeout: args.eyescanTimeout, rebootBin: p.reboot,
-            otpBin: otpBin, otpCpuidByteOffset: profile?.otpCpuidByteOffset,
+            otpBin: otpBin, idProbe: profile?.idProbe, family: profile?.family,
             onProgress: { chunk in box.note(chunk, since: start) })
         try? transport.close()
 
@@ -473,7 +493,7 @@ struct RockchipDDRTestUtilityCLI {
 
         if args.json {
             let soc2 = DetectProfiles.forPID(device.productID)?.soc ?? soc
-            CLIOut.result(CLIResult(soc: soc2, pid: "0x" + hex16(device.productID),
+            var out = CLIResult(soc: soc2, pid: "0x" + hex16(device.productID),
                                     device: device.productName,
                                     cpuid: outcome.cpuid.map(ChipIdentity.hex),
                                     serial: outcome.cpuid.flatMap(ChipIdentity.serial(fromCpuid:)),
@@ -482,8 +502,10 @@ struct RockchipDDRTestUtilityCLI {
                                     // Was nil before; the runner now knows. az0x-validator reads only
                                     // eyescan.{go,transcript} + elapsedMs + the exit code, so filling
                                     // this in is additive (see the CLI contract).
-                                    rebootedToMaskrom: outcome.returnedToMaskrom, ok: pass, error: nil,
-                                    elapsedMs: Int(Date().timeIntervalSince(start) * 1000)))
+                                rebootedToMaskrom: outcome.returnedToMaskrom, ok: pass, error: nil,
+                                elapsedMs: Int(Date().timeIntervalSince(start) * 1000))
+            out.fill(variant: outcome.variant)
+            CLIOut.result(out)
         }
         if !pass { Foundation.exit(2) }
     }
@@ -564,15 +586,17 @@ struct RockchipDDRTestUtilityCLI {
 
         if args.json {
             let matched = CfgAutoSelect.firstAvailable(out.candidates, in: socFiles)
-            CLIOut.result(CLIResult(soc: socName, pid: "0x" + hex16(device.productID),
-                                    device: device.productName,
-                                    cpuid: out.cpuid.map(ChipIdentity.hex),
-                                    serial: out.cpuid.flatMap(ChipIdentity.serial(fromCpuid:)),
-                                    detect: DetectJSON.from(out, cfg: matched?.displayName),
-                                    solder: nil, eyescan: nil,
-                                    rebootedToMaskrom: out.rebootedToMaskrom,
-                                    ok: matched != nil, error: nil,
-                                    elapsedMs: Int(Date().timeIntervalSince(start) * 1000)))
+            var json = CLIResult(soc: socName, pid: "0x" + hex16(device.productID),
+                                 device: device.productName,
+                                 cpuid: out.cpuid.map(ChipIdentity.hex),
+                                 serial: out.cpuid.flatMap(ChipIdentity.serial(fromCpuid:)),
+                                 detect: DetectJSON.from(out, cfg: matched?.displayName),
+                                 solder: nil, eyescan: nil,
+                                 rebootedToMaskrom: out.rebootedToMaskrom,
+                                 ok: matched != nil, error: nil,
+                                 elapsedMs: Int(Date().timeIntervalSince(start) * 1000))
+            json.fill(variant: out.variant)
+            CLIOut.result(json)
         }
     }
 
@@ -602,13 +626,15 @@ struct RockchipDDRTestUtilityCLI {
             CLIOut.summary("No exact-match cfg — cannot run test. Candidates: \(out.candidates.count)")
             try? transport.close()
             if args.json {
-                CLIOut.result(CLIResult(soc: socName, pid: "0x" + hex16(device.productID),
-                                        device: device.productName,
-                                        cpuid: out.cpuid.map(ChipIdentity.hex),
-                                        serial: out.cpuid.flatMap(ChipIdentity.serial(fromCpuid:)),
-                                        detect: DetectJSON.from(out, cfg: nil),
-                                        solder: nil, eyescan: nil, rebootedToMaskrom: nil,
-                                        ok: false, error: "detect-no-unique-cfg", elapsedMs: 0))
+                var json = CLIResult(soc: socName, pid: "0x" + hex16(device.productID),
+                                     device: device.productName,
+                                     cpuid: out.cpuid.map(ChipIdentity.hex),
+                                     serial: out.cpuid.flatMap(ChipIdentity.serial(fromCpuid:)),
+                                     detect: DetectJSON.from(out, cfg: nil),
+                                     solder: nil, eyescan: nil, rebootedToMaskrom: nil,
+                                     ok: false, error: "detect-no-unique-cfg", elapsedMs: 0)
+                json.fill(variant: out.variant)
+                CLIOut.result(json)
             }
             Foundation.exit(2)
         }
@@ -636,17 +662,19 @@ struct RockchipDDRTestUtilityCLI {
 
         let solderPass = (result.outcome == .passed)
         if args.json {
-            CLIOut.result(CLIResult(soc: socName, pid: "0x" + hex16(device.productID),
-                                    device: device.productName,
-                                    cpuid: out.cpuid.map(ChipIdentity.hex),
-                                    serial: out.cpuid.flatMap(ChipIdentity.serial(fromCpuid:)),
-                                    detect: DetectJSON.from(out, cfg: matched.displayName),
+            var json = CLIResult(soc: socName, pid: "0x" + hex16(device.productID),
+                                 device: device.productName,
+                                 cpuid: out.cpuid.map(ChipIdentity.hex),
+                                 serial: out.cpuid.flatMap(ChipIdentity.serial(fromCpuid:)),
+                                 detect: DetectJSON.from(out, cfg: matched.displayName),
                                     solder: SolderJSON(pass: solderPass, outcome: result.outcome.rawValue,
                                                        state: result.state.rawValue, cfg: matched.displayName,
                                                        bootSucceeded: result.bootSucceeded,
                                                        log: ResultLogWriter().render(result: result, sourceCfgPath: matched.absolutePath)),
-                                    eyescan: nil, rebootedToMaskrom: rebooted,
-                                    ok: solderPass, error: nil, elapsedMs: 0))
+                                 eyescan: nil, rebootedToMaskrom: rebooted,
+                                 ok: solderPass, error: nil, elapsedMs: 0)
+            json.fill(variant: out.variant)
+            CLIOut.result(json)
         }
         if !solderPass { Foundation.exit(2) }
     }

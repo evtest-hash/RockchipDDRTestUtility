@@ -10,6 +10,9 @@ public struct DetectOutcome: Sendable {
     public let rebootedToMaskrom: Bool
     /// Raw CPUID from OTP; nil when unsupported or the read did not complete.
     public let cpuid: [UInt8]?
+    /// Which variant of the model this chip is (RK3588S2, RK3566PRO, RK3576J …);
+    /// nil when the identity probe did not run or read no variant field.
+    public let variant: ChipVariant?
 }
 
 public enum DetectError: Error, Sendable {
@@ -148,7 +151,9 @@ public actor DdrDetector {
         // an extra item download+run on a path the GUI drives for every soldering test, and only
         // the CLI reports the identity. Callers that do not want it pay nothing.
         var cpuid: [UInt8]? = nil
-        if readIdentity, let cpuidByteOffset = profile.otpCpuidByteOffset, let otpBin = payload("otpdump") {
+        var variant: ChipVariant? = nil
+        var otpDump: OtpDump? = nil
+        if readIdentity, let idProbe = profile.idProbe, let otpBin = payload("otpdump") {
             let otpItem = CfgItem(name: "otpdump", payloadOffset: 0, payloadLength: otpBin.count)
             do {
                 try transport.downloadItem(item: otpItem, payload: otpBin, address: base)
@@ -156,17 +161,37 @@ public actor DdrDetector {
                 var otpCaptured = ""
                 for _ in 0..<12 {
                     if let s = try? transport.readPrintf(), !s.isEmpty { otpCaptured += "\n" + s }
-                    // OTP_END terminates the probe's output, so stop as soon as it parses.
-                    if let parsed = ChipIdentity.parseOtpProbeOutput(otpCaptured, cpuidByteOffset: cpuidByteOffset) {
-                        cpuid = parsed
-                        break
+                    // Stop as soon as the capture holds everything this SoC's probe
+                    // can give; the variant is re-derived from each parse, so a
+                    // dump that is still growing never leaves a stale reading.
+                    var complete = false
+                    if let dump = ChipIdentity.parseOtpDump(otpCaptured,
+                                                            fallbackBaseByte: idProbe.legacyBaseByte) {
+                        otpDump = dump
+                        if let family = profile.family {
+                            variant = ChipVariant.resolve(family: family, dump: dump)
+                        }
+                        if let id = dump.slice(at: idProbe.cpuidOffset, count: ChipIdentity.cpuidLength) {
+                            cpuid = id
+                            complete = true
+                        }
                     }
+                    if complete { break }
                     try? await Task.sleep(nanoseconds: 40_000_000)
                 }
             } catch {
                 cpuid = nil
+                variant = nil
+                otpDump = nil
             }
-            phase("③b otpdump capture (cpuid \(cpuid == nil ? "unavailable" : "ok"))")
+            // The raw dump goes to the diagnostic line as well: every variant field is
+            // a couple of bits inside these bytes, and when a reading looks wrong the
+            // bytes are the only thing that can settle it (the decode rules come from
+            // the vendor kernel, which is not a source we can re-verify at runtime).
+            let raw = otpDump.map { "otp[0x\(String($0.baseByte, radix: 16))+]=\(ChipIdentity.hex($0.bytes))" }
+                ?? "otp=unreadable"
+            phase("③b otpdump capture (cpuid \(cpuid == nil ? "unavailable" : "ok")"
+                  + ", 型号 \(variant?.name ?? "未判定"), \(raw))")
         }
 
         // ④ reboot to maskrom, then wait for re-enumeration. Runs ONLY here,
@@ -180,7 +205,8 @@ public actor DdrDetector {
         phase(reboot ? "④ reboot + re-enum (rebooted=\(rebooted))"
                      : "④ reboot SKIPPED (unified detect→test; transport kept open)")
         return DetectOutcome(rawOsReg: words, geometry: geo, candidates: candidates,
-                             matchTier: tier, rebootedToMaskrom: rebooted, cpuid: cpuid)
+                             matchTier: tier, rebootedToMaskrom: rebooted, cpuid: cpuid,
+                             variant: variant)
     }
 
     /// Reboot a RESIDENT (post-test) device back to maskrom using the SoC's detect-cfg reboot payload,
