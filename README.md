@@ -99,6 +99,7 @@ RockchipDDRTestUtilityCLI --solder --json
 ```jsonc
 {
   "soc": "RK3568&RK3566", "pid": "0x350A", "device": "…",
+  "cpuid": "4d344e…", "serial": "587dc6a514453616", "chipVariant": "RK3566",
   "detect":  { "type": "LPDDR4", "capacityMB": 4096, "channels": 1, "csPerDie": 2,
                "sysRegVersion": 3, "geometry": [ /* per-channel rank/col/bank/row/bus/die */ ],
                "cfg": "…焊接检测.cfg", "tier": "uniqueByCoarse", "candidates": 1 },
@@ -159,6 +160,18 @@ The tool identifies a board's DRAM geometry over pure USB:
 4. Matches **exactly** on DRAM type + total capacity + per-die CS against that SoC's soldering configs; if several configs share a name, a second pass narrows them by each candidate's `forceinit` parameter geometry
 
 A config is set only on a unique match. Anything else (ambiguous / no match) stops and asks for manual selection — it never silently runs a wrong config. The whole detect payload ships as one self-contained `DDR自动探测.cfg` per SoC, excluded from the selectable test list and driven by a dedicated detector rather than the test engine.
+
+## Chip Identity & Variant
+
+`--detect` and `--solder` also read the SoC's OTP: `cpuid` / `serial` (the same values U-Boot derives) plus the chip's **variant**, which the USB PID cannot give — one PID covers RK3588/S/S2, another covers RK3566/RK3567/RK3568.
+
+| PID | Told apart |
+|-----|------------|
+| 0x350B | RK3588 · RK3588S · RK3588S2 · RK3588J · RK3588M |
+| 0x350E | RK3576 · RK3576S · RK3576J · RK3576M |
+| 0x350A | RK3566 · RK3567 · RK3568 · RK3566PRO |
+
+Decoded per the vendor kernel's own rules, each pinned by a capture from real silicon. `chipVariant` ships with the raw fields behind it (`cpuCode`, `otpSpec`, `otpPackage`, `otpTestVersion`), and is left empty rather than guessed when those fields don't establish a name. CLI only — the GUI's test path issues no extra USB item.
 
 ## Eye-Scan
 
