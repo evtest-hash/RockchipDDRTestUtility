@@ -48,6 +48,12 @@ final class DetectProfileTests: XCTestCase {
         XCTAssertEqual(p.cruResetReg, 0xFF76_01B0)   // glb_srst_fst (clean restart, flag survives)
         XCTAssertEqual(p.cruResetValue, 0x0000_FDB9)
         XCTAssertEqual(p.detectCfgName, "DDR自动探测.cfg")
+        // The eFuse probe has been self-describing since its first build, so it has
+        // NO legacy base to fall back on: a capture missing the OTP_DUMP marker must
+        // be refused, not decoded at an assumed offset. (cpuidOffset and family are
+        // asserted in DetectCfgTests' cross-SoC table, not duplicated here.)
+        XCTAssertNotNil(p.idProbe)
+        XCTAssertNil(p.idProbe?.legacyBaseByte)
     }
     func testUnsupportedPIDReturnsNil() {
         XCTAssertNil(DetectProfiles.forPID(0x350C))   // RK3562 not configured yet

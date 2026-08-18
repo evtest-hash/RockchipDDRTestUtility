@@ -81,6 +81,55 @@ final class ChipIdentityTests: XCTestCase {
         XCTAssertEqual(ChipIdentity.serial(fromCpuid: cpuid), "34376b2c031e323e")
     }
 
+    /// Captured from a real RK3288 in maskrom (2026-08-18). RK3288 has no OTP
+    /// controller: this is its 32-byte eFuse, read byte-at-a-time by
+    /// tools/ddr-autodetect/arm32/efuseprobe.S.in, CPUID at cpu_id@0x07
+    /// (rk3288.dtsi == CFG_CPUID_OFFSET 0x7). The ASCII the CPUID decodes to
+    /// ("URKV17010.000") is what makes the packing self-evidently right — the
+    /// probe packs 4 eFuse bytes per printed word, and a mis-packed dump would
+    /// scramble that string while still yielding a plausible-looking serial.
+    ///
+    /// The board was then flashed and `adb devices` reported 7f35c361c64395de —
+    /// the serial derived below, confirming the whole chain end to end. Getting
+    /// there needed CONFIG_MISC + CONFIG_ROCKCHIP_EFUSE and an un-disabled efuse
+    /// DT node: stock rk3288_defconfig enables NO eFuse driver, so
+    /// rockchip_set_serialno() falls through to fabricating the CPUID with an
+    /// unseeded rand() and every such board reports one shared constant instead.
+    ///
+    /// The word after GATE_OK is the eFuse CTRL readback (0x0c = LOAD|PGENB),
+    /// which proves the block is clocked and addressable; the two before it are
+    /// CLKGATE_CON(11) either side of the ungate write, both 0 — pclk_efuse_256
+    /// was already on, so this capture does not exercise the gate. OTP_END and the
+    /// last two words are absent because DdrDetector stops draining the printf
+    /// ring once the CPUID slice is complete (its behaviour for every SoC), which
+    /// is why parsing must not require the terminator.
+    private let rk3288Capture = """
+        OTP_BEGIN
+        00000000
+        00000000
+        GATE_OK
+        0000000c
+        OTP_ALIVE
+        OTP_DUMP
+        00000000
+        88234b52
+        5500f181
+        31564b52
+        30313037
+        3030302e
+        138d000b
+        """
+
+    func testRK3288EfuseCaptureDerivesSerial() throws {
+        // fallbackBaseByte nil on purpose: this probe has been self-describing
+        // from its first build, so it must parse with no host-side assumption.
+        let dump = try XCTUnwrap(ChipIdentity.parseOtpDump(rk3288Capture, fallbackBaseByte: nil))
+        XCTAssertEqual(dump.baseByte, 0)
+        let cpuid = try XCTUnwrap(dump.slice(at: 0x07, count: ChipIdentity.cpuidLength))
+        XCTAssertEqual(ChipIdentity.hex(cpuid), "55524b5631373031302e3030300b008d")
+        XCTAssertEqual(ChipIdentity.serial(fromCpuid: cpuid), "7f35c361c64395de")
+    }
+
     // MARK: - v2 framing (self-describing base)
 
     /// v2 probes print OTP_DUMP followed by the OTP byte offset their first data

@@ -40,11 +40,18 @@ public struct IdProbe: Sendable, Equatable {
     /// The OTP byte offset the payload's first word came from BEFORE probes started
     /// stating it themselves (see `ChipIdentity.parseOtpDump`). Keeps a stale cfg
     /// reporting a correct CPUID instead of a wrong one.
-    public let legacyBaseByte: Int
+    ///
+    /// `nil` for a probe that has been self-describing since its first build: there
+    /// is no legacy payload to be compatible with, so a capture missing the
+    /// `OTP_DUMP` marker must be REFUSED rather than decoded at an assumed base.
+    /// Supplying a value here that merely happens to equal the probe's real base
+    /// would silently re-enable that guess and turn a corrupt dump into a
+    /// plausible-looking CPUID.
+    public let legacyBaseByte: Int?
     /// U-Boot's `CFG_CPUID_OFFSET`.
     public let cpuidOffset: Int
 
-    public init(legacyBaseByte: Int, cpuidOffset: Int) {
+    public init(legacyBaseByte: Int?, cpuidOffset: Int) {
         self.legacyBaseByte = legacyBaseByte
         self.cpuidOffset = cpuidOffset
     }
@@ -132,7 +139,9 @@ public enum DetectProfiles {
             cruResetReg: 0xFF76_01B0,   // glb_srst_fst (clean restart; flag survives)
             cruResetValue: 0x0000_FDB9,
             family: nil,        // RK3288 变体(RK3288W)不做识别
-            idProbe: nil),
+            // eFuse cpu_id@0x07, not OTP — see CLAUDE.md. Self-describing from its
+            // first build, so it has no legacy base to fall back on.
+            idProbe: IdProbe(legacyBaseByte: nil, cpuidOffset: 0x07)),
     ]
     public static func forPID(_ pid: UInt16) -> DetectProfile? { all[pid] }
 }
