@@ -8,7 +8,15 @@ public final class CfgBinaryParser {
     public init() {}
 
     public func parse(url: URL) throws -> CfgTestPlan {
-        let data = try Data(contentsOf: url)
+        // Wrap the read: `Data(contentsOf:)` throws a bare CocoaError, which no
+        // caller can classify — the CLI mapped a missing cfg to `transport`, and
+        // the GUI surfaced Foundation's "operation couldn't be completed" prose.
+        let data: Data
+        do {
+            data = try Data(contentsOf: url)
+        } catch {
+            throw DDRToolError.fileNotFound("Cannot read cfg \(url.lastPathComponent): \(error.localizedDescription)")
+        }
         return try parse(data: data, sourcePath: url.path)
     }
 

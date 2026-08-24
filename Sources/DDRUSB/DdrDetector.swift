@@ -15,10 +15,23 @@ public struct DetectOutcome: Sendable {
     public let variant: ChipVariant?
 }
 
-public enum DetectError: Error, Sendable {
+public enum DetectError: Error, LocalizedError, Sendable {
     case unsupportedSoc
     case cfgPayloadMissing(String)
     case noOsReg
+
+    /// Without LocalizedError these surfaced as "DDRUSB.DetectError error 1." —
+    /// useless in the CLI's `errorMessage` and in any log that renders them.
+    public var errorDescription: String? {
+        switch self {
+        case .unsupportedSoc:
+            return "This SoC has no detect profile (unsupported USB PID)"
+        case .cfgPayloadMissing(let name):
+            return "Detect cfg is missing its \(name) payload"
+        case .noOsReg:
+            return "The osregdump probe returned no OS_REG words"
+        }
+    }
 }
 
 /// Orchestrates the whole DDR auto-detect flow over pure USB (no xrock).
