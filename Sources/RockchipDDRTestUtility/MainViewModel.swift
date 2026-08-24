@@ -197,13 +197,9 @@ final class MainViewModel: ObservableObject {
 
             try await refreshDevices()
 
-            // Fallback: if no device detected, pick first SoC. `selectedFileID`
-            // is deliberately left nil here — `resolveDefaultTestFile` itself
-            // falls back to "first cfg" when config.ini has no explicit default,
-            // which is exactly the silent-wrong-cfg default this task removes.
-            if selectedSoc == nil {
-                selectedSoc = socNames.first
-            }
+            // No fallback to socNames.first: that listed an unrelated chip's cfgs
+            // (RK29, alphabetically first) while the header read "not connected".
+            // An empty list now means one thing: no chip identified yet.
 
         } catch {
             statusMessage = error.localizedDescription
@@ -225,9 +221,11 @@ final class MainViewModel: ObservableObject {
             selectedDeviceID = devices.first?.deviceID
         }
 
-        // Auto-select SoC from detected device
-        if let device = devices.first(where: { $0.deviceID == selectedDeviceID }),
-           let soc = device.socName, !soc.isEmpty {
+        // Take the chip from the device's socName; nil when pidToSoc has no entry
+        // for that PID, else the previous chip's cfg stays selected and runnable.
+        // Only while a device is present — unplugging keeps the list on screen.
+        if let current = devices.first(where: { $0.deviceID == selectedDeviceID }) {
+            let soc = current.socName.flatMap { $0.isEmpty ? nil : $0 }
             if selectedSoc != soc {
                 selectedSoc = soc
                 selectedFileID = nil
