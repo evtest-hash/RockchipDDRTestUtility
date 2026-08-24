@@ -175,6 +175,57 @@ without re-plugging. Two mechanisms (both required, hardware-verified on RK3568)
 Re-booting an already-booted device fails (`expected 512 got -1`), so run 1 of a
 fresh connection needs a real bootrom (physical replug after the prior session).
 
+### Device admission (Maskrom only)
+
+`discoverDevices` admits a device only when ALL of these hold — the rule is
+transcribed from `upgrade_tool`, not invented:
+
+    idVendor  == 0x2207
+    idProduct >= 0x0100        (upgrade_tool sub_100003544)
+    bcdUSB & 1 == 0            (upgrade_tool sub_1000035D0 / sub_100003994)
+
+`upgrade_tool` admits a rockusb device when (vid, pid) is in its built-in legacy
+chip table OR when the VID is Rockchip's and the PID is >= 0x0100. That table
+holds only pre-RK3288 parts (VID 0x071B: 0x3201/0x3226/0x3228; VID 0x2207:
+0x261A/0x273A/0x281A/0x282B/0x290A/0x292A/0x2C26/0x300A/0x300B/0x310B/0x320A),
+so **no modern PID appears in it** and every SoC here is admitted by the
+`>= 0x0100` rule alone — which is why this code carries the rule and not a table.
+A second vendor table (0x2207 PIDs 0x0000/0x0010/0x0016 plus legacy) marks
+mass-storage "Msc" devices; we want none of them, so it is not transcribed.
+
+`bcdUSB` bit 0 is Maskrom (clear) vs Loader (set) — both advertise the SAME PID,
+so it is the only discriminator. This tool keeps ONLY Maskrom: the DDR bin goes
+down over control transfer 0x0C/0x0471 into SRAM, which no other personality can
+accept. A Loader- or ADB-mode board is therefore not a candidate but invisible,
+and the CLI reports `noDevice` for it — same as `upgrade_tool ld`, which prints
+`connected(0)` for an ADB device.
+
+Measured on one RK3576 board, same PID in both personalities:
+
+| mode | idProduct | bcdUSB | bit 0 | product string |
+| --- | --- | --- | --- | --- |
+| Maskrom | 0x350A (RK3566) | **0x0200** | 0 | — (no serial) |
+| Loader | 0x350E | **0x0301** | 1 | "USB download gadget" |
+| ADB | 0x0006 | 0x0320 | 0 | "rk3xxx" |
+
+Note the Loader reads **0x0301**, not 0x0201 — so `bcdUSB == 0x0201` would MISS
+this loader and admit it as Maskrom. Test the bit, as the vendor does.
+
+**Both gates are required, and neither substitutes for the other.** The ADB row
+above has bit 0 clear, so the bcdUSB gate alone would call it Maskrom; the PID
+gate rejects it. Conversely the Loader row has a perfectly valid PID, so the PID
+gate alone would admit it.
+
+Before this existed only the VID was checked, so an ADB-mode board entered the
+candidate list — and since `chooseDevice` takes `devices.first`, it could be
+selected over a real Maskrom board and then have rockusb command packets pushed
+at it. `resolveInterfaceAndEndpoints` also no longer falls back to a hardcoded
+`(0, 0, 0x02, 0x81)`: claiming endpoints the descriptor never advertised only
+deferred the failure to the first transfer.
+
+Because `discoverDevices` returns Maskrom devices exclusively, `UsbDevice` needs
+no mode field and the GUI needs no change beyond seeing fewer candidates.
+
 ### USB Protocol
 
 `RkUsbTransportLibusb` implements Rockchip's proprietary USB protocol:

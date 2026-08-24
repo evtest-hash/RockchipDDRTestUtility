@@ -41,6 +41,38 @@ enum LibusbSharedContext {
 
 public final class RkUsbTransportLibusb: UsbTransport {
     private static let rockchipVendorID: UInt16 = 0x2207
+
+    /// Rockchip's own admission rule, transcribed from `upgrade_tool`
+    /// (`sub_100003544`): a device is a rockusb device when its (vid, pid) is in
+    /// the tool's built-in legacy chip table, or — for anything not in it — when
+    /// the VID is Rockchip's AND the PID is >= 0x0100.
+    ///
+    /// That table holds only pre-RK3288-era parts (VID 0x071B PIDs 0x3201/0x3226/
+    /// 0x3228; VID 0x2207 PIDs 0x261A/0x273A/0x281A/0x282B/0x290A/0x292A/0x2C26/
+    /// 0x300A/0x300B/0x310B/0x320A) — NO modern PID appears in it, so every SoC
+    /// this tool supports is admitted by the `>= 0x0100` rule alone. Hence no
+    /// table here: the rule is the whole gate.
+    ///
+    /// It is also what rejects the Android gadget personalities. ADB enumerates as
+    /// 0x2207/0x0006 and Rockchip's mass-storage PIDs (0x0000/0x0010/0x0016) sit
+    /// below the same line — measured on a booted board, and `upgrade_tool ld`
+    /// reports `connected(0)` for exactly that device.
+    private static let minRockusbProductID: UInt16 = 0x0100
+
+    /// Maskrom vs Loader, also transcribed from `upgrade_tool` (`sub_1000035D0`
+    /// LABEL_61 and `sub_100003994`): bit 0 of the device descriptor's `bcdUSB` —
+    /// clear = Maskrom, set = Loader. Both personalities advertise the SAME PID,
+    /// so this bit is the only discriminator. Measured: RK3566 in Maskrom reads
+    /// bcdUSB 0x0200, and a board reported as Loader keeps its 0x350E PID.
+    ///
+    /// This tool keeps ONLY Maskrom. The DDR bin goes down over control transfer
+    /// 0x0C/0x0471 into SRAM, which no other personality can accept — so a
+    /// non-Maskrom device is not a candidate, it is invisible.
+    ///
+    /// NOTE this bit is NOT an ADB filter on its own: a measured ADB device reads
+    /// bcdUSB 0x0320, whose bit 0 is also clear, and it would classify as Maskrom.
+    /// The PID gate above is what rejects it. Both gates are required.
+    private static func isMaskrom(bcdUSB: UInt16) -> Bool { bcdUSB & 1 == 0 }
     private static let bootControlRequestType: UInt8 = 0x40
     private static let bootControlRequest: UInt8 = 0x0C
     private static let bootControlIndex: UInt16 = 0x0471
@@ -137,6 +169,17 @@ public final class RkUsbTransportLibusb: UsbTransport {
                 continue
             }
             guard descriptor.idVendor == Self.rockchipVendorID else {
+                continue
+            }
+            // Two independent gates (see the constants above). Previously only the
+            // VID was checked, so an ADB-mode board — a board running Linux, not in
+            // Maskrom — entered the candidate list: `chooseDevice` takes
+            // `devices.first`, so it could be picked over a real Maskrom board, and
+            // the test path would then push rockusb command packets at it.
+            guard descriptor.idProduct >= Self.minRockusbProductID else {
+                continue
+            }
+            guard Self.isMaskrom(bcdUSB: descriptor.bcdUSB) else {
                 continue
             }
 
@@ -679,7 +722,12 @@ public final class RkUsbTransportLibusb: UsbTransport {
             return (first.interfaceNumber, first.altSetting, first.outEp, first.inEp)
         }
 
-        return (0, 0, 0x02, 0x81)
+        // No interface with a bulk IN/OUT pair exists on this device. Returning a
+        // hardcoded (0, 0, 0x02, 0x81) here only deferred the failure to the first
+        // transfer, as endpoints the descriptor never advertised — report it where
+        // it happens instead.
+        throw DDRToolError.transportError(
+            "No interface with a bulk IN/OUT endpoint pair — this device is not a rockusb device")
     }
 
     private func sendBootControlChunk(_ chunk: Data) throws {

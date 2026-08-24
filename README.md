@@ -128,6 +128,8 @@ RockchipDDRTestUtilityCLI --solder --json
 | `2` | FAIL — the device tested the DDR and reported it bad | scrap the board |
 | `1` | ERROR — no verdict at all | fix the setup and re-run; leave the board alone |
 
+Only boards in **Maskrom** are candidates — the DDR bin is downloaded into SRAM over control transfer `0x0C/0x0471`, which no other USB personality accepts. A board in Loader or ADB mode is not listed and reports `noDevice`, matching `upgrade_tool ld` (which prints `connected(0)` for an ADB device). Admission is `idVendor == 0x2207 && idProduct >= 0x0100 && (bcdUSB & 1) == 0`, transcribed from `upgrade_tool`.
+
 Exit `1` always carries an `errorCode`, one of: `badArgument` · `noDevice` · `cfgNotFound` · `unsupportedSoc` · `transport` · `probeFailed` · `ambiguousCfg` (geometry decoded, but more than one cfg matches — pick one manually) · `deviceWedged` (eye-scan: the board stopped responding, replug it) · `scanIncomplete` (eye-scan: still streaming at the deadline, raise `--eye-timeout`).
 
 The distinction is what makes `2` trustworthy: a USB stall mid-test, a missing cfg, or an eye-scan timeout can no longer scrap a good board. `--detect` failing to match any cfg *is* a `2` — the cfg library covers every shipped DRAM combination, so a zero-match means the geometry read back doesn't correspond to a real part.
