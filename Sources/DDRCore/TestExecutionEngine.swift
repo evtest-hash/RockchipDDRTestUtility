@@ -103,7 +103,8 @@ public actor TestExecutionEngine {
                             "ERROR_DOWNLOADBOOT_FAIL",
                             "Download boot failed: \(error.localizedDescription)",
                             device: selectedDevice,
-                            keepTransportOpen: keepTransportOpen
+                            keepTransportOpen: keepTransportOpen,
+                            failure: .transport
                         )
                     }
 
@@ -122,7 +123,8 @@ public actor TestExecutionEngine {
                             "ERROR_DOWNLOADBOOT_FAIL",
                             "Boot handshake failed: \(error.localizedDescription)",
                             device: selectedDevice,
-                            keepTransportOpen: keepTransportOpen
+                            keepTransportOpen: keepTransportOpen,
+                            failure: .transport
                         )
                     }
                 }
@@ -147,6 +149,7 @@ public actor TestExecutionEngine {
                         "Download test item \(item.name) failed: \(error.localizedDescription)",
                         device: selectedDevice,
                         keepTransportOpen: keepTransportOpen,
+                        failure: .transport,
                         itemName: item.name
                     )
                 }
@@ -167,6 +170,7 @@ public actor TestExecutionEngine {
                             "Download parameter failed: \(error.localizedDescription)",
                             device: selectedDevice,
                             keepTransportOpen: keepTransportOpen,
+                            failure: .transport,
                             itemName: item.name
                         )
                     }
@@ -188,6 +192,7 @@ public actor TestExecutionEngine {
                         "Run test item \(item.name) failed: \(error.localizedDescription)",
                         device: selectedDevice,
                         keepTransportOpen: keepTransportOpen,
+                        failure: .transport,
                         itemName: item.name
                     )
                 }
@@ -209,6 +214,7 @@ public actor TestExecutionEngine {
                         "Polling test item \(item.name) failed: \(error.localizedDescription)",
                         device: selectedDevice,
                         keepTransportOpen: keepTransportOpen,
+                        failure: .transport,
                         itemName: item.name
                     )
                 }
@@ -223,6 +229,9 @@ public actor TestExecutionEngine {
                         "Run test item \(item.name) failed: \(reason)",
                         device: selectedDevice,
                         keepTransportOpen: keepTransportOpen,
+                        // The device polled done with resultCode != 0 — the ONLY
+                        // path that means the DDR itself is bad (CLI exit 2).
+                        failure: .deviceVerdict,
                         itemName: item.name
                     )
                 }
@@ -251,7 +260,8 @@ public actor TestExecutionEngine {
                 "ERROR",
                 error.localizedDescription,
                 device: context.selectedDevice,
-                keepTransportOpen: keepTransportOpen
+                keepTransportOpen: keepTransportOpen,
+                failure: FailureKind.classify(error)
             )
         }
     }
@@ -276,6 +286,7 @@ public actor TestExecutionEngine {
         _ message: String,
         device: UsbDevice?,
         keepTransportOpen: Bool,
+        failure: FailureKind,
         itemName: String? = nil
     ) async -> ExecutionResult {
         context.state = .failed
@@ -295,7 +306,8 @@ public actor TestExecutionEngine {
             logs: context.logs,
             startedAt: context.startedAt,
             finishedAt: Date(),
-            bootSucceeded: context.bootSucceeded
+            bootSucceeded: context.bootSucceeded,
+            failure: failure
         )
     }
 

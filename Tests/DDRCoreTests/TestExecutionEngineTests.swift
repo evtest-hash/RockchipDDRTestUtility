@@ -186,6 +186,106 @@ final class TestExecutionEngineTests: XCTestCase {
         XCTAssertTrue(result.bootSucceeded, "post-boot failures must preserve the boot-succeeded latch")
     }
 
+    // MARK: - FailureKind
+    //
+    // The CLI's exit code hinges entirely on this discrimination: only
+    // `.deviceVerdict` may become exit 2 (scrap the board). Everything else is
+    // exit 1 (the board is untested, not bad). Before `failure` existed, all of
+    // these collapsed into `outcome: .failed`, so a bulk timeout scrapped good boards.
+
+    func testDeviceResultCodeIsADeviceVerdict() async {
+        let devices = [
+            UsbDevice(deviceID: "A", vendorID: 0x2207, productID: 0x0001, productName: "RK-A", serialNumber: nil),
+        ]
+        let transport = MockUsbTransport(devices: devices, failRunResult: true)
+        let engine = TestExecutionEngine(parser: CfgBinaryParser(), transport: transport)
+
+        let result = await engine.run(cfgPath: rk3588Fixture())
+
+        XCTAssertEqual(result.outcome, .failed)
+        XCTAssertEqual(result.failure, .deviceVerdict, "resultCode != 0 is the ONLY real board verdict")
+    }
+
+    func testDeviceErrorStatusIsADeviceVerdict() async {
+        let devices = [
+            UsbDevice(deviceID: "A", vendorID: 0x2207, productID: 0x0001, productName: "RK-A", serialNumber: nil),
+        ]
+        let transport = MockUsbTransport(devices: devices, reportError: true)
+        let engine = TestExecutionEngine(parser: CfgBinaryParser(), transport: transport)
+
+        let result = await engine.run(cfgPath: rk3588Fixture())
+
+        XCTAssertEqual(result.failure, .deviceVerdict)
+    }
+
+    /// The case that used to scrap good boards: a transfer dies AFTER boot, mid
+    /// test. Same `outcome: .failed` as a real DDR failure — only `failure` tells
+    /// them apart, so this must never read as `.deviceVerdict`.
+    func testMidTestTransferFailureIsTransportNotAVerdict() async {
+        let devices = [
+            UsbDevice(deviceID: "A", vendorID: 0x2207, productID: 0x0001, productName: "RK-A", serialNumber: nil),
+        ]
+        // Not "testDeviceReady": the mock answers it without consulting failPhase,
+        // so it cannot simulate a throw there. The engine's polling-throw arm is
+        // classified identically to runItem's, which this loop does cover.
+        for phase in ["downloadItem", "downloadParam", "runItem"] {
+            let transport = MockUsbTransport(devices: devices, failPhase: phase)
+            let engine = TestExecutionEngine(parser: CfgBinaryParser(), transport: transport)
+
+            let result = await engine.run(cfgPath: rk3588Fixture())
+
+            XCTAssertEqual(result.outcome, .failed, "\(phase)")
+            XCTAssertEqual(result.failure, .transport, "\(phase) must not read as a board verdict")
+        }
+    }
+
+    func testBootDownloadFailureIsTransport() async {
+        let devices = [
+            UsbDevice(deviceID: "A", vendorID: 0x2207, productID: 0x0001, productName: "RK-A", serialNumber: nil),
+        ]
+        let transport = MockUsbTransport(devices: devices, failPhase: "downloadBoot")
+        let engine = TestExecutionEngine(parser: CfgBinaryParser(), transport: transport)
+
+        let result = await engine.run(cfgPath: rk3588Fixture())
+
+        XCTAssertEqual(result.failure, .transport)
+    }
+
+    func testNoDeviceIsNotAVerdict() async {
+        let transport = MockUsbTransport(devices: [])
+        let engine = TestExecutionEngine(parser: CfgBinaryParser(), transport: transport)
+
+        let result = await engine.run(cfgPath: rk3588Fixture())
+
+        XCTAssertEqual(result.failure, .noDevice)
+    }
+
+    func testMissingCfgIsNotAVerdict() async {
+        let devices = [
+            UsbDevice(deviceID: "A", vendorID: 0x2207, productID: 0x0001, productName: "RK-A", serialNumber: nil),
+        ]
+        let transport = MockUsbTransport(devices: devices)
+        let engine = TestExecutionEngine(parser: CfgBinaryParser(), transport: transport)
+
+        let result = await engine.run(cfgPath: "/nonexistent/nope.cfg")
+
+        XCTAssertEqual(result.outcome, .failed)
+        XCTAssertEqual(result.failure, .cfg)
+    }
+
+    func testPassingRunHasNoFailure() async {
+        let devices = [
+            UsbDevice(deviceID: "A", vendorID: 0x2207, productID: 0x0001, productName: "RK-A", serialNumber: nil),
+        ]
+        let transport = MockUsbTransport(devices: devices)
+        let engine = TestExecutionEngine(parser: CfgBinaryParser(), transport: transport)
+
+        let result = await engine.run(cfgPath: rk3588Fixture())
+
+        XCTAssertEqual(result.outcome, .passed)
+        XCTAssertNil(result.failure)
+    }
+
     private func rk3588Fixture() -> String {
         let repoRoot = URL(fileURLWithPath: #file)
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()

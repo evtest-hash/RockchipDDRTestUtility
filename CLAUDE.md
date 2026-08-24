@@ -104,6 +104,52 @@ and never influences the verdict — Windows reads printf in a separate thread
 for the same purpose. Each stage (boot → forceinit → connect) must pass before
 the next begins.
 
+**A failed run says WHY** — `ExecutionResult.failure: FailureKind?`. Only
+`.deviceVerdict` (resultCode != 0) means the DDR itself is bad; `.transport`,
+`.cfg` and `.noDevice` mean the test never produced a verdict at all. The engine
+used to collapse both into `outcome: .failed`, so a single bulk timeout was
+indistinguishable from a genuine soldering failure — and the CLI reported it as
+FAIL, which on a production line scraps a good board. `FailureKind.classify` maps
+a thrown error conservatively: anything unrecognised becomes `.transport`, never
+a device verdict. `ResultLogWriter.render` now appends host-side ERROR entries
+after the device printf, because the CLI embeds that render as the sole failure
+evidence in its JSON.
+
+### CLI exit codes & JSON contract
+
+Both are derived in ONE place (`CLIExit.from` in `CLIMain.swift`) from the two
+fields every mode fills — `pass` and `errorCode`:
+
+    errorCode != nil → 1 (ERROR: no verdict — fix the setup, board untested)
+    pass == true     → 0 (PASS)
+    else             → 2 (FAIL: the device judged the DDR bad — scrap it)
+
+So `exit 2 ⟺ errorCode == nil && pass == false`, which is what makes 2
+trustworthy. Every runner returns a `CLIResult` instead of exiting itself; there
+is exactly one `Foundation.exit` on the result path (`finish`), and `elapsedMs`
+is stamped there too.
+
+Per-mode verdicts: `--detect` passes only on a UNIQUE match — `.none` is a board
+verdict (exit 2, because the cfg library covers every shipped DRAM combination,
+so a zero-match means the geometry isn't a real part) while `.ambiguous` is
+`errorCode: ambiguousCfg` (exit 1, needs a human). `uniqueCfg()` enforces the
+GUI's iron rule; plain `CfgAutoSelect.firstAvailable` returns `candidates[0]`
+even for an ambiguous group, which is how `--solder` used to test a board
+against a cfg the GUI would have refused. `--eyescan` maps `wedged` /
+`!completedViaStatus` to `deviceWedged` / `scanIncomplete` (exit 1) — both were
+previously printed only to the human summary, so automation could not tell
+"replug the fixture" from "this board's eye failed".
+
+The JSON contract covers the four production commands (`--detect`, `--solder`,
+`--eyescan`, `--list`) plus every error path. `--cfg` / `--probe-bulk` are
+diagnostic-only and REJECT `--json` (`CLIMode.isDiagnostic`) rather than print an
+empty stdout. `CLIOut.json` is set by pre-scanning argv BEFORE `parse`, so an
+argument error still emits JSON. One verdict field named `pass` everywhere (the
+old `ok` / `solder.outcome` / `solder.state` / `eyescan.go` are gone), `mode`
+identifies the command (`--cfg` used to report itself under the `solder` key),
+and `errorCode` is a closed enum — the old free-text `error` carried
+`DDRToolError.errorDescription`, which drops the case discriminator.
+
 ### Repeat Testing
 
 The tool mirrors Windows DDR_UserTool so "start test" can be clicked repeatedly

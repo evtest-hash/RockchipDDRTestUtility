@@ -10,7 +10,7 @@ Three checks, all driven from the same USB session:
 
 | Check | GUI | CLI | Verdict |
 |-------|-----|-----|---------|
-| **DDR 自动探测** — probe the DRAM geometry (type / capacity / channels / per-channel rank, col, bank, row, bus width, die width) and match it to a test config | runs as the first step of 焊接 | `--detect` | a unique cfg match |
+| **DDR 自动探测** — probe the DRAM geometry (type / capacity / channels / per-channel rank, col, bank, row, bus width, die width) and match it to a test config | runs as the first step of 焊接 | `--detect` | a unique cfg match (`uniqueByCoarse` / `uniqueByTieBreak`) |
 | **焊接检测** — the soldering-quality test (DQS / DQ / DM / CA / CS / ZQ checks) | 焊接 mode | `--solder` | device result code == 0 |
 | **DQ 眼图** — per-DQ eye / margin scan (rx + tx) | 眼图 mode | `--eyescan` | scan completed **and** every `all result:` line passes |
 
@@ -86,11 +86,11 @@ RockchipDDRTestUtilityCLI --eyescan               # DQ 眼图
 RockchipDDRTestUtilityCLI --help
 ```
 
-Options: `--device-id <id>` (pick one of several boards), `--detect-cfg <path>` (override the detect cfg), `--eye-timeout <seconds>`, `--quiet`, and `--cfg <path> [--repeat N]` / `--probe-bulk` for diagnostics.
+Options: `--device-id <id>` (pick one of several boards), `--detect-cfg <path>` (override the detect cfg), `--eye-timeout <seconds>`, `--quiet`, and `--cfg <path> [--repeat N]` / `--probe-bulk` for diagnostics (human-only — they have no JSON schema).
 
 ### Machine-readable output
 
-`--json` emits exactly one JSON object on stdout; every human-facing log line goes to stderr. The device's own output is embedded, so the JSON is self-contained — no side files to collect and no printf scraping.
+`--json` emits exactly one JSON object on stdout; every human-facing log line goes to stderr. The device's own output is embedded, so the JSON is self-contained — no side files to collect and no printf scraping. It covers the four production commands (`--detect`, `--solder`, `--eyescan`, `--list`) plus every error path; the two diagnostic modes (`--cfg`, `--probe-bulk`) are human tools and reject `--json` rather than print nothing.
 
 ```bash
 RockchipDDRTestUtilityCLI --solder --json
@@ -98,20 +98,39 @@ RockchipDDRTestUtilityCLI --solder --json
 
 ```jsonc
 {
+  "mode": "solder",
+  "pass": true,             // the one verdict field, in every mode
+  "errorCode": null,        // absent unless there was NO verdict; see exit codes
+  "errorMessage": null,
+  "elapsedMs": 12345,
   "soc": "RK3568&RK3566", "pid": "0x350A", "device": "…",
   "cpuid": "4d344e…", "serial": "587dc6a514453616", "chipVariant": "RK3566",
-  "detect":  { "type": "LPDDR4", "capacityMB": 4096, "channels": 1, "csPerDie": 2,
+  "rebootedToMaskrom": true,
+  "detect":  { "pass": true, "tier": "uniqueByCoarse",
+               "type": "LPDDR4", "capacityMB": 4096, "channels": 1, "csPerDie": 2,
                "sysRegVersion": 3, "geometry": [ /* per-channel rank/col/bank/row/bus/die */ ],
-               "cfg": "…焊接检测.cfg", "tier": "uniqueByCoarse", "candidates": 1 },
-  "solder":  { "pass": true, "outcome": "…", "state": "…", "cfg": "…",
-               "bootSucceeded": true, "log": "…device USB printf…" },
-  "ok": true, "error": null, "elapsedMs": 12345
+               "cfg": "…焊接检测.cfg", "candidates": ["…焊接检测.cfg"],
+               "rawOsReg": ["0x00000000", "…"] },
+  "solder":  { "pass": true, "cfg": "…", "bootSucceeded": true,
+               "log": "…device USB printf + host errors…" }
 }
 ```
 
-`--eyescan` fills `eyescan: { go, bytes, transcript }` instead.
+`--eyescan` fills `eyescan: { pass, completed, wedged, bytes, transcript }` instead; `--list` fills `devices: [ { deviceID, vid, pid, name, soc } ]`. Keys whose value is null are omitted entirely.
 
-Exit codes: **0** the requested check passed · **1** error (no device / parse / transport / unsupported SoC) · **2** fail (soldering FAILED, eye-scan not PASS, or detect found no unique cfg).
+### Exit codes
+
+**0** and **2** both mean the device produced a verdict; **1** means it did not, so the board is untested rather than bad.
+
+| Code | Meaning | Act on it by |
+|------|---------|--------------|
+| `0` | PASS — the check passed | ship the board |
+| `2` | FAIL — the device tested the DDR and reported it bad | scrap the board |
+| `1` | ERROR — no verdict at all | fix the setup and re-run; leave the board alone |
+
+Exit `1` always carries an `errorCode`, one of: `badArgument` · `noDevice` · `cfgNotFound` · `unsupportedSoc` · `transport` · `probeFailed` · `ambiguousCfg` (geometry decoded, but more than one cfg matches — pick one manually) · `deviceWedged` (eye-scan: the board stopped responding, replug it) · `scanIncomplete` (eye-scan: still streaming at the deadline, raise `--eye-timeout`).
+
+The distinction is what makes `2` trustworthy: a USB stall mid-test, a missing cfg, or an eye-scan timeout can no longer scrap a good board. `--detect` failing to match any cfg *is* a `2` — the cfg library covers every shipped DRAM combination, so a zero-match means the geometry read back doesn't correspond to a real part.
 
 ## Build from Source
 

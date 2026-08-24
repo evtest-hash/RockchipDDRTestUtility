@@ -32,6 +32,20 @@ public final class ResultLogWriter {
             }
         }
 
+        // Host-side error entries, appended after the device printf. Without
+        // these the rendered log carried ONLY device output, so a run that died
+        // on a bulk timeout produced a log with no reason in it — and the CLI
+        // embeds this render in its JSON as the sole failure evidence.
+        let errors = result.logs.filter { $0.level == .error }
+        if !errors.isEmpty {
+            lines.append("")
+            lines.append("--- host errors ---")
+            for entry in errors {
+                let itemPrefix = entry.itemName.map { "[\($0)] " } ?? ""
+                lines.append("\(entry.code): \(itemPrefix)\(entry.message)")
+            }
+        }
+
         return lines.joined(separator: "\n")
     }
 

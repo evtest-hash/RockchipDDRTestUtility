@@ -318,6 +318,41 @@ public enum TestOutcome: String, Sendable {
     case failed = "FAIL"
 }
 
+/// WHY a run did not pass. The CLI's exit code hinges entirely on this
+/// distinction: only `.deviceVerdict` means the device actually tested the DDR
+/// and reported it bad (exit 2 — scrap the board). Every other kind means the
+/// test never produced a verdict at all (exit 1 — fix the cable/fixture, leave
+/// the board alone). Before this existed, `TestExecutionEngine` collapsed both
+/// into `outcome: .failed`, so a single bulk timeout was indistinguishable from
+/// a genuine soldering failure.
+public enum FailureKind: String, Sendable {
+    /// `RKU_TestDeviceReady` returned resultCode != 0 — a real DDR verdict.
+    case deviceVerdict
+    /// A control/bulk transfer failed, stalled, or timed out.
+    case transport
+    /// The cfg is missing, unparseable, or carries no test items.
+    case cfg
+    /// No Rockchip device to talk to.
+    case noDevice
+}
+
+extension FailureKind {
+    /// Classify a thrown error. Anything that isn't recognisably a cfg or
+    /// device-presence problem is treated as transport — deliberately
+    /// conservative: an unknown error must never be reported as a bad board.
+    public static func classify(_ error: Error) -> FailureKind {
+        guard let e = error as? DDRToolError else { return .transport }
+        switch e {
+        case .noDevice, .multipleDevices:
+            return .noDevice
+        case .fileNotFound, .invalidFormat, .parseFailure:
+            return .cfg
+        case .transportError, .runtimeError:
+            return .transport
+        }
+    }
+}
+
 /// Outcome of a single `RKU_TestDeviceReady` (opcode 0) poll.
 ///
 /// Mirrors DDR_UserTool's `sub_416B70`: the 16-byte response carries the echoed
@@ -379,6 +414,9 @@ public struct ExecutionResult: Sendable {
     /// mirroring DDR_UserTool's `this+0x4B8`, which is cleared solely after a
     /// successful boot. False when boot was skipped (already booted) or failed.
     public let bootSucceeded: Bool
+    /// Why the run failed; `nil` when it passed. `.deviceVerdict` is the ONLY
+    /// value that means "this board is bad" — see `FailureKind`.
+    public let failure: FailureKind?
 
     public init(
         outcome: TestOutcome,
@@ -387,7 +425,8 @@ public struct ExecutionResult: Sendable {
         logs: [ExecutionLogEntry],
         startedAt: Date,
         finishedAt: Date,
-        bootSucceeded: Bool = false
+        bootSucceeded: Bool = false,
+        failure: FailureKind? = nil
     ) {
         self.outcome = outcome
         self.state = state
@@ -396,6 +435,7 @@ public struct ExecutionResult: Sendable {
         self.startedAt = startedAt
         self.finishedAt = finishedAt
         self.bootSucceeded = bootSucceeded
+        self.failure = failure
     }
 }
 
