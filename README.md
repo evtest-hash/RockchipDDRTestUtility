@@ -44,7 +44,7 @@ Every SoC below ships soldering-test configs. The extra columns mark the SoCs th
 | RK29 | 0x290A | ✅ | — | — |
 | RV1126 | 0x110C | ✅ | — | — |
 
-Without auto-detect the config must be picked by hand from the sidebar; the test itself works the same.
+Without auto-detect the config must be picked by hand from the toolbar pop-up; the test itself works the same.
 
 `DDRTestFiles/` also carries configs for **RK3028, RK3528, RV1126B, RV1126BP**, which currently have no maskrom-PID mapping — a connected board of those SoCs is listed but its SoC can't be identified automatically. **RK3506** (0x350F) is recognized but ships no configs.
 
@@ -54,27 +54,45 @@ Without auto-detect the config must be picked by hand from the sidebar; the test
 - Apple Silicon (arm64) or Intel (x86_64)
 - Rockchip device connected in USB download mode (VID 0x2207, Maskrom)
 
+Nothing to install: both downloads are universal binaries with libusb linked in. Homebrew is only needed to BUILD from source.
+
 ## Download
 
 From [Releases](../../releases):
 
 - **`RockchipDDRTestUtility.dmg`** — the GUI app. Open it, drag **Rockchip DDR Test Utility.app** to **Applications**, launch. Test configs are bundled inside the app.
-- **`RockchipDDRTestUtilityCLI-macos.tar.gz`** — standalone CLI. Universal binary + its libusb dylib, with the whole config library compiled in, so it runs from anywhere with no Homebrew install and no `DDRTestFiles/` next to it.
+- **`RockchipDDRTestUtilityCLI-macos.tar.gz`** — standalone CLI: **one universal executable**, nothing beside it. libusb is linked statically and the whole config library is compiled in, so it runs from anywhere with no Homebrew install and no `DDRTestFiles/` next to it.
 
 ## Usage (GUI)
 
 1. Connect a Rockchip device via USB in Maskrom / download mode
 2. Pick a mode: **焊接** (soldering test) or **眼图** (eye-scan). 眼图 is greyed out on SoCs that ship no eye-scan config.
 3. Click **开始**
-   - 焊接: auto-detect probes the DRAM, preselects the exactly-matching config, and the test runs straight after it
-   - 眼图: the firmware self-trains the DDR and scans every DQ — no config selection involved (the sidebar is hidden)
+   - 焊接: auto-detect probes the DRAM, fills in the exactly-matching config, and the test runs straight after it
+   - 眼图: the firmware self-trains the DDR and scans every DQ — no config involved, so the config pop-up disappears
 4. Watch the log area — detection appears as the first card, followed by the test steps
-5. Click **保存测试结果** / **保存眼图日志** to export
+5. Click **保存测试日志** / **保存眼图日志** to export
 
-Two optional toggles (焊接 mode only, defaults are the normal factory setup):
+Everything the run needs sits in the toolbar: which board, which check, which config. The verdict has a row of its own at the bottom of the window, so it never covers the log it is summarising.
 
-- **自动探测** (on by default) — gates whether **开始** attempts detection at all. Turn it off to run a hand-picked config from the sidebar.
-- **自动测试** (off by default) — when on, plugging a board in starts the run by itself. When off, plug-in is passive: the tool never touches the board until you click **开始**.
+- **Board** — with more than one board on the bus, a picker appears, labelling each by the socket it sits in (`RK3566 · 1.4`). Every path honours the choice, and switching boards drops the previous board's session (the next run boots and detects again). One board: just its chip name.
+- **Config** — a pop-up beside the mode switch. With **自动探测配置** on it is filled in for you; with it off, pick one by hand.
+- **自动探测配置** (on by default) — gates whether **开始** probes the DRAM at all. Turn it off to run a hand-picked config.
+
+Plugging a board in never starts anything: every run begins at **开始**.
+
+### Three verdicts, not two
+
+The GUI's verdict row and the CLI's exit code report the same three states, and so
+does the saved log file:
+
+| | GUI | CLI | Saved file | What it means |
+|---|---|---|---|---|
+| pass | green **测试通过** | `0` | `Result: PASS` | the check passed |
+| device verdict | red **测试失败** | `2` | `Result: FAIL` | the device tested the DDR and reported it bad — scrap the board |
+| no verdict | orange **未测出结论** | `1` | `Result: NO VERDICT (<reason>)` | a USB stall, a missing config, a wedged eye-scan — the board was never judged, so fix the setup and re-run |
+
+A cable pulled mid-test is not a bad board. Reporting it as one scraps good hardware, so nothing but the device's own result code can produce the middle row.
 
 ## Usage (CLI)
 
@@ -86,11 +104,13 @@ RockchipDDRTestUtilityCLI --eyescan               # DQ 眼图
 RockchipDDRTestUtilityCLI --help
 ```
 
-Options: `--device-id <id>` (pick one of several boards), `--detect-cfg <path>` (override the detect cfg), `--eye-timeout <seconds>`, `--quiet`, and `--cfg <path> [--repeat N]` / `--probe-bulk` for diagnostics (human-only — they have no JSON schema).
+Options: `--device-id <id>` (pick one of several boards), `--detect-cfg <path>` (override the detect cfg), `--eye-timeout <seconds>`, `--json`, `--quiet`.
+
+Those four commands are all of them — the diagnostic modes that existed while the USB layer was being brought up (`--cfg`, `--repeat`, `--probe-bulk`) are gone, so every command is inside the JSON contract below.
 
 ### Machine-readable output
 
-`--json` emits exactly one JSON object on stdout; every human-facing log line goes to stderr. The device's own output is embedded, so the JSON is self-contained — no side files to collect and no printf scraping. It covers the four production commands (`--detect`, `--solder`, `--eyescan`, `--list`) plus every error path; the two diagnostic modes (`--cfg`, `--probe-bulk`) are human tools and reject `--json` rather than print nothing.
+`--json` emits exactly one JSON object on stdout; every human-facing log line goes to stderr. The device's own output is embedded, so the JSON is self-contained — no side files to collect and no printf scraping. It covers every command (`--detect`, `--solder`, `--eyescan`, `--list`) and every error path — there is no mode outside it, so `--json` always prints exactly one object.
 
 ```bash
 RockchipDDRTestUtilityCLI --solder --json
@@ -147,6 +167,14 @@ swift run RockchipDDRTestUtilityCLI --list           # CLI
 swift test                                           # tests (no USB hardware needed)
 bash scripts/package.sh                              # universal DMG + standalone CLI tarball
 ```
+
+`package.sh` builds a universal **static** libusb (from source, one slice per arch,
+`lipo`-merged) and links it into both executables, which is what makes the shipped
+CLI a single file and leaves the app bundle with no `Frameworks/` and no rpath. It
+fails the build if any shipped binary still references libusb dynamically —
+such a binary would die on a machine without Homebrew.
+
+Homebrew's libusb is still needed to build: `swift build` uses its headers.
 
 ## Test File Structure
 
@@ -207,7 +235,7 @@ The scan is not a pass/fail soldering check: it reports rx / tx margin per DQ. T
 | `DDRCore` | Config parsing, binary `.cfg` parser, test execution engine, result writer; auto-detect logic — `DetectProfile` (per-SoC params), `OsRegDecoder` (SYS_REG V1/V3 decode), `CfgAutoSelect` (exact-match cfg ranking + tie-break) |
 | `DDRUSB` | USB transport via libusb (Rockchip protocol); `DdrDetector` (auto-detect driver), `EyescanRunner` (eye-scan transcript stream) |
 | `RockchipDDRTestUtility` | SwiftUI GUI application |
-| `RockchipDDRTestUtilityCLI` | Command-line interface (`--detect`, `--solder`, `--eyescan`, `--list`, `--cfg`, `--json`) |
+| `RockchipDDRTestUtilityCLI` | Command-line interface (`--detect`, `--solder`, `--eyescan`, `--list`, `--json`) |
 
 ### Test Flow
 
