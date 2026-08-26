@@ -74,6 +74,13 @@ let package = Package(
         // JSON shape) is what automation depends on, and it had no tests at all.
         // Depending on the executable target directly avoids splitting a library
         // out of it just to make it reachable.
+        // The GUI's step pipeline: which card an engine log entry lands on, and
+        // what happens when one goes missing. Reachable the same way the CLI's
+        // contract tests are — by depending on the app target directly.
+        .testTarget(
+            name: "GUITests",
+            dependencies: ["RockchipDDRTestUtility", "DDRCore", "DDRUSB"]
+        ),
         .testTarget(
             name: "CLIContractTests",
             dependencies: ["RockchipDDRTestUtilityCLI", "DDRCore", "DDRUSB"]

@@ -39,6 +39,7 @@ swift test --filter CfgRepositoryTests   # test SoC discovery
 Two test targets, no USB hardware required for either:
 
 - **DDRCoreTests** — CfgBinaryParser, CfgRepository (SoC name extraction), TestExecutionEngine state transitions, ResultLogWriter, the verdict layer (`VerdictTests`, incl. the golden CRLF eye-scan transcript) and the probe-item polling rule (`ProbeItemTests`).
+- **GUITests** — the GUI's step pipeline: which card an engine log entry lands on, and what happens when a completion entry goes missing. Reachable the same way `CLIContractTests` is.
 - **CLIContractTests** — the CLI's machine contract: exit-code truth table, `CLIErrorCode` classification, argv parsing, and the JSON shape. It depends on the executable target directly (`@testable import RockchipDDRTestUtilityCLI`), so no library had to be split out of `CLIMain.swift` to make it reachable.
 
 ## Architecture

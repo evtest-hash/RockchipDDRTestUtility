@@ -543,39 +543,39 @@ final class MainViewModel: ObservableObject {
             appendStepMessage("Boot", message)
 
         case "INFO_DOWNLOADITEM_START":
-            if let name = entry.itemName ?? extractItemName(from: message) {
+            if let name = entry.itemName {
                 ensureStep(name)
                 setStepState(name, .downloading)
                 appendStepMessage(name, message)
             }
 
         case "INFO_DOWNLOADITEM_OK":
-            if let name = entry.itemName ?? extractItemName(from: message) {
+            if let name = entry.itemName {
                 appendStepMessage(name, message)
             }
 
         case "INFO_DOWNLOADITEMPARAM_START":
-            if let name = entry.itemName ?? extractItemName(from: message) {
+            if let name = entry.itemName {
                 appendStepMessage(name, message)
             }
 
         case "INFO_RUNITEM_START":
-            if let name = entry.itemName ?? extractItemName(from: message) {
+            if let name = entry.itemName {
                 setStepState(name, .running)
                 appendStepMessage(name, message)
             }
 
         case "INFO_RUNITEM_OK":
-            if let name = entry.itemName ?? extractItemName(from: message) {
+            if let name = entry.itemName {
                 setStepState(name, .passed)
                 appendStepMessage(name, message)
             }
 
         case "ERROR_DOWNLOADITEM_FAIL", "ERROR_DOWNLOADITEMPARAM_FAIL", "ERROR_RUNITEM_FAIL":
-            markCurrentRunningStepFailed(message)
+            markStepFailed(entry)
 
         case "INFO_PRINTF":
-            handlePrintf(message)
+            handlePrintf(entry)
 
         case "INFO_TESTDDR_OK":
             markAllPendingStepsPassed()
@@ -585,7 +585,9 @@ final class MainViewModel: ObservableObject {
         }
     }
 
-    private func handleExecutionLog(_ entry: ExecutionLogEntry) {
+    /// Entry point for the engine's log stream (internal so the step pipeline can
+    /// be driven from a test without a device).
+    func handleExecutionLog(_ entry: ExecutionLogEntry) {
         updateStepsFromLog(entry)
     }
 
@@ -611,31 +613,15 @@ final class MainViewModel: ObservableObject {
     /// Fallback item-name recovery from log prose. Prefer the structured
     /// `entry.itemName` (set by the engine for item-scoped codes); this is kept
     /// only as a safety net for entries without it.
-    private func extractItemName(from message: String) -> String? {
-        // "Start to download test item forceinit..." → "forceinit"
-        // "Start to run test item connect"          → "connect"
-        // "Running test item forceinit ok"          → "forceinit"
-        guard let range = message.range(of: "test item ") else { return nil }
-        let rest = message[range.upperBound...]
-        // Item name = the leading run of non-space, non-dot characters, so both
-        // "forceinit ok" and "forceinit..." resolve to "forceinit".
-        let name = rest.prefix { !$0.isWhitespace && $0 != "." }
-        let trimmed = String(name).trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-
-    private func handlePrintf(_ message: String) {
+    private func handlePrintf(_ entry: ExecutionLogEntry) {
         // Printf is display-only. Step pass/fail is driven by the engine's
         // INFO_RUNITEM_OK / ERROR_RUNITEM_FAIL / INFO_TESTDDR_OK codes (which
         // come from the device's RKU_TestDeviceReady status/result), not from
         // scanning this text — matching DDR_UserTool's failure detection.
-        let idx = testSteps.lastIndex(where: { $0.state == .running })
-            ?? testSteps.lastIndex(where: { $0.state == .downloading })
-            ?? testSteps.indices.last
-        guard let idx else { return }
+        guard let idx = stepIndex(for: entry) else { return }
 
         // Strip protocol tags and display all lines
-        let cleaned = message
+        let cleaned = entry.message
             .replacingOccurrences(of: "<>", with: "")
             .replacingOccurrences(of: "</N>", with: "")
         for line in cleaned.components(separatedBy: .newlines) {
@@ -647,19 +633,36 @@ final class MainViewModel: ObservableObject {
     }
 
 
-    private func markCurrentRunningStepFailed(_ message: String) {
-        if let idx = testSteps.lastIndex(where: { $0.state == .downloading || $0.state == .running }) {
-            testSteps[idx].state = .failed
-            testSteps[idx].messages.append(message)
-            totalMessageCount += 1
-        }
+    private func markStepFailed(_ entry: ExecutionLogEntry) {
+        guard let idx = stepIndex(for: entry) else { return }
+        testSteps[idx].state = .failed
+        testSteps[idx].messages.append(entry.message)
+        totalMessageCount += 1
     }
 
+    /// Which card an entry belongs to. The engine names the item on every
+    /// item-scoped entry, so ASK rather than infer; scanning for the last
+    /// running card is only a fallback for entries that carry no item (and for a
+    /// name with no card yet — printf must never invent one).
+    private func stepIndex(for entry: ExecutionLogEntry) -> Int? {
+        if let name = entry.itemName,
+           let idx = testSteps.lastIndex(where: { $0.name == name }) {
+            return idx
+        }
+        return testSteps.lastIndex(where: { $0.state == .running })
+            ?? testSteps.lastIndex(where: { $0.state == .downloading })
+            ?? testSteps.indices.last
+    }
+
+    /// INFO_TESTDDR_OK means the whole run passed, so nothing may still be in
+    /// flight. The engine emits INFO_RUNITEM_OK per item, so a card left running
+    /// here means an entry went missing — backfill it, but SAY SO. This used to
+    /// rewrite state silently, hiding exactly the anomaly worth seeing.
     private func markAllPendingStepsPassed() {
-        for i in testSteps.indices {
-            if testSteps[i].state == .running || testSteps[i].state == .downloading {
-                testSteps[i].state = .passed
-            }
+        for i in testSteps.indices where testSteps[i].state == .running || testSteps[i].state == .downloading {
+            testSteps[i].state = .passed
+            testSteps[i].messages.append("(该步骤未收到独立的完成回执，由整体测试通过推定为通过)")
+            totalMessageCount += 1
         }
     }
 
