@@ -19,7 +19,16 @@ final class MainViewModel: ObservableObject {
     /// on the streaming printf path.
     @Published var totalMessageCount = 0
 
-    @Published var overallOutcome: TestOutcome?
+    /// The run's conclusion, three-state (see `DDRCore.RunConclusion`). A USB
+    /// timeout is NOT a bad board: it used to be collapsed into `.failed` here,
+    /// which showed the operator the same red 「测试失败」 as a real device
+    /// verdict — and that scraps good boards.
+    @Published var overallConclusion: RunConclusion?
+    /// For the saved log file, which records PASS/FAIL only.
+    var overallOutcome: TestOutcome? {
+        guard let overallConclusion else { return nil }
+        return overallConclusion == .passed ? .passed : .failed
+    }
     @Published var selectedSoc: String? {
         didSet { if selectedSoc != oldValue { refreshEyescanCfgURL() } }
     }
@@ -79,7 +88,7 @@ final class MainViewModel: ObservableObject {
         testSteps = []
         totalMessageCount = 0
         runToken += 1
-        overallOutcome = nil
+        overallConclusion = nil
     }
 
     /// 眼图对当前 SoC 是否可用,**完全由「是否随附眼图 cfg」决定**——眼图无需任何
@@ -248,7 +257,7 @@ final class MainViewModel: ObservableObject {
         // second, standalone test run resets normally.)
         if carryDetectStepIntoTest {
             carryDetectStepIntoTest = false   // 续用 detect 的时间线,不新建 ScrollView
-            overallOutcome = nil
+            overallConclusion = nil
         } else {
             beginNewRun()
         }
@@ -292,17 +301,17 @@ final class MainViewModel: ObservableObject {
                 setDeviceNeedsBoot(false)
             }
 
-            // If any step ended in failure, the overall outcome is failure
-            // regardless (its verdict came from the device's status/result).
-            if testSteps.contains(where: { $0.state == .failed }) {
-                overallOutcome = .failed
-            } else {
-                overallOutcome = result.outcome
-            }
-            statusMessage = overallOutcome == .passed ? "Test finished: PASS" : "Test finished: FAIL"
+            // The verdict is the engine's — it comes from the device's status /
+            // result words. The old code additionally forced FAIL whenever any
+            // step had logged an error, which turned a non-fatal host-side error
+            // on a passing run into a scrapped board.
+            let conclusion = RunConclusion.solder(result)
+            overallConclusion = conclusion
+            statusMessage = Self.statusLine(conclusion)
         } catch {
-            overallOutcome = .failed
-            statusMessage = error.localizedDescription
+            // Never reached the device's verdict → no conclusion about the DDR.
+            overallConclusion = .inconclusive(.transport)
+            statusMessage = "未测出结论:\(error.localizedDescription)"
         }
 
         isRunning = false
@@ -311,31 +320,24 @@ final class MainViewModel: ObservableObject {
         startKeepAlive()
     }
 
-    static let eyescanStepName = "眼图测试"
-
-    /// 眼图判定标准(与设备固件一致):
-    /// - `all result:` 的**条数随 SoC 拓扑而变**:RK3576 双通道 / RK3588 四通道 → 每通道各一条;
-    ///   RK3568 单通道 → 只一条(固件把 cs0/cs1 两个片选汇总进这一条)。末尾接 `all dq eye scan done`。
-    /// **完全采用固件自己的汇总判定,HOST 不加额外判断逻辑**:
-    ///   (a) **完成标记** `all dq eye scan done`:确认真跑完(否则 → 未完成,不下 pass/fail 结论)。
-    ///   (b) **`all result:` 全 pass**:这是固件扫完所有 DQ 后打的**自身汇总判定行**(pass / `  fail`)。
-    ///       多通道(RK3576 双 / RK3588 四)每通道各打一条 → 忠实读取**每一条**,全 pass 才 PASS。
-    ///       这不是 host 额外逻辑,只是不遗漏任一通道的固件判定(旧代码只看最后一条会把某通道的
-    ///       失败被后一通道的 pass 掩盖)。RK3568 单通道只一条(固件把 cs0/cs1 汇总进它)。
-    /// - 无完成标记 → **未完成**(超时 / 设备异常 / 未处于 Maskrom / 训练中止),不下 pass/fail 结论。
-    private func eyescanVerdict(_ transcript: String)
-        -> (done: Bool, pass: Bool, resultLine: String?) {
-        let done = transcript.contains("all dq eye scan done")
-        let resultLines = transcript
-            .split(separator: "\n", omittingEmptySubsequences: false)
-            .filter { $0.contains("all result:") }
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-        // 完成标记 + 每条固件汇总 all result: 都 pass(≥1 条)才判 PASS。
-        let pass = !resultLines.isEmpty && resultLines.allSatisfy { $0.contains("pass") }
-        // 展示:优先给出错的那条(定位是哪个通道),全 pass 时自然落到末条。
-        let resultLine = resultLines.first(where: { !$0.contains("pass") }) ?? resultLines.last
-        return (done, pass, resultLine)
+    /// One status line per conclusion. 「测试失败」 is reserved for a real device
+    /// verdict; everything else says plainly that the board was NOT judged.
+    static func statusLine(_ c: RunConclusion) -> String {
+        switch c {
+        case .passed: return "测试通过"
+        case .deviceFailed: return "测试失败:设备判定 DDR 不合格"
+        case .inconclusive(let reason):
+            switch reason {
+            case .transport: return "未测出结论:USB 传输失败 —— 请检查连接后重试,板子未被判定"
+            case .cfg: return "未测出结论:配置文件缺失或无法解析,板子未被判定"
+            case .noDevice: return "未测出结论:未找到处于 Maskrom 的设备"
+            case .deviceWedged: return "未测出结论:设备中途停止响应 —— 请重新插拔后重试"
+            case .scanIncomplete: return "未测出结论:扫描未在时限内完成 —— 板子正常,是耗时超限"
+            }
+        }
     }
+
+    static let eyescanStepName = "眼图测试"
 
     /// 眼图测试入口。3 步全在设备端:train-only 眼图 bin(自训练 DDR + 定几何)→
     /// DDR Test Tool(常驻 0x80 服务)→ 重定位测量核。全程无需选配置文件。
@@ -378,40 +380,28 @@ final class MainViewModel: ObservableObject {
             try? transport.close()
             flushEyescanLineCarry()   // 冲掉最后一行不带换行的残余
 
-            let v = eyescanVerdict(transcript)
             lastEyescanTranscript = transcript
-            if v.done {
-                setStepState(Self.eyescanStepName, v.pass ? .passed : .failed)
-                overallOutcome = v.pass ? .passed : .failed
-                appendEyescanText("判定:\(v.resultLine ?? "all result: (缺失)")\n")
-                statusMessage = v.pass ? "眼图完成:PASS(所有 DQ 裕量达标)"
-                                       : "眼图完成:FAIL(存在裕量不足的 DQ)"
-                // 跑完了但板子没真正复位 → 下一轮的 0x471 下载会失败,先提示。
-                if outcome.returnedToMaskrom == false {
-                    appendEyescanText("注意:设备未复位回 Maskrom,下次开始前请重新插拔\n")
-                }
-            } else if outcome.wedged {
-                // 设备长时间无输出 = item 没跑完就停了。此时设备整体不再响应,连 reboot item
-                // 也跑不了 —— 唯一的恢复手段是物理重新插拔。overallOutcome 保持 nil,不下结论。
-                setStepState(Self.eyescanStepName, .failed)
-                appendEyescanText("扫描超时且设备已停止输出 —— 板子已卡死,请重新插拔后再试\n")
-                statusMessage = "眼图未完成:设备卡死,需重新插拔"
-            } else if !outcome.completedViaStatus {
-                // 超时但数据一直在流 = 设备正常,只是比超时慢。板子没坏。
-                setStepState(Self.eyescanStepName, .failed)
-                appendEyescanText("扫描超时,但设备仍在持续输出 —— 板子正常,是耗时超过了上限\n")
-                statusMessage = "眼图未完成:超时(设备正常)"
-            } else {
-                // 设备报了完成,但输出里没有完成标记 → 扫描本身异常,不是链路卡死。
-                setStepState(Self.eyescanStepName, .failed)
-                appendEyescanText("设备已上报完成,但输出缺少完成标记(all dq eye scan done)\n")
-                statusMessage = "眼图未完成,请检查设备"
+            // 判读全部来自 DDRCore:固件自己的 all result: 汇总 + 传输侧结论。
+            let report = EyescanVerdict.parse(transcript)
+            let conclusion = RunConclusion.eyescan(report: report, wedged: outcome.wedged,
+                                                   completedViaStatus: outcome.completedViaStatus)
+            overallConclusion = conclusion
+            setStepState(Self.eyescanStepName, conclusion == .passed ? .passed : .failed)
+            statusMessage = Self.statusLine(conclusion)
+            if let line = report.displayLine {
+                appendEyescanText("固件判定:\(line)\n")
+            }
+            appendEyescanText("结论:\(Self.statusLine(conclusion))\n")
+            // 跑完了但板子没真正复位 → 下一轮的 0x471 下载会失败,先提示。
+            if conclusion != .inconclusive(.deviceWedged), outcome.returnedToMaskrom == false {
+                appendEyescanText("注意:设备未复位回 Maskrom,下次开始前请重新插拔\n")
             }
         } catch {
             setStepState(Self.eyescanStepName, .failed)
-            appendEyescanText("眼图失败:\(error.localizedDescription)\n")
+            overallConclusion = .inconclusive(.transport)
+            appendEyescanText("眼图未测出结论:\(error.localizedDescription)\n")
             appendEyescanText("请确认设备处于 Maskrom(若刚跑过焊接测试,需重新插拔),再重试\n")
-            statusMessage = "眼图失败,请确认 Maskrom 后重试"
+            statusMessage = Self.statusLine(.inconclusive(.transport))
         }
 
         // 眼图跑完设备自复位回 Maskrom → 交给设备监视器(pollDevices)处理重枚举
@@ -855,8 +845,10 @@ final class MainViewModel: ObservableObject {
             Self.dlog("detect done: \(out.geometry.summary()) matches=\(out.candidates.count) tier=\(out.matchTier)")
             setDeviceNeedsBoot(false)   // Boot 常驻，测试跳过 boot
 
-            switch out.matchTier {
-            case .uniqueByCoarse, .uniqueByTieBreak:
+            // 采纳与否由 DDRCore 的 DetectVerdict 决定(铁律:非唯一命中绝不自动跑);
+            // tier 在此只用来决定给操作员看哪句话。
+            switch DetectVerdict.decide(out.matchTier) {
+            case .adopt:
                 guard applyDetectCandidates(out.candidates) != nil else {
                     setStepState(Self.detectStepName, .failed)
                     appendStepMessage(Self.detectStepName, "已识别 \(out.geometry.summary())，但库中无对应配置 — 请手动选择")
@@ -882,18 +874,19 @@ final class MainViewModel: ObservableObject {
                 isDetecting = false
                 await runSolderTest()
 
-            case .ambiguous:
-                setStepState(Self.detectStepName, .passed)
-                appendStepMessage(Self.detectStepName, "检测到 \(out.geometry.summary())")
-                appendStepMessage(Self.detectStepName, "有多种同规格配置，请选择后再点开始测试")
-                statusMessage = "检测到 \(out.geometry.summary())，有多种同规格配置，请选择后开始测试"
-                startKeepAlive()
-
-            case .none:
-                setStepState(Self.detectStepName, .failed)
-                appendStepMessage(Self.detectStepName, "未能识别内存(\(out.geometry.summary()))")
-                appendStepMessage(Self.detectStepName, "请手动选择配置文件后再点开始测试")
-                statusMessage = "未能自动识别内存，请手动选择配置文件后开始测试"
+            case .manual:
+                switch out.matchTier {
+                case .ambiguous:
+                    setStepState(Self.detectStepName, .passed)
+                    appendStepMessage(Self.detectStepName, "检测到 \(out.geometry.summary())")
+                    appendStepMessage(Self.detectStepName, "有多种同规格配置，请选择后再点开始测试")
+                    statusMessage = "检测到 \(out.geometry.summary())，有多种同规格配置，请选择后开始测试"
+                default:
+                    setStepState(Self.detectStepName, .failed)
+                    appendStepMessage(Self.detectStepName, "未能识别内存(\(out.geometry.summary()))")
+                    appendStepMessage(Self.detectStepName, "请手动选择配置文件后再点开始测试")
+                    statusMessage = "未能自动识别内存，请手动选择配置文件后开始测试"
+                }
                 startKeepAlive()
             }
         } catch {

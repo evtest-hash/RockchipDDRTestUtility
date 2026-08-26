@@ -395,25 +395,34 @@ func tierString(_ t: CfgAutoSelect.MatchTier) -> String {
 /// `candidates[0]` even for an ambiguous group, which is how the CLI used to
 /// test a board against a cfg the GUI would have refused.
 func uniqueCfg(_ out: DetectOutcome, in files: [TestFileEntry]) -> TestFileEntry? {
-    switch out.matchTier {
-    case .uniqueByCoarse, .uniqueByTieBreak:
-        return CfgAutoSelect.firstAvailable(out.candidates, in: files)
-    case .ambiguous, .none:
-        return nil
+    switch DetectVerdict.decide(out.matchTier) {
+    case .adopt: return CfgAutoSelect.firstAvailable(out.candidates, in: files)
+    case .manual: return nil
     }
 }
 
-/// Eye-scan PASS verdict — mirrors the GUI's `eyescanVerdict` (MainViewModel).
-/// Completion alone is NOT pass: the firmware prints one `all result:` summary
-/// line per channel (pass / `  fail`) after scanning every DQ. Pass requires the
-/// done marker AND at least one `all result:` line AND every such line == pass.
-func eyescanPass(_ transcript: String) -> Bool {
-    guard transcript.contains("all dq eye scan done") else { return false }
-    let resultLines = transcript
-        .split(whereSeparator: \.isNewline)
-        .map { $0.trimmingCharacters(in: .whitespaces) }
-        .filter { $0.contains("all result:") }
-    return !resultLines.isEmpty && resultLines.allSatisfy { $0.contains("pass") }
+/// One human-readable line per conclusion. "FAIL" is reserved for a real device
+/// verdict — a run that produced none must never print it.
+func eyescanVerdictLine(_ c: RunConclusion) -> String {
+    switch c {
+    case .passed: return "PASS — all DQ eye margins pass"
+    case .deviceFailed: return "FAIL — the firmware judged a DQ eye out of margin"
+    case .inconclusive(let reason): return "NO VERDICT — \(reason) (the board was not judged)"
+    }
+}
+
+/// Map the shared conclusion onto this CLI's machine-readable reason. The
+/// verdict itself is `DDRCore.RunConclusion`; only the naming is CLI-local.
+extension CLIErrorCode {
+    static func from(_ reason: InconclusiveReason) -> CLIErrorCode {
+        switch reason {
+        case .transport: return .transport
+        case .cfg: return .cfgNotFound
+        case .noDevice: return .noDevice
+        case .deviceWedged: return .deviceWedged
+        case .scanIncomplete: return .scanIncomplete
+        }
+    }
 }
 
 func printUsageAndExit() -> Never {
@@ -600,12 +609,17 @@ struct RockchipDDRTestUtilityCLI {
         try? transport.close()
 
         let transcript = outcome.transcript
-        let pass = eyescanPass(transcript)
-
-        // A wedged or still-streaming device produced NO verdict about the eye —
-        // exit 1, not 2. Only a completed scan with a `fail` line scraps a board.
-        let errorCode: CLIErrorCode? = outcome.wedged ? .deviceWedged
-            : (!outcome.completedViaStatus ? .scanIncomplete : nil)
+        let report = EyescanVerdict.parse(transcript)
+        // Wedged, still-streaming, or completed-without-the-done-marker all mean
+        // NO verdict about the eye — exit 1, not 2. Only a completed scan whose
+        // firmware summary says fail scraps a board.
+        let conclusion = RunConclusion.eyescan(report: report, wedged: outcome.wedged,
+                                               completedViaStatus: outcome.completedViaStatus)
+        let pass = conclusion == .passed
+        let errorCode: CLIErrorCode? = switch conclusion {
+        case .inconclusive(let reason): CLIErrorCode.from(reason)
+        case .passed, .deviceFailed: nil
+        }
         // The code alone doesn't say what to DO about it, and these two are the
         // only outcomes an operator can act on without touching the board.
         let errorMessage: String? = switch errorCode {
@@ -616,7 +630,8 @@ struct RockchipDDRTestUtilityCLI {
 
         CLIOut.summary("\n=== EYE-SCAN SUMMARY ===")
         CLIOut.summary("  bytes captured : \(transcript.utf8.count)")
-        CLIOut.summary("  verdict        : \(pass ? "PASS — all DQ eye margins pass" : "FAIL — a DQ eye failed or the scan did not complete")  (done + all result: pass)")
+        CLIOut.summary("  verdict        : \(eyescanVerdictLine(conclusion))")
+        if let line = report.displayLine { CLIOut.summary("  firmware says  : \(line)") }
         if outcome.wedged {
             CLIOut.summary("  device         : WEDGED — stopped responding; PHYSICALLY REPLUG the board before the next run")
         } else if !outcome.completedViaStatus {
@@ -625,14 +640,14 @@ struct RockchipDDRTestUtilityCLI {
             CLIOut.summary("  device         : did NOT reset — replug before the next run")
         }
 
-        var out = CLIResult(mode: .eyescan, pass: pass && errorCode == nil,
+        var out = CLIResult(mode: .eyescan, pass: pass,
                             errorCode: errorCode, errorMessage: errorMessage)
         out.fill(device: device, soc: DetectProfiles.forPID(device.productID)?.soc ?? soc)
         out.cpuid = outcome.cpuid.map(ChipIdentity.hex)
         out.serial = outcome.cpuid.flatMap(ChipIdentity.serial(fromCpuid:))
         out.fill(variant: outcome.variant)
         out.rebootedToMaskrom = outcome.returnedToMaskrom
-        out.eyescan = EyescanJSON(pass: pass, completed: outcome.completedViaStatus,
+        out.eyescan = EyescanJSON(pass: pass, completed: outcome.completedViaStatus && report.scanCompleted,
                                   wedged: outcome.wedged, bytes: transcript.utf8.count,
                                   transcript: transcript)
         return out
@@ -800,11 +815,15 @@ struct RockchipDDRTestUtilityCLI {
         let rebooted = await detector.rebootToMaskrom(transport: transport, device: device)
         CLIOut.summary("=== reboot to bootrom: \(rebooted ? "OK (re-enumerated in maskrom)" : "sent") ===")
 
-        let pass = run.outcome == .passed
         // A transport/cfg failure means the DDR was never judged — exit 1. ONLY
         // FailureKind.deviceVerdict (resultCode != 0) yields exit 2.
+        let conclusion = RunConclusion.solder(run)
+        let pass = conclusion == .passed
         result.pass = pass
-        result.errorCode = CLIErrorCode.from(run.failure)
+        result.errorCode = switch conclusion {
+        case .inconclusive(let reason): CLIErrorCode.from(reason)
+        case .passed, .deviceFailed: nil
+        }
         result.errorMessage = result.errorCode == nil ? nil
             : run.logs.last(where: { $0.level == .error })?.message
         result.rebootedToMaskrom = rebooted

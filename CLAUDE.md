@@ -115,6 +115,40 @@ a device verdict. `ResultLogWriter.render` now appends host-side ERROR entries
 after the device printf, because the CLI embeds that render as the sole failure
 evidence in its JSON.
 
+### Verdict layer — every pass/fail decision, in ONE place
+
+`DDRCore/Verdict.swift` owns every judgement this tool makes; the GUI and the CLI
+are only allowed to DISPLAY what it returns (and, for the CLI, map it onto exit
+codes). **Any new threshold, tier→action mapping, or pass/fail rule goes here and
+comes with a test. Never in an app target — neither is unit-testable.**
+
+This rule exists because it was broken. The eye-scan verdict had a copy in
+`MainViewModel` and another in `CLIMain`; they drifted, and the GUI's copy
+reported PASS on a board whose firmware had printed `all result: err`. The device
+speaks CRLF, `"\r\n"` is ONE Swift Character, so `split(separator: "\n")` never
+split it — the whole transcript came back as a single "line", which of course
+"contains pass" because of the earlier per-channel `pass` lines. `EyescanVerdict`
+splits on `\.isNewline` instead, and a golden fixture captured from the failing
+RK3566 (`Tests/DDRCoreTests/Fixtures/eyescan_rk3566_cs0wr_fail_crlf.txt`) pins it.
+
+- `EyescanVerdict.parse` → `EyescanReport` (firmware's own `all result:` summaries
+  + the `all dq eye scan done` marker). The host adds NO thresholds of its own.
+- `RunConclusion` — **three** states, not two: `.passed` / `.deviceFailed` /
+  `.inconclusive(InconclusiveReason)`. `.solder(_:)` maps an `ExecutionResult`,
+  `.eyescan(report:wedged:completedViaStatus:)` maps a scan. Only `.deviceFailed`
+  means scrap the board.
+- `DetectVerdict.decide(_ tier:)` → `.adopt` / `.manual` — the iron rule that a
+  cfg is run only on a unique match. Tier still selects the operator-facing
+  wording; it no longer selects the DECISION in two places.
+
+The GUI renders `RunConclusion` directly (`overallConclusion`): green 测试通过 /
+red 测试失败 / **orange 未测出结论**. Before this it collapsed every host-side
+error into red 测试失败 — `FailureKind` was produced by the engine and consumed
+only by the CLI — so a bulk timeout looked exactly like a bad-DDR verdict and a
+production line would scrap a good board. The GUI also no longer forces FAIL when
+any step logged an error; the verdict is the engine's, taken from the device's
+status/result words.
+
 ### CLI exit codes & JSON contract
 
 Both are derived in ONE place (`CLIExit.from` in `CLIMain.swift`) from the two
@@ -135,10 +169,15 @@ so a zero-match means the geometry isn't a real part) while `.ambiguous` is
 `errorCode: ambiguousCfg` (exit 1, needs a human). `uniqueCfg()` enforces the
 GUI's iron rule; plain `CfgAutoSelect.firstAvailable` returns `candidates[0]`
 even for an ambiguous group, which is how `--solder` used to test a board
-against a cfg the GUI would have refused. `--eyescan` maps `wedged` /
-`!completedViaStatus` to `deviceWedged` / `scanIncomplete` (exit 1) — both were
-previously printed only to the human summary, so automation could not tell
-"replug the fixture" from "this board's eye failed".
+against a cfg the GUI would have refused. `--eyescan` derives its verdict from
+`RunConclusion.eyescan`, which maps `wedged` / `!completedViaStatus` to
+`deviceWedged` / `scanIncomplete` (exit 1) — both were previously printed only to
+the human summary, so automation could not tell "replug the fixture" from "this
+board's eye failed". A scan whose status says done but whose transcript carries
+no `all dq eye scan done` marker is now ALSO exit 1 (it used to be exit 2): the
+scan misbehaved, so no verdict about the DDR exists, and only a device verdict
+may scrap a board. The human summary says `NO VERDICT — <reason>` there, never
+FAIL.
 
 The JSON contract covers the four production commands (`--detect`, `--solder`,
 `--eyescan`, `--list`) plus every error path. `--cfg` / `--probe-bulk` are

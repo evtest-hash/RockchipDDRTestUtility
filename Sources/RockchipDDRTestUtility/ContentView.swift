@@ -183,8 +183,8 @@ struct ContentView: View {
                 .id(viewModel.runToken)
             }
 
-            if let outcome = viewModel.overallOutcome {
-                resultBadge(outcome)
+            if let conclusion = viewModel.overallConclusion {
+                resultBadge(conclusion)
                     .padding(16)
                     .transition(.opacity)
             }
@@ -318,12 +318,18 @@ struct ContentView: View {
         }
     }
 
-    private func resultBadge(_ outcome: TestOutcome) -> some View {
-        let isPass = outcome == .passed
+    /// 三态,不是两态:黄色「未测出结论」表示这块板没有被判定过 —— 查治具/线缆后重测,
+    /// 不要当废板处理。只有红色才是设备判定 DDR 不合格。
+    private func resultBadge(_ conclusion: RunConclusion) -> some View {
+        let (icon, text, color): (String, String, Color) = switch conclusion {
+        case .passed: ("checkmark.circle.fill", "测试通过", .green)
+        case .deviceFailed: ("xmark.circle.fill", "测试失败", .red)
+        case .inconclusive: ("exclamationmark.triangle.fill", "未测出结论", .orange)
+        }
         return HStack(spacing: 8) {
-            Image(systemName: isPass ? "checkmark.circle.fill" : "xmark.circle.fill")
+            Image(systemName: icon)
                 .font(.title2)
-            Text(isPass ? "测试通过" : "测试失败")
+            Text(text)
                 .font(.title3)
                 .fontWeight(.bold)
         }
@@ -332,8 +338,8 @@ struct ContentView: View {
         .padding(.vertical, 12)
         .background(
             RoundedRectangle(cornerRadius: 10)
-                .fill(isPass ? .green : .red)
-                .shadow(color: Color(isPass ? .green : .red).opacity(0.3), radius: 8, y: 4)
+                .fill(color)
+                .shadow(color: color.opacity(0.3), radius: 8, y: 4)
         )
     }
 }

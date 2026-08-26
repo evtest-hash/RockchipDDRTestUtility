@@ -279,7 +279,7 @@ public actor EyescanRunner {
                         Date().timeIntervalSince(lastDataAt), nStatusOK, nStatusFail, tStatus,
                         (nStatusOK + nStatusFail) > 0 ? tStatus / Double(nStatusOK + nStatusFail) * 1000 : 0,
                         lastStatusError.isEmpty ? "" : " | last status error: \(lastStatusError)",
-                        transcript.split(separator: "\n").last.map(String.init) ?? "-"))
+                        transcript.split(whereSeparator: \.isNewline).last.map(String.init) ?? "-"))
         }
         let rate = tData > 0 ? Double(dataBytes)/tData : 0
         mark(String(format: "③ drain stats: %dB | data-reads %d in %.2fs = %.0f B/s (USB limit-when-data, avgchunk %dB, max %dB) | empty-reads %d in %.2fs (100ms-timeout waste) | UI-dropped %d chunk(s)",
