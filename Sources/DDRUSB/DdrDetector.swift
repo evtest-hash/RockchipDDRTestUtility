@@ -15,6 +15,16 @@ public struct DetectOutcome: Sendable {
     public let variant: ChipVariant?
 }
 
+/// What driving one probe item produced. `returned` distinguishes "the device
+/// finished the item" from "we gave up waiting" — the detector's diagnostics
+/// could not tell those apart before.
+struct ProbeItemRun: Sendable {
+    let captured: String
+    let returned: Bool
+    let statusPolls: Int
+    let statusFailures: Int
+}
+
 public enum DetectError: Error, LocalizedError, Sendable {
     case unsupportedSoc
     case cfgPayloadMissing(String)
@@ -47,6 +57,53 @@ public enum DetectError: Error, LocalizedError, Sendable {
 /// a reboot that must fire only after capture), which the engine's
 /// "boot once, run each item in file order for pass/fail" model can't express.
 public actor DdrDetector {
+    /// One probe item (osregdump / otpdump), driven to the point where the DEVICE
+    /// says it is done.
+    ///
+    /// Completion is a device STATE (`testDeviceReady` word1 == finished), NOT a
+    /// content marker: the probe's last bytes can arrive after the text already
+    /// parses, and returning on the text alone left the loader still inside the
+    /// item — the next `downloadItem` then went to a firmware that wasn't back in
+    /// its command loop.
+    ///
+    /// The polling rule is transcribed from `EyescanRunner`, where it was measured
+    /// on hardware: opcode 0 and a producing item are served by the SAME device-side
+    /// loop, so a status poll issued while printf is still handing back data
+    /// contends with the item. Poll ONLY when the ring has gone quiet — by then the
+    /// device answers instantly.
+    ///
+    /// Never throws on a status failure or on the deadline: it returns whatever was
+    /// captured with `returned == false`, which is exactly what this code did before
+    /// it looked at status at all. The caller decides whether the capture is usable.
+    static func runProbeItem(transport: UsbTransport, item: CfgItem, payload: Data,
+                             base: UInt32, timeout: TimeInterval) async throws -> ProbeItemRun {
+        try transport.downloadItem(item: item, payload: payload, address: base)
+        try transport.runItem(item: item, address: base)
+
+        var captured = ""
+        var returned = false
+        var polls = 0, failures = 0
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if let s = try? transport.readPrintf(), !s.isEmpty {
+                captured += "\n" + s
+                continue                       // data still flowing → do NOT poll status
+            }
+            polls += 1
+            do {
+                if try transport.testDeviceReady().phase == .finished {
+                    returned = true
+                    break
+                }
+            } catch {
+                failures += 1                  // transient: retry, don't abort
+            }
+            try? await Task.sleep(nanoseconds: 40_000_000)
+        }
+        return ProbeItemRun(captured: captured, returned: returned,
+                            statusPolls: polls, statusFailures: failures)
+    }
+
     private let resourcesDir: URL   // dir holding the detect cfg
     private let parser = CfgBinaryParser()
 
@@ -119,19 +176,21 @@ public actor DdrDetector {
         var captured = ""
         var words: [UInt32]? = nil
         var tries = 0
-        while words == nil, tries < 20 {
+        var returned = false
+        // Overall bound preserves the old worst case (20 tries x 480ms fixed drain
+        // ~= 10s). Each try may now wait longer than that drain, but it exits as
+        // soon as the device reports the item done — normally tens of ms.
+        let osregDeadline = Date().addingTimeInterval(10)
+        while words == nil, tries < 20, Date() < osregDeadline {
             tries += 1
-            do {
-                try transport.downloadItem(item: probeItem, payload: probeBin, address: base)
-                try transport.runItem(item: probeItem, address: base)
-            } catch { break }
-            for _ in 0..<12 {
-                if let s = try? transport.readPrintf(), !s.isEmpty { captured += "\n" + s }
-                try? await Task.sleep(nanoseconds: 40_000_000)
-            }
+            guard let run = try? await Self.runProbeItem(transport: transport, item: probeItem,
+                                                         payload: probeBin, base: base, timeout: 1.5)
+            else { break }
+            captured += run.captured
+            returned = run.returned
             words = OsRegDecoder.parseProbeOutput(captured)
         }
-        phase("③ osregdump capture (\(tries) tr\(tries == 1 ? "y" : "ies"))")
+        phase("③ osregdump capture (\(tries) tr\(tries == 1 ? "y" : "ies"), item \(returned ? "returned" : "DID NOT return"))")
         guard let words else { throw DetectError.noOsReg }
 
         let geo = OsRegDecoder.decode(words)
@@ -168,29 +227,21 @@ public actor DdrDetector {
         var otpDump: OtpDump? = nil
         if readIdentity, let idProbe = profile.idProbe, let otpBin = payload("otpdump") {
             let otpItem = CfgItem(name: "otpdump", payloadOffset: 0, payloadLength: otpBin.count)
+            var otpReturned = false
             do {
-                try transport.downloadItem(item: otpItem, payload: otpBin, address: base)
-                try transport.runItem(item: otpItem, address: base)
-                var otpCaptured = ""
-                for _ in 0..<12 {
-                    if let s = try? transport.readPrintf(), !s.isEmpty { otpCaptured += "\n" + s }
-                    // Stop as soon as the capture holds everything this SoC's probe
-                    // can give; the variant is re-derived from each parse, so a
-                    // dump that is still growing never leaves a stale reading.
-                    var complete = false
-                    if let dump = ChipIdentity.parseOtpDump(otpCaptured,
-                                                            fallbackBaseByte: idProbe.legacyBaseByte) {
-                        otpDump = dump
-                        if let family = profile.family {
-                            variant = ChipVariant.resolve(family: family, dump: dump)
-                        }
-                        if let id = dump.slice(at: idProbe.cpuidOffset, count: ChipIdentity.cpuidLength) {
-                            cpuid = id
-                            complete = true
-                        }
+                // Parse ONCE, on the finished capture. The old loop re-parsed every
+                // 40ms and broke on the first complete-looking text — which is how a
+                // still-running item got left behind.
+                let run = try await Self.runProbeItem(transport: transport, item: otpItem,
+                                                      payload: otpBin, base: base, timeout: 3)
+                otpReturned = run.returned
+                if let dump = ChipIdentity.parseOtpDump(run.captured,
+                                                        fallbackBaseByte: idProbe.legacyBaseByte) {
+                    otpDump = dump
+                    if let family = profile.family {
+                        variant = ChipVariant.resolve(family: family, dump: dump)
                     }
-                    if complete { break }
-                    try? await Task.sleep(nanoseconds: 40_000_000)
+                    cpuid = dump.slice(at: idProbe.cpuidOffset, count: ChipIdentity.cpuidLength)
                 }
             } catch {
                 cpuid = nil
@@ -204,6 +255,7 @@ public actor DdrDetector {
             let raw = otpDump.map { "otp[0x\(String($0.baseByte, radix: 16))+]=\(ChipIdentity.hex($0.bytes))" }
                 ?? "otp=unreadable"
             phase("③b otpdump capture (cpuid \(cpuid == nil ? "unavailable" : "ok")"
+                  + ", item \(otpReturned ? "returned" : "DID NOT return")"
                   + ", 型号 \(variant?.name ?? "未判定"), \(raw))")
         }
 
