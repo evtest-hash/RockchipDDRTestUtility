@@ -4,6 +4,8 @@ A macOS native tool for testing DDR memory on Rockchip SoCs **over pure USB** �
 
 ![Rockchip DDR Test Utility](assets/screenshot.png)
 
+*焊接检测 after a pass: auto-detect filled in the config, each stage carries the device's own output, and the verdict has its own row.*
+
 ## What it does
 
 Three checks, all driven from the same USB session:
@@ -72,6 +74,11 @@ From [Releases](../../releases):
    - 眼图: the firmware self-trains the DDR and scans every DQ — no config involved, so the config pop-up disappears
 4. Watch the log area — detection appears as the first card, followed by the test steps
 5. Click **保存测试日志** / **保存眼图日志** to export
+
+| 焊接 | 眼图 |
+|:---:|:---:|
+| ![焊接 empty state](assets/solder-idle.png) | ![眼图 empty state](assets/eyescan-idle.png) |
+| config pop-up in the toolbar | no config — the geometry is probed |
 
 Everything the run needs sits in the toolbar: which board, which check, which config. The verdict has a row of its own at the bottom of the window, so it never covers the log it is summarising.
 
@@ -227,6 +234,10 @@ Decoded per the vendor kernel's own rules, each pinned by a capture from real si
 `--eyescan` / 眼图 mode runs a per-DQ eye / margin scan from the SoC's packaged `DDR眼图.cfg`, streaming the firmware transcript back over USB. Availability is decided purely by whether that config ships for the connected SoC — adding a new eye-scan SoC means dropping in a `…眼图.cfg`, no code change.
 
 The scan is not a pass/fail soldering check: it reports rx / tx margin per DQ. The PASS verdict requires the `all dq eye scan done` marker **and** every per-channel `all result:` line to read pass.
+
+![眼图 pass](assets/eyescan-pass.png)
+
+The pane ends with the firmware's own summary and the verdict derived from it, so a failing scan names the reason (`dq28,dq30, fail` → `all result: err`) instead of leaving it in 400 lines of transcript.
 
 ## Architecture
 
