@@ -8,9 +8,23 @@ final class MainViewModel: ObservableObject {
     @Published var selectedFileID: String?
     @Published var devices: [UsbDevice] = []
     @Published var selectedDeviceID: String?
-    @Published var isRunning = false
+    /// What the session is doing. Was two independent booleans (`isRunning`,
+    /// `isDetecting`), which made "detecting AND testing" representable and left
+    /// every guard checking both. Both are now derived, so the view is unchanged.
+    enum Phase: Equatable { case idle, detecting, testing }
+    @Published var phase: Phase = .idle
+    var isRunning: Bool { phase == .testing }
     @Published var statusMessage: String = ""
-    @Published var testSteps: [TestStep] = []
+    /// Run state is PER TOOL. 焊接 and 眼图 are separate tests with separate
+    /// lifecycles, and they used to share one array — so a finished eye-scan card,
+    /// green PASS and all, appeared in the soldering pane, where an operator reads
+    /// it as a verdict about the wrong test. Exposed as `testSteps` so every call
+    /// site (and the view) still just says "the current tool's steps".
+    @Published private var stepsByTool: [ToolMode: [TestStep]] = [:]
+    var testSteps: [TestStep] {
+        get { stepsByTool[mode] ?? [] }
+        set { stepsByTool[mode] = newValue }
+    }
     /// Monotonic count of messages appended across all steps. Bumped at every
     /// `messages.append` site, so it changes for both new steps (always created
     /// with a first message) and printf appended to an existing step. The UI
@@ -23,7 +37,11 @@ final class MainViewModel: ObservableObject {
     /// timeout is NOT a bad board: it used to be collapsed into `.failed` here,
     /// which showed the operator the same red 「测试失败」 as a real device
     /// verdict — and that scraps good boards.
-    @Published var overallConclusion: RunConclusion?
+    @Published private var conclusionByTool: [ToolMode: RunConclusion] = [:]
+    var overallConclusion: RunConclusion? {
+        get { conclusionByTool[mode] }
+        set { conclusionByTool[mode] = newValue }
+    }
     @Published var selectedSoc: String? {
         didSet { if selectedSoc != oldValue { refreshEyescanCfgURL() } }
     }
@@ -36,9 +54,9 @@ final class MainViewModel: ObservableObject {
     /// *preselects*; this switch lets the operator opt out entirely.
     @Published var autoDetectEnabled = true
     /// True while a DDR auto-detect probe (DdrDetector.detect) is in flight for
-    /// a newly-arrived device. UI can use this to show a "detecting..." state
-    /// distinct from `isRunning` (which covers the actual test execution).
-    @Published var isDetecting = false
+    /// a newly-arrived device. The UI shows a "detecting..." state distinct from
+    /// `isRunning` (which covers the actual test execution).
+    var isDetecting: Bool { phase == .detecting }
     /// 工具箱模式:焊接测试(广覆盖)或眼图 / 裕量扫描(窄覆盖,按 cfg 存在与否背书)。
     /// 分段控件选「测什么」,单个「开始」按钮按此模式分派。每个模式自带它的展示
     /// 文案(空状态标题 / 步骤、保存按钮标题 / 文件名),文案跟着模式走,视图里不必
@@ -70,7 +88,12 @@ final class MainViewModel: ObservableObject {
         var saveButtonLabel: String { self == .eyescan ? "保存眼图日志" : "保存测试结果" }
         var saveFileName: String { self == .eyescan ? "DDR_Eyescan.txt" : "DDR_Test_Result.txt" }
     }
-    @Published var mode: ToolMode = .solder
+    @Published var mode: ToolMode = .solder {
+        // Each tool keeps its own steps and verdict, so switching just changes
+        // which one is on screen; bump the token so the log view starts at the
+        // top of that tool's log rather than the other one's scroll offset.
+        didSet { if mode != oldValue { runToken += 1 } }
+    }
 
     /// 每开一轮新测试(焊接 / detect / 眼图)自增。用作日志区 ScrollView 的 `.id`,
     /// 强制新一轮重建一个全新的 ScrollView——否则会复用上一轮已滚到底部的滚动
@@ -98,7 +121,7 @@ final class MainViewModel: ObservableObject {
 
     /// 「开始」按钮是否可点(按当前模式)。
     var canStart: Bool {
-        guard !isRunning, !isDetecting, !devices.isEmpty else { return false }
+        guard phase == .idle, !devices.isEmpty else { return false }
         return mode == .solder || canEyescan
     }
 
@@ -123,13 +146,11 @@ final class MainViewModel: ObservableObject {
     /// to ~6s, during which two racing detects (or a reboot-induced re-enum
     /// re-triggering detect) would otherwise loop. Cleared in
     /// `resetConnectionState()` so a genuine unplug re-arms it.
-    private var hasDetectedForCurrentDevice = false
     /// True until a boot download succeeds on the current device connection.
     /// Mirrors DDR_UserTool's `this+0x4B8` flag: set whenever the device set
     /// changes (device (re)connected), cleared after the first successful boot,
     /// so repeated "start test" runs skip boot and just re-run the bulk test —
     /// exactly how Windows lets you keep clicking start.
-    private var deviceNeedsBoot = true
     /// 眼图流式展示的跨 chunk 行缓冲:readPrintf 的字节不按行对齐,末尾未完成的
     /// 一行暂存于此,待下一段补齐后再落成一条消息(见 appendEyescanLines)。
     private var eyescanLineCarry = ""
@@ -142,8 +163,6 @@ final class MainViewModel: ObservableObject {
     /// Held as the PROTOCOL, not `RkUsbTransportLibusb`: the session logic only
     /// needs the transport's contract, and binding it to libusb is what kept this
     /// class impossible to drive from a test.
-    private var activeTransport: UsbTransport?
-    private var activeTransportDeviceID: String?
     /// Idle keep-alive for the held transport. Mirrors DDR_UserTool's permanent
     /// printf-reader thread (PrintfReaderThreadProc / sub_405C30): while a device
     /// is connected and no test is running, poll `readPrintf()` (opcode 0x80 on
@@ -153,6 +172,25 @@ final class MainViewModel: ObservableObject {
     /// repeat "start test". Cancelled at the start of every test (the engine
     /// owns the transport while `isRunning`) and on teardown. The transport's
     /// `ioLock` serializes any residual overlap with the engine.
+    /// State scoped to ONE connection to ONE board: the handle held across
+    /// "start" clicks plus the two latches that describe that board. They are
+    /// created and dropped together (`resetConnectionState` assigns a fresh
+    /// value), so a latch can never outlive the board it describes — which is
+    /// what four separate fields, each reset by hand, could not guarantee.
+    struct Connection {
+        /// Which board the held handle belongs to; nil when nothing is held.
+        var deviceID: String?
+        /// Held open across clicks — re-opening reissues SET_CONFIGURATION,
+        /// which a booted device can't service (first bulk OUT stalls).
+        var transport: UsbTransport?
+        /// DDR_UserTool's `this+0x4B8`: true until a real boot succeeds on this
+        /// connection, so repeat runs skip the control-transfer boot.
+        var needsBoot = true
+        /// DDR auto-detect has already run for this connection.
+        var probed = false
+    }
+    var connection = Connection()
+
     private var keepAliveTask: Task<Void, Never>?
 
     private let parser = CfgBinaryParser()
@@ -245,7 +283,7 @@ final class MainViewModel: ObservableObject {
             return
         }
 
-        isRunning = true
+        phase = .testing
         // Keep the detect card + start a continuous timeline when this test
         // follows an auto-detect; otherwise start fresh. (Consume the flag so a
         // second, standalone test run resets normally.)
@@ -268,13 +306,13 @@ final class MainViewModel: ObservableObject {
             // — exactly how Windows holds its device handle across "start test"
             // clicks (re-opening re-issues SET_CONFIGURATION and stalls the
             // booted device's bulk endpoint; verified on RK3568 hardware).
-            if activeTransport == nil || activeTransportDeviceID != selectedDeviceID {
+            if connection.transport == nil || connection.deviceID != selectedDeviceID {
                 tearDownActiveTransport()
-                activeTransport = try makeTransport()
-                activeTransportDeviceID = selectedDeviceID
+                connection.transport = try makeTransport()
+                connection.deviceID = selectedDeviceID
             }
-            let skipBoot = !deviceNeedsBoot
-            let engine = TestExecutionEngine(parser: parser, transport: activeTransport!) { [weak self] entry in
+            let skipBoot = !connection.needsBoot
+            let engine = TestExecutionEngine(parser: parser, transport: connection.transport!) { [weak self] entry in
                 // Preserve engine log order in the UI. A detached Task per entry
                 // can reorder Boot / forceinit / connect updates under load.
                 guard let self else { return }
@@ -308,7 +346,7 @@ final class MainViewModel: ObservableObject {
             statusMessage = "未测出结论:\(error.localizedDescription)"
         }
 
-        isRunning = false
+        phase = .idle
         // Transport is still held (keepTransportOpen); resume the idle
         // keep-alive so the device doesn't get suspended before the next click.
         startKeepAlive()
@@ -348,10 +386,10 @@ final class MainViewModel: ObservableObject {
             statusMessage = eyescanHelp
             return
         }
-        isRunning = true
+        phase = .testing
         // 眼图要 Maskrom + 自带 downloadBoot 序列 → 拆掉焊接测试的常驻持久句柄。
         tearDownActiveTransport()
-        defer { isRunning = false }
+        defer { phase = .idle }
 
         ensureStep(Self.eyescanStepName)          // step tracks STATE only (drives the pane header)
         setStepState(Self.eyescanStepName, .running)
@@ -447,7 +485,7 @@ final class MainViewModel: ObservableObject {
         }
         if autoDetectEnabled,
            DetectProfiles.forPID(device.productID) != nil,
-           !hasDetectedForCurrentDevice {
+           !connection.probed {
             await performDetectThenTest(device)
             return
         }
@@ -672,8 +710,12 @@ final class MainViewModel: ObservableObject {
         CfgRepository.makeDefaultRootURL()
     }
 
+    /// How this session gets a transport. Overridden in tests; nothing else in
+    /// the session may construct one, so no path is pinned to real hardware.
+    var transportFactory: () throws -> UsbTransport = { try RkUsbTransportLibusb() }
+
     private func makeTransport() throws -> UsbTransport {
-        return try RkUsbTransportLibusb()
+        try transportFactory()
     }
 
     /// Release the persistent test transport. Called on device-set change
@@ -682,9 +724,9 @@ final class MainViewModel: ObservableObject {
     /// for a device that's gone.
     private func tearDownActiveTransport() {
         stopKeepAlive()
-        try? activeTransport?.close()
-        activeTransport = nil
-        activeTransportDeviceID = nil
+        try? connection.transport?.close()
+        connection.transport = nil
+        connection.deviceID = nil
     }
 
     // MARK: - Idle Keep-Alive
@@ -693,7 +735,7 @@ final class MainViewModel: ObservableObject {
     /// if no transport is held or it isn't open. Idempotent — restarts cleanly.
     private func startKeepAlive() {
         stopKeepAlive()
-        guard let transport = activeTransport, transport.isOpen else { return }
+        guard let transport = connection.transport, transport.isOpen else { return }
         keepAliveTask = Task.detached { [weak self] in
             var consecutiveFails = 0
             while !Task.isCancelled {
@@ -727,10 +769,10 @@ final class MainViewModel: ObservableObject {
     /// loss-detection paths (the keep-alive reader's `handleDeviceLost` and
     /// `pollDevices`' device-removal branch) so the two can't drift.
     private func resetConnectionState() {
-        tearDownActiveTransport()
-        setDeviceNeedsBoot(true)
+        stopKeepAlive()
+        try? connection.transport?.close()
+        connection = Connection()   // fresh latches: needsBoot, not probed, no handle
         selectedDeviceID = nil
-        hasDetectedForCurrentDevice = false
         carryDetectStepIntoTest = false
     }
 
@@ -738,7 +780,7 @@ final class MainViewModel: ObservableObject {
     /// (unplugged or wedged). Resets connection state and refreshes the device
     /// list so the monitor detects the removal immediately and catches the replug.
     @MainActor
-    private func handleDeviceLost() {
+    func handleDeviceLost() {
         resetConnectionState()
         Task { try? await refreshDevices() }
     }
@@ -756,9 +798,8 @@ final class MainViewModel: ObservableObject {
     }
 
     private func pollDevices() {
-        guard !isRunning else { return }
-        guard !isDetecting else { return }
-        guard activeTransport == nil else { return }
+        guard phase == .idle else { return }
+        guard connection.transport == nil else { return }
         do {
             let transport = try makeTransport()
             let newDevices = try transport.discoverDevices()
@@ -810,7 +851,7 @@ final class MainViewModel: ObservableObject {
     }
 
     private func setDeviceNeedsBoot(_ newValue: Bool) {
-        deviceNeedsBoot = newValue
+        connection.needsBoot = newValue
     }
 
     /// 探测 + 测试 原子操作（按钮路径与自动测试插入路径共用）。探测唯一命中
@@ -818,11 +859,11 @@ final class MainViewModel: ObservableObject {
     /// 多规格/未识别 → 不选、提示手动选、停（不测）。探测失败 → 提示、停。
     @MainActor
     private func performDetectThenTest(_ device: UsbDevice) async {
-        hasDetectedForCurrentDevice = true
-        isDetecting = true
+        connection.probed = true
+        phase = .detecting
         statusMessage = "正在检测内存…"
         stopKeepAlive()
-        defer { isDetecting = false }
+        defer { if phase == .detecting { phase = .idle } }
         Self.dlog("detect start: device=\(device.deviceID) pid=0x\(String(format: "%04X", device.productID))")
         beginNewRun()
         ensureStep(Self.detectStepName)
@@ -830,14 +871,14 @@ final class MainViewModel: ObservableObject {
         appendStepMessage(Self.detectStepName, "开始探测…")
         carryDetectStepIntoTest = true
         do {
-            if activeTransport == nil || activeTransportDeviceID != selectedDeviceID {
+            if connection.transport == nil || connection.deviceID != selectedDeviceID {
                 tearDownActiveTransport()
-                activeTransport = try makeTransport()
-                activeTransportDeviceID = selectedDeviceID
+                connection.transport = try makeTransport()
+                connection.deviceID = selectedDeviceID
             }
             let socName = DetectProfiles.forPID(device.productID)?.soc ?? device.socName ?? ""
             let det = DdrDetector(resourcesDir: detectResourcesDir(soc: socName))
-            let out = try await det.detect(transport: activeTransport!, device: device,
+            let out = try await det.detect(transport: connection.transport!, device: device,
                                            socFiles: filesForSelectedSoc, reboot: false)
             Self.dlog("detect done: \(out.geometry.summary()) matches=\(out.candidates.count) tier=\(out.matchTier)")
             setDeviceNeedsBoot(false)   // Boot 常驻，测试跳过 boot
@@ -861,15 +902,14 @@ final class MainViewModel: ObservableObject {
                 // 等常驻 Boot 回到空闲命令循环再让测试下发 forceinit：osregdump
                 // 探测刚结束时 Boot 可能仍忙，固定短延时会竞争 → 首个 downloadItem
                 // 偶发 bulk IN timeout。probeAlive() 成功即表示 Boot 已能服务命令。
-                let t = activeTransport
+                let t = connection.transport
                 await Task.detached {
                     for _ in 0..<30 {                       // 最多 ~3s
                         try? await Task.sleep(nanoseconds: 100_000_000)
                         if t?.probeAlive() == true { break }
                     }
                 }.value
-                isDetecting = false
-                await runSolderTest()
+                await runSolderTest()   // .detecting → .testing
 
             case .manual:
                 switch out.matchTier {

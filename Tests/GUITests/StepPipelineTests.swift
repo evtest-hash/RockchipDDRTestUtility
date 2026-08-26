@@ -93,3 +93,49 @@ final class StepPipelineTests: XCTestCase {
         vm.testSteps.first { $0.name == name }?.state
     }
 }
+
+/// 焊接 and 眼图 are separate tools with separate lifecycles. Their results used
+/// to share one `testSteps` array and one `overallConclusion`, so a finished
+/// eye-scan card — green PASS and all — showed up in the soldering log pane.
+/// An operator reading that card reads a verdict about the wrong test.
+@MainActor
+final class ToolIsolationTests: XCTestCase {
+
+    func testOneToolsCardsDoNotAppearInTheOthersPane() {
+        let vm = MainViewModel()
+        vm.mode = .eyescan
+        vm.handleExecutionLog(.init(level: .info, code: "INFO_DOWNLOADITEM_START",
+                                    message: "…", itemName: "眼图测试"))
+        XCTAssertEqual(vm.testSteps.count, 1)
+
+        vm.mode = .solder
+
+        XCTAssertTrue(vm.testSteps.isEmpty, "leaked: \(vm.testSteps.map(\.name))")
+    }
+
+    func testAVerdictDoesNotFollowTheOperatorToTheOtherTool() {
+        let vm = MainViewModel()
+        vm.mode = .eyescan
+        vm.overallConclusion = .passed
+
+        vm.mode = .solder
+
+        XCTAssertNil(vm.overallConclusion, "the other tool's PASS must not show here")
+    }
+
+    /// Switching away and back must not throw the result away either — the
+    /// operator peeks at the other tool and comes back to the same screen.
+    func testSwitchingBackRestoresThatToolsResult() {
+        let vm = MainViewModel()
+        vm.mode = .solder
+        vm.handleExecutionLog(.init(level: .info, code: "INFO_DOWNLOADITEM_START",
+                                    message: "…", itemName: "forceinit"))
+        vm.overallConclusion = .deviceFailed
+
+        vm.mode = .eyescan
+        vm.mode = .solder
+
+        XCTAssertEqual(vm.testSteps.map(\.name), ["forceinit"])
+        XCTAssertEqual(vm.overallConclusion, .deviceFailed)
+    }
+}
