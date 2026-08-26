@@ -61,7 +61,8 @@ public enum ChipIdentity {
         return OtpDump(baseByte: fallbackBaseByte, bytes: littleEndianBytes(hexWords(body)))
     }
 
-    /// The serial# U-Boot derives from this CPUID, rendered as it renders it (`%llx`).
+    /// The serial# U-Boot derives from this CPUID, rendered as it renders it —
+    /// `%016llx`, i.e. zero-padded to the firmware's fixed 64-bit width.
     public static func serial(fromCpuid cpuid: [UInt8]) -> String? {
         guard cpuid.count == cpuidLength else { return nil }
         var low = [UInt8](), high = [UInt8]()
@@ -71,7 +72,16 @@ public enum ChipIdentity {
         }
         let lo = crc32NoComp(0, low)
         let hi = crc32NoComp(lo, high)
-        return String(UInt64(lo) | (UInt64(hi) << 32), radix: 16)
+        // ZERO-PADDED to 16 digits, matching the firmware's fixed 64-bit field.
+        // This string is the only bridge between two device domains: the tool
+        // reads it from OTP while the board is in maskrom, the booted board
+        // reports the same value, and `adb -s <serial>` matches them as STRINGS.
+        // `String(_:radix:)` drops leading zeros, so a chip whose folded value
+        // starts with a zero nibble printed 15 digits here and 16 on the board —
+        // the claim then failed, and failed misleadingly: the flash succeeded and
+        // the board was up, but the software reported "flashed, won't boot".
+        // Measured on an AZ07 (RK3566): 883265bf7fee7c8 vs 0883265bf7fee7c8.
+        return String(format: "%016llx", UInt64(lo) | (UInt64(hi) << 32))
     }
 
     public static func hex(_ bytes: [UInt8]) -> String {

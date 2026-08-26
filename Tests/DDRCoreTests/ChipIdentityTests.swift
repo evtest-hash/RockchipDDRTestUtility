@@ -194,4 +194,31 @@ final class ChipIdentityTests: XCTestCase {
     func testSerialRejectsWrongLength() {
         XCTAssertNil(ChipIdentity.serial(fromCpuid: [1, 2, 3]))
     }
+
+    /// AZ07, real silicon. The folded value's top nibble is zero, so an unpadded
+    /// `%llx` yields FIFTEEN characters while the board's own firmware prints
+    /// sixteen — and that string is the only bridge between the two device
+    /// domains: the tool reads it from OTP in maskrom, the booted board reports
+    /// the same value, and `adb -s <serial>` matches them as strings. One missing
+    /// character and the claim fails, in the worst possible way: the flash
+    /// succeeded, the board is up, and the software reports "flashed but won't
+    /// boot".
+    ///
+    /// The four vectors above all happen to start with a nonzero nibble, which is
+    /// why this went unnoticed from the first day.
+    func testSerialIsZeroPaddedToSixteenHexDigits() {
+        let cpuid: [UInt8] = [0x4d, 0x42, 0x42, 0x30, 0x38, 0x32, 0x00, 0x00,
+                              0x00, 0x00, 0x00, 0x00, 0x00, 0x0f, 0x20, 0x1e]
+        XCTAssertEqual(ChipIdentity.serial(fromCpuid: cpuid), "0883265bf7fee7c8")
+    }
+
+    /// The width is the contract, not a formatting preference: the firmware emits
+    /// a fixed 64-bit field, so every serial this tool prints must be 16 digits.
+    func testEverySerialIsSixteenDigitsWide() {
+        for byte in stride(from: 0, through: 255, by: 17) {
+            let cpuid = [UInt8](repeating: UInt8(byte), count: ChipIdentity.cpuidLength)
+            XCTAssertEqual(ChipIdentity.serial(fromCpuid: cpuid)?.count, 16,
+                           "cpuid of 0x\(String(byte, radix: 16)) bytes")
+        }
+    }
 }
