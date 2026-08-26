@@ -62,7 +62,6 @@ final class MainViewModel: ObservableObject {
     @Published var selectedSoc: String? {
         didSet { if selectedSoc != oldValue { refreshEyescanCfgURL() } }
     }
-    @Published var autoTestEnabled = false
     /// User switch for DDR auto-detect (preselecting the cfg on plug-in). ON by
     /// default. Deliberately NOT persisted — its lifetime is this app run only,
     /// so every launch starts with auto-detect on. When OFF, a profiled device is
@@ -102,7 +101,8 @@ final class MainViewModel: ObservableObject {
                         ("查看 rx / tx 眼图裕量结果", "3.circle")]
             }
         }
-        var saveButtonLabel: String { self == .eyescan ? "保存眼图日志" : "保存测试结果" }
+        /// 一个动词一个名词,两个模式同一个词根 —— 保存的都是这一轮跑出来的日志。
+        var saveButtonLabel: String { self == .eyescan ? "保存眼图日志" : "保存测试日志" }
         var saveFileName: String { self == .eyescan ? "DDR_Eyescan.txt" : "DDR_Test_Result.txt" }
     }
     @Published var mode: ToolMode = .solder {
@@ -139,7 +139,12 @@ final class MainViewModel: ObservableObject {
     /// 「开始」按钮是否可点(按当前模式)。
     var canStart: Bool {
         guard phase == .idle, !devices.isEmpty else { return false }
-        return mode == .solder || canEyescan
+        guard mode == .solder else { return canEyescan }
+        // Either detect will pick the cfg, or one is already picked. Neither ⇒
+        // the click had nothing to run and used to fail silently.
+        if selectedFileID != nil { return true }
+        guard let device = devices.first(where: { $0.deviceID == selectedDeviceID }) else { return false }
+        return autoDetectEnabled && DetectProfiles.forPID(device.productID) != nil && !connection.probed
     }
 
     /// 眼图模式下「开始」按钮的 hover 说明(不可用时解释原因)。
@@ -565,7 +570,9 @@ final class MainViewModel: ObservableObject {
         let chip = device.socName?.isEmpty == false ? device.socName! : device.productName
         let fields = device.deviceID.split(separator: "-")
         guard fields.count >= 2 else { return chip }
-        return "\(chip) · 插口 \(fields[0]).\(fields[1])"
+        // Port chain only: the bus number is the same for every board on one
+        // machine, so it is noise in a label that has to stay short.
+        return "\(chip) · \(fields[1])"
     }
 
     /// The operator picked a different board: retarget the tool at its chip. The
@@ -821,54 +828,53 @@ final class MainViewModel: ObservableObject {
     private func pollDevices() {
         guard phase == .idle else { return }
         guard connection.transport == nil else { return }
-        do {
-            let transport = try makeTransport()
-            let newDevices = try transport.discoverDevices()
-            let changed = newDevices.map(\.deviceID).sorted() != devices.map(\.deviceID).sorted()
+        guard let newDevices = try? makeTransport().discoverDevices() else { return }
+        guard newDevices.map(\.deviceID).sorted() != devices.map(\.deviceID).sorted() else { return }
+        applyDeviceSet(newDevices)
+    }
 
-            if changed {
-                let deviceRemoved = !devices.isEmpty && newDevices.isEmpty
-                devices = newDevices
+    /// Fold a fresh enumeration into the session. Bookkeeping only — plugging a
+    /// board in never starts anything.
+    ///
+    /// There used to be an 自动测试 switch here that ran `startTest()` on arrival.
+    /// Once the operator could say WHICH board to test, that trigger had no good
+    /// answer for "which board did this arrival mean" — and every run is better
+    /// off being one the operator asked for. `startTest()` now has exactly one
+    /// caller: the button.
+    ///
+    /// 这里不清日志区:每个「开始」入口(runSolderTest / performDetectThenTest /
+    /// startEyescan)在开跑前自己清。这样设备重枚举——尤其眼图自复位回 Maskrom——
+    /// 不会把刚出的结果冲掉,结果一直留到下次点「开始」。
+    func applyDeviceSet(_ newDevices: [UsbDevice]) {
+        let busWentEmpty = !devices.isEmpty && newDevices.isEmpty
+        devices = newDevices
 
-                if deviceRemoved {
-                    // Current device gone → fresh-connection reset so a replug
-                    // re-boots and re-runs auto-test.
-                    resetConnectionState()
-                } else {
-                    setDeviceNeedsBoot(true)
-                    // 不在这里清日志区:每个「开始」入口(runSolderTest /
-                    // performDetectThenTest / startEyescan)在开跑前自己清。这样设备
-                    // 重枚举——尤其眼图自复位回 Maskrom——不会把刚出的结果冲掉,
-                    // 结果一直留到下次点「开始」。(避免了之前一次性标记赌时序的脆弱。)
-
-                    if let currentID = selectedDeviceID,
-                       !devices.contains(where: { $0.deviceID == currentID }) {
-                        selectedDeviceID = devices.first?.deviceID
-                    }
-                    if selectedDeviceID == nil {
-                        selectedDeviceID = devices.first?.deviceID
-                    }
-                    if let device = devices.first(where: { $0.deviceID == selectedDeviceID }),
-                       let soc = device.socName {
-                        if selectedSoc != soc {
-                            selectedSoc = soc
-                            selectedFileID = nil            // 不默认选第一个
-                        }
-                    }
-
-                    // 自动测试开：插入即用与「开始测试」按钮相同的编排(探测+测/测)。
-                    // 关：插入什么都不做,等按钮。settle 让刚插上的 bootrom 就绪。
-                    if autoTestEnabled {
-                        Task {
-                            try? await Task.sleep(nanoseconds: 1_000_000_000)
-                            await startTest()
-                        }
-                    }
-                }
-            }
-        } catch {
-            // Silently ignore — device enumeration can fail transiently
+        if busWentEmpty {
+            // 当前设备走了 → 按新连接复位,重插会重新 boot、重新探测。
+            resetConnectionState()
+            return
         }
+        setDeviceNeedsBoot(true)
+
+        // An arrival never takes the selection: the operator's choice stands, and
+        // a first board only gets picked because there is nothing else to pick.
+        if let currentID = selectedDeviceID,
+           !devices.contains(where: { $0.deviceID == currentID }) {
+            selectedDeviceID = devices.first?.deviceID
+        }
+        if selectedDeviceID == nil {
+            selectedDeviceID = devices.first?.deviceID
+        }
+        syncSocToSelection()
+    }
+
+    /// Point the cfg list at the selected board's chip; another chip's cfg must
+    /// never stay selected.
+    private func syncSocToSelection() {
+        guard let device = devices.first(where: { $0.deviceID == selectedDeviceID }),
+              let soc = device.socName, selectedSoc != soc else { return }
+        selectedSoc = soc
+        selectedFileID = nil            // 不默认选第一个
     }
 
     private func setDeviceNeedsBoot(_ newValue: Bool) {

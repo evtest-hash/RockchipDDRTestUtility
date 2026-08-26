@@ -198,3 +198,51 @@ extension SessionTests {
                   productName: soc, serialNumber: nil, socName: soc)
     }
 }
+
+@MainActor
+extension SessionTests {
+
+    /// An arrival is bookkeeping, not a command: it must not take the selection
+    /// away from the board the operator picked. (This used to be conditional on
+    /// an 自动测试 switch, which also STARTED a test on arrival — removed, because
+    /// once you can say which board to test, "which board did this arrival mean"
+    /// has no good answer.)
+    func testAnArrivalDoesNotTakeTheSelection() {
+        let vm = MainViewModel()
+        vm.devices = [board("a")]
+        vm.selectedDeviceID = "a"
+
+        vm.applyDeviceSet([board("a"), board("b")])
+
+        XCTAssertEqual(vm.selectedDeviceID, "a")
+        XCTAssertEqual(vm.devices.count, 2)
+    }
+
+    func testTheFirstBoardIsSelectedBecauseThereIsNothingElseToPick() {
+        let vm = MainViewModel()
+        vm.applyDeviceSet([board("a")])
+        XCTAssertEqual(vm.selectedDeviceID, "a")
+    }
+
+    /// The selection has to be repaired when the board it named goes away.
+    func testLosingTheSelectedBoardFallsBackToASurvivor() {
+        let vm = MainViewModel()
+        vm.devices = [board("a"), board("b")]
+        vm.selectedDeviceID = "a"
+
+        vm.applyDeviceSet([board("b")])
+
+        XCTAssertEqual(vm.selectedDeviceID, "b")
+    }
+
+    func testAnEmptyBusResetsTheConnection() {
+        let vm = MainViewModel()
+        vm.devices = [board("a")]
+        vm.selectedDeviceID = "a"
+
+        vm.applyDeviceSet([])
+
+        XCTAssertNil(vm.selectedDeviceID)
+        XCTAssertTrue(vm.connection.needsBoot)
+    }
+}

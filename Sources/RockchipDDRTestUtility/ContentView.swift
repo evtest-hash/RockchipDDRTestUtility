@@ -6,47 +6,12 @@ struct ContentView: View {
     @StateObject private var viewModel = MainViewModel()
 
     var body: some View {
-        HStack(spacing: 0) {
-            // 眼图不选配置文件(几何自动探测)——隐藏侧边 cfg 栏,免得误以为
-            // 能选 cfg 做眼图。仅焊接模式显示。
-            if viewModel.mode == .solder {
-                sidebar
-                Divider()
-            }
-            mainContent
-        }
-        .frame(minWidth: 860, minHeight: 560)
+        mainContent
+            .frame(minWidth: 900, minHeight: 560)
         .navigationTitle("Rockchip DDR Test Utility")
         .task {
             await viewModel.load()
         }
-    }
-
-    // MARK: - Sidebar
-
-    private var sidebar: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            // CFG file list
-            ScrollViewReader { proxy in
-                List(selection: $viewModel.selectedFileID) {
-                    ForEach(viewModel.filesForSelectedSoc) { file in
-                        Text(file.displayName)
-                            .font(.system(size: 12))
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                            .tag(file.id)
-                            .help(file.displayName)
-                    }
-                }
-                .listStyle(.sidebar)
-                .disabled(viewModel.isDetecting)
-                .onChange(of: viewModel.selectedFileID) { newValue in
-                    guard let newValue else { return }
-                    proxy.scrollTo(newValue, anchor: .center)
-                }
-            }
-        }
-        .frame(minWidth: 260, maxWidth: 320)
     }
 
     // MARK: - Main Content
@@ -57,7 +22,10 @@ struct ContentView: View {
             Divider()
             logArea
             Divider()
-            statusBar
+            // The verdict gets a fixed row of its own, present even before a run.
+            // It used to be a badge floating over the log — covering the last
+            // lines of the very output it was summarising.
+            verdictBar
         }
     }
 
@@ -102,30 +70,36 @@ struct ContentView: View {
             .pickerStyle(.segmented)
             .labelsHidden()
             .fixedSize()
-            .disabled(viewModel.isRunning || viewModel.isDetecting)
+            .disabled(viewModel.phase != .idle)
 
-            Spacer()
-
-            if viewModel.isDetecting || viewModel.isRunning {
-                HStack(spacing: 6) {
-                    ProgressView()
-                        .controlSize(.small)
-                    Text(viewModel.isDetecting ? "探测中…" : "测试中…")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+            // 焊接才要 cfg;眼图的几何是探出来的。放在这里而不是结论行,是因为
+            // 它是这次测试的输入,不是结果的一部分。
+            if viewModel.mode == .solder {
+                Picker("", selection: $viewModel.selectedFileID) {
+                    if viewModel.selectedFileID == nil {
+                        Text("请选择配置").tag(String?.none)
+                    }
+                    ForEach(viewModel.filesForSelectedSoc) { file in
+                        Text(Self.cfgLabel(file.displayName)).tag(Optional(file.id))
+                    }
                 }
+                .labelsHidden()
+                .frame(maxWidth: 340)
+                .disabled(viewModel.phase != .idle)
+                .help(viewModel.filesForSelectedSoc.first { $0.id == viewModel.selectedFileID }?
+                        .displayName ?? "选择焊接检测配置文件")
             }
 
-            // 自动探测 / 自动测试是焊接流程专属 → 眼图模式下变灰。
-            Toggle("自动探测", isOn: $viewModel.autoDetectEnabled)
-                .toggleStyle(.checkbox)
-                .disabled(viewModel.mode == .eyescan)
-                .help("开启后，点「开始」会先自动探测 DDR 并选好匹配的配置文件，再接着测试（默认开启，仅本次运行有效）。关闭则使用你手动选择的配置文件。（焊接模式专用）")
+            Spacer(minLength: 8)
 
-            Toggle("自动测试", isOn: $viewModel.autoTestEnabled)
+            // 自动探测 / 自动测试是焊接流程专属 → 眼图模式下变灰。
+            // 名字说的是结果,不只是机制:它替操作员把右边那个配置选好。开着 →
+            // 配置由工具填;关掉 → 自己填。两个控件挨着,关系一眼可见。
+            Toggle("自动探测配置", isOn: $viewModel.autoDetectEnabled)
                 .toggleStyle(.checkbox)
+                .fixedSize()
                 .disabled(viewModel.mode == .eyescan)
-                .help("开启后，插入设备即自动开始（探测+测试），适合大批量连续测试；关闭则需点「开始」。（焊接模式专用）")
+                .help("开启后，点「开始」先读出 DDR 几何并选好匹配的配置文件，再接着测试（默认开启，仅本次运行有效）。关闭则使用你手动选择的配置文件。（焊接模式专用）")
 
             Button {
                 Task {
@@ -140,6 +114,7 @@ struct ContentView: View {
                     .frame(minWidth: 80)
             }
             .keyboardShortcut(.return)
+            .buttonStyle(.borderedProminent)
             .disabled(!viewModel.canStart)
             .help(viewModel.mode == .eyescan ? viewModel.eyescanHelp : "")
         }
@@ -201,46 +176,26 @@ struct ContentView: View {
                 .id(viewModel.runToken)
             }
 
-            if let conclusion = viewModel.overallConclusion {
-                resultBadge(conclusion)
-                    .padding(16)
-                    .transition(.opacity)
-            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    // MARK: - Eye-scan Log Pane
+    // MARK: - Verdict Bar
 
-    /// The eye-scan display: a status header + the full log filling the rest of the area, scrolling
-    /// internally via a native NSTextView. Reads `viewModel.eyescanLog` (one growing string).
-    private var eyescanLogPane: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            if let step = viewModel.testSteps.first {
-                HStack(spacing: 8) {
-                    stepStateIcon(step.state)
-                    Text(step.name)
-                        .font(.system(size: 14, weight: .medium))
-                    Spacer()
-                    stepStateLabel(step.state)
-                }
+    /// 结论固定占一行,连未测时也在 —— 位置恒定,眼睛每轮都落在同一处;颜色本身
+    /// 就是状态。「保存日志」放这里,因为它保存的正是这一轮的结果。
+    private var verdictBar: some View {
+        HStack(spacing: 10) {
+            if viewModel.phase == .idle {
+                Image(systemName: verdictIcon).font(.system(size: 19))
+            } else {
+                ProgressView().controlSize(.small).frame(width: 19)
             }
-            LogView(text: viewModel.eyescanLog)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(
-                    RoundedRectangle(cornerRadius: 6)
-                        .fill(Color(nsColor: .textBackgroundColor).opacity(0.25))
-                )
-        }
-        .padding(16)
-    }
-
-    // MARK: - Status Bar
-
-    private var statusBar: some View {
-        HStack {
+            Text(verdictTitle).font(.system(size: 17, weight: .bold))
+            if let detail = verdictDetail {
+                Text(detail).font(.system(size: 13)).foregroundStyle(.secondary)
+            }
             Spacer()
-
             Button(viewModel.mode.saveButtonLabel) {
                 let panel = NSSavePanel()
                 panel.allowedContentTypes = [.plainText]
@@ -252,8 +207,91 @@ struct ContentView: View {
             }
             .disabled(!viewModel.canSaveResult)
         }
+        .foregroundStyle(verdictTint)
         .padding(.horizontal, 16)
-        .padding(.vertical, 6)
+        .padding(.vertical, 9)
+        .background(verdictTint.opacity(shown == nil ? 0.05 : 0.13))
+    }
+
+    /// 跑起来之后上一轮的结论就不再成立 —— 这一行改为报告当前阶段。
+    private var shown: RunConclusion? {
+        viewModel.phase == .idle ? viewModel.overallConclusion : nil
+    }
+
+    private var verdictIcon: String {
+        switch shown {
+        case .passed: return "checkmark.circle.fill"
+        case .deviceFailed: return "xmark.circle.fill"
+        case .inconclusive: return "exclamationmark.triangle.fill"
+        case nil: return "circle.dashed"
+        }
+    }
+
+    private var verdictTitle: String {
+        switch shown {
+        case .passed: return "测试通过"
+        case .deviceFailed: return "测试失败"
+        case .inconclusive: return "未测出结论"
+        case nil:
+            switch viewModel.phase {
+            case .idle: return "待测"
+            case .detecting: return "探测中…"
+            case .testing: return "测试中…"
+            }
+        }
+    }
+
+    /// 只有需要操作员做点什么、或需要解释的时候才出这一句。
+    private var verdictDetail: String? {
+        switch shown {
+        case .passed: return nil
+        case .deviceFailed: return "设备判定 DDR 不合格"
+        case .inconclusive(let reason):
+            switch reason {
+            case .transport: return "USB 传输失败 —— 检查连接后重测，板子未被判定"
+            case .cfg: return "配置文件缺失或无法解析，板子未被判定"
+            case .noDevice: return "未找到处于 Maskrom 的设备"
+            case .deviceWedged: return "设备中途停止响应 —— 请重新插拔后重试"
+            case .scanIncomplete: return "扫描未在时限内完成 —— 板子正常，是耗时超限"
+            }
+        case nil: return viewModel.devices.isEmpty ? "插入处于 Maskrom 的板子" : nil
+        }
+    }
+
+    private var verdictTint: Color {
+        switch shown {
+        case .passed: return .green
+        case .deviceFailed: return .red
+        case .inconclusive: return .orange
+        case nil: return .secondary
+        }
+    }
+
+    /// 每个 cfg 名都以「焊接检测.cfg」结尾 —— 八个字符每条都一样,却把真正区分
+    /// 彼此的部分挤出可视区。
+    static func cfgLabel(_ displayName: String) -> String {
+        displayName
+            .replacingOccurrences(of: "焊接检测.cfg", with: "")
+            .replacingOccurrences(of: ".cfg", with: "")
+            .trimmingCharacters(in: .whitespaces)
+    }
+
+    // MARK: - Eye-scan Log Pane
+
+    /// The eye-scan display: a status header + the full log filling the rest of the area, scrolling
+    /// internally via a native NSTextView. Reads `viewModel.eyescanLog` (one growing string).
+    private var eyescanLogPane: some View {
+        // 没有表头:眼图只有一个步骤,它的状态就是整轮的状态,而那个由底部结论行
+        // 报告 —— 表头再说一遍就是同一件事说两处。日志因此占满整个区域。
+        VStack(alignment: .leading, spacing: 10) {
+            LogView(text: viewModel.eyescanLog)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(Color(nsColor: .textBackgroundColor).opacity(0.25))
+                )
+        }
+        .padding(16)
     }
 
     // MARK: - Step Card
@@ -264,6 +302,11 @@ struct ContentView: View {
                 stepStateIcon(step.state)
                 Text(step.name)
                     .font(.system(size: 14, weight: .medium))
+                if let gloss = step.gloss {
+                    Text("· \(gloss)")
+                        .font(.system(size: 13))
+                        .foregroundStyle(.secondary)
+                }
                 Spacer()
                 stepStateLabel(step.state)
             }
@@ -328,38 +371,11 @@ struct ContentView: View {
     }
 
     private func stepBackgroundColor(_ state: StepState) -> Color {
-        switch state {
-        case .passed: return .green.opacity(0.06)
-        case .failed: return .red.opacity(0.06)
-        case .downloading, .running: return .blue.opacity(0.04)
-        default: return Color(nsColor: .controlBackgroundColor)
-        }
+        state == .running || state == .downloading
+            ? .blue.opacity(0.05)
+            : Color(nsColor: .controlBackgroundColor)
     }
 
-    /// 三态,不是两态:黄色「未测出结论」表示这块板没有被判定过 —— 查治具/线缆后重测,
-    /// 不要当废板处理。只有红色才是设备判定 DDR 不合格。
-    private func resultBadge(_ conclusion: RunConclusion) -> some View {
-        let (icon, text, color): (String, String, Color) = switch conclusion {
-        case .passed: ("checkmark.circle.fill", "测试通过", .green)
-        case .deviceFailed: ("xmark.circle.fill", "测试失败", .red)
-        case .inconclusive: ("exclamationmark.triangle.fill", "未测出结论", .orange)
-        }
-        return HStack(spacing: 8) {
-            Image(systemName: icon)
-                .font(.title2)
-            Text(text)
-                .font(.title3)
-                .fontWeight(.bold)
-        }
-        .foregroundStyle(.white)
-        .padding(.horizontal, 24)
-        .padding(.vertical, 12)
-        .background(
-            RoundedRectangle(cornerRadius: 10)
-                .fill(color)
-                .shadow(color: color.opacity(0.3), radius: 8, y: 4)
-        )
-    }
 }
 
 /// Native AppKit text log for LARGE, high-rate streaming content (the eye-scan report). SwiftUI's

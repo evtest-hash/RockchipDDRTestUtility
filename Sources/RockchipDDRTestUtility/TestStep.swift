@@ -25,3 +25,17 @@ struct TestStep: Identifiable {
         self.messages = []
     }
 }
+
+extension TestStep {
+    /// The firmware's own item names appear in the log and in saved files, so they
+    /// stay — but on screen they say nothing to whoever is reading. Gloss the ones
+    /// that have a meaning; leave anything already Chinese alone.
+    var gloss: String? {
+        switch name.lowercased() {
+        case "boot": return "引导下载"
+        case "forceinit": return "强制初始化"
+        case "connect": return "焊接连接检查"
+        default: return nil
+        }
+    }
+}
