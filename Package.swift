@@ -70,5 +70,13 @@ let package = Package(
             name: "DDRCoreTests",
             dependencies: ["DDRCore", "DDRUSB"]
         ),
+        // The CLI's machine contract (exit codes, errorCode enum, argv parsing,
+        // JSON shape) is what automation depends on, and it had no tests at all.
+        // Depending on the executable target directly avoids splitting a library
+        // out of it just to make it reachable.
+        .testTarget(
+            name: "CLIContractTests",
+            dependencies: ["RockchipDDRTestUtilityCLI", "DDRCore", "DDRUSB"]
+        ),
     ]
 )
