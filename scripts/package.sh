@@ -25,123 +25,102 @@ fi
 
 cd "$PROJECT_DIR"
 
-# Fail the build if any slice of $1 references a libusb that is NOT relocatable
-# (i.e. not an @rpath/@loader_path/@executable_path path). Catches leftover
-# absolute Homebrew or build-staging paths that would break on a user's machine.
-verify_libusb() {
-    local bin="$1" arch bad
-    for arch in "${ARCHES[@]}"; do
-        bad="$(otool -arch "$arch" -L "$bin" 2>/dev/null \
-                | awk '/libusb-1\.0\.0\.dylib/{print $1}' | grep -v '^@' || true)"
-        if [ -n "$bad" ]; then
-            echo "ERROR: $(basename "$bin") ($arch) references non-relocatable libusb:"
-            echo "  $bad"
-            exit 1
-        fi
-    done
-}
-
-# Add an LC_RPATH only if absent — `swift build` already stamps @loader_path onto
-# executables (for the Swift runtime), so a blind -add_rpath would error out.
-add_rpath_once() {
-    local bin="$1" rp="$2"
-    if ! otool -l "$bin" | grep -qF "path $rp "; then
-        install_name_tool -add_rpath "$rp" "$bin"
-    fi
-}
-
 # ── Step 0: Refresh the embedded cfg blob (single-file CLI) ──
 # The CLI embeds the whole DDRTestFiles/ library via .incbin (Sources/CDDRBlob);
 # regenerate it so the built binary carries the current cfgs. Deterministic, ~6s.
 echo "=== Refreshing embedded cfg blob ==="
 bash "$PROJECT_DIR/scripts/embed_cfgs.sh"
 
-# ── Step 1: Produce ONE staged libusb that every slice links against ──
-# Both executables, both arches, AND the bundled copy must be the SAME libusb, or
-# the arm64 slice (linked against a newer Homebrew libusb) demands a compat
-# version the bundled dylib can't satisfy → dyld rejects it at launch. We stage a
-# single universal dylib with install_name @rpath/libusb-1.0.0.dylib and point a
-# pkg-config override at it for ALL arch builds; consumers add the right rpath.
-
-if [ ${#ARCHES[@]} -gt 1 ]; then
-    LIBUSB_ARCHS=$(lipo -info "$LIBUSB_DYLIB" 2>/dev/null || echo "")
-    if echo "$LIBUSB_ARCHS" | grep -q "x86_64.*arm64\|arm64.*x86_64"; then
-        echo "=== Homebrew libusb is already universal ==="
-        LIBUSB_SRC="$LIBUSB_DYLIB"
-    else
-        echo "=== Building universal libusb from source ==="
-        LIBUSB_BUILD="$STAGING_DIR/libusb-build"
-        rm -rf "$LIBUSB_BUILD"
-        mkdir -p "$LIBUSB_BUILD"
-
-        curl -sL https://github.com/libusb/libusb/releases/download/v1.0.27/libusb-1.0.27.tar.bz2 \
-            -o "$LIBUSB_BUILD/libusb.tar.bz2"
-        tar xf "$LIBUSB_BUILD/libusb.tar.bz2" -C "$LIBUSB_BUILD"
-
-        echo "--- libusb arm64 ---"
-        mkdir -p "$LIBUSB_BUILD/build-arm64" && cd "$LIBUSB_BUILD/build-arm64"
-        "$LIBUSB_BUILD/libusb-1.0.27/configure" \
-            --host=aarch64-apple-darwin \
-            --enable-static=no \
-            --prefix="$LIBUSB_BUILD/install-arm64" \
-            CFLAGS="-arch arm64 -mmacosx-version-min=12.0" \
-            LDFLAGS="-arch arm64 -mmacosx-version-min=12.0"
-        make -j"$(sysctl -n hw.ncpu)" && make install
-
-        echo "--- libusb x86_64 ---"
-        mkdir -p "$LIBUSB_BUILD/build-x86_64" && cd "$LIBUSB_BUILD/build-x86_64"
-        "$LIBUSB_BUILD/libusb-1.0.27/configure" \
-            --host=x86_64-apple-darwin \
-            --enable-static=no \
-            --prefix="$LIBUSB_BUILD/install-x86_64" \
-            CFLAGS="-arch x86_64 -mmacosx-version-min=12.0" \
-            LDFLAGS="-arch x86_64 -mmacosx-version-min=12.0"
-        make -j"$(sysctl -n hw.ncpu)" && make install
-
-        echo "--- Merging libusb universal ---"
-        LIBUSB_SRC="$STAGING_DIR/libusb-src.dylib"
-        lipo -create \
-            "$LIBUSB_BUILD/install-arm64/lib/libusb-1.0.0.dylib" \
-            "$LIBUSB_BUILD/install-x86_64/lib/libusb-1.0.0.dylib" \
-            -output "$LIBUSB_SRC"
-
-        cd "$PROJECT_DIR"
-    fi
-else
-    LIBUSB_SRC="$LIBUSB_DYLIB"
-fi
-
-# Stage the canonical libusb: install_name @rpath, plus the -lusb-1.0 link name.
-LIBUSB_STAGE="$STAGING_DIR/libusb-universal"
+# ── Step 1: Produce ONE universal STATIC libusb ──
+# libusb is linked STATICALLY, so the CLI ships as a single file (it already
+# embeds the whole cfg library via .incbin) and the .app needs no Frameworks/
+# dylib or rpath. Everything is linked against the SAME libusb, or the arm64
+# slice would demand a compat version the x86_64 one doesn't have.
+#
+# NOTE (licensing): libusb is LGPL-2.1+. Static linking carries the obligation to
+# let a recipient relink against their own libusb — ship this archive plus the
+# license, or the source, with any external distribution.
+LIBUSB_STAGE="$STAGING_DIR/libusb-static"
 rm -rf "$LIBUSB_STAGE"
 mkdir -p "$LIBUSB_STAGE"
-UNIVERSAL_LIBUSB="$LIBUSB_STAGE/libusb-1.0.0.dylib"
-cp "$LIBUSB_SRC" "$UNIVERSAL_LIBUSB"
-chmod u+w "$UNIVERSAL_LIBUSB"
-install_name_tool -id "@rpath/libusb-1.0.0.dylib" "$UNIVERSAL_LIBUSB"
-ln -sf libusb-1.0.0.dylib "$LIBUSB_STAGE/libusb-1.0.dylib"
+LIBUSB_A="$LIBUSB_STAGE/libusb-1.0.a"
 
-# One pkg-config override, used for EVERY arch build.
+BREW_A="$LIBUSB_BREW/lib/libusb-1.0.a"
+BREW_A_ARCHS="$(lipo -info "$BREW_A" 2>/dev/null || echo "")"
+NEED_SOURCE_BUILD=0
+for arch in "${ARCHES[@]}"; do
+    case "$BREW_A_ARCHS" in *"$arch"*) ;; *) NEED_SOURCE_BUILD=1 ;; esac
+done
+
+if [ "$NEED_SOURCE_BUILD" = "0" ]; then
+    echo "=== Homebrew libusb.a already covers ${ARCHES[*]} ==="
+    cp "$BREW_A" "$LIBUSB_A"
+else
+    echo "=== Building static libusb from source (${ARCHES[*]}) ==="
+    LIBUSB_BUILD="$STAGING_DIR/libusb-build"
+    rm -rf "$LIBUSB_BUILD"
+    mkdir -p "$LIBUSB_BUILD"
+    curl -sL https://github.com/libusb/libusb/releases/download/v1.0.27/libusb-1.0.27.tar.bz2 \
+        -o "$LIBUSB_BUILD/libusb.tar.bz2"
+    tar xf "$LIBUSB_BUILD/libusb.tar.bz2" -C "$LIBUSB_BUILD"
+
+    SLICES=()
+    for arch in "${ARCHES[@]}"; do
+        case "$arch" in
+            arm64)  host=aarch64-apple-darwin ;;
+            x86_64) host=x86_64-apple-darwin ;;
+            *) echo "Unsupported arch: $arch"; exit 1 ;;
+        esac
+        echo "--- libusb $arch (static) ---"
+        mkdir -p "$LIBUSB_BUILD/build-$arch" && cd "$LIBUSB_BUILD/build-$arch"
+        "$LIBUSB_BUILD/libusb-1.0.27/configure" \
+            --host="$host" \
+            --enable-static=yes \
+            --enable-shared=no \
+            --prefix="$LIBUSB_BUILD/install-$arch" \
+            CFLAGS="-arch $arch -mmacosx-version-min=12.0" \
+            LDFLAGS="-arch $arch -mmacosx-version-min=12.0" >/dev/null
+        make -j"$(sysctl -n hw.ncpu)" >/dev/null && make install >/dev/null
+        SLICES+=("$LIBUSB_BUILD/install-$arch/lib/libusb-1.0.a")
+    done
+    cd "$PROJECT_DIR"
+
+    if [ ${#SLICES[@]} -gt 1 ]; then
+        echo "--- Merging libusb.a universal ---"
+        lipo -create "${SLICES[@]}" -output "$LIBUSB_A"
+    else
+        cp "${SLICES[0]}" "$LIBUSB_A"
+    fi
+fi
+echo "libusb.a: $(lipo -info "$LIBUSB_A")"
+
+# pkg-config supplies ONLY the header path. The archive and libusb's own macOS
+# dependencies go in as -Xlinker flags below, because SwiftPM's pkg-config
+# handling does not pass `-framework` through.
 LIBUSB_PKG_DIR="$STAGING_DIR/libusb-pkg"
-mkdir -p "$LIBUSB_PKG_DIR"
+rm -rf "$LIBUSB_PKG_DIR"; mkdir -p "$LIBUSB_PKG_DIR"
 cat > "$LIBUSB_PKG_DIR/libusb-1.0.pc" << PCEOF
-prefix=$LIBUSB_STAGE
-exec_prefix=\${prefix}
-libdir=\${exec_prefix}
-includedir=$LIBUSB_BREW/include
+prefix=$LIBUSB_BREW
+includedir=\${prefix}/include
 Name: libusb-1.0
-Description: libusb
+Description: libusb (static, linked via -Xlinker)
 Version: 1.0.27
-Libs: -L\${libdir} -lusb-1.0
+Libs:
 Cflags: -I\${includedir}/libusb-1.0
 PCEOF
 
-# ── Step 2: Build Swift executables (all arches link the staged libusb) ──
+# libusb's Libs.private on macOS — required once it is linked statically.
+LIBUSB_LINK=(-Xlinker "$LIBUSB_A"
+             -Xlinker -lobjc
+             -Xlinker -framework -Xlinker IOKit
+             -Xlinker -framework -Xlinker CoreFoundation
+             -Xlinker -framework -Xlinker Security)
 
+# ── Step 2: Build Swift executables (every arch links the static libusb) ──
 echo "=== Building release (${ARCHES[*]}) ==="
 for arch in "${ARCHES[@]}"; do
     echo "--- Building for $arch ---"
-    PKG_CONFIG_PATH="$LIBUSB_PKG_DIR" swift build -c release --arch "$arch"
+    PKG_CONFIG_PATH="$LIBUSB_PKG_DIR" swift build -c release --arch "$arch" "${LIBUSB_LINK[@]}"
 done
 
 # ── Step 3: Create fat binaries ──
@@ -165,7 +144,6 @@ fi
 echo "=== Assembling .app bundle ==="
 rm -rf "$STAGING_DIR/$BUNDLE_NAME"
 mkdir -p "$BUNDLE_DIR/Contents/MacOS"
-mkdir -p "$BUNDLE_DIR/Contents/Frameworks"
 mkdir -p "$BUNDLE_DIR/Contents/Resources"
 
 cp "$BUILD_DIR/RockchipDDRTestUtility" "$BUNDLE_DIR/Contents/MacOS/"
@@ -188,35 +166,36 @@ else
     echo "WARNING: DDRTestFiles directory not found"
 fi
 
-# ── Step 6: Bundle libusb into the .app ──
-# Every slice already references @rpath/libusb-1.0.0.dylib (Step 1/2), so we only
-# drop the dylib in Frameworks and add the rpath. No per-path -change needed.
-
-echo "=== Bundling libusb (.app) ==="
-cp "$UNIVERSAL_LIBUSB" "$BUNDLE_DIR/Contents/Frameworks/libusb-1.0.0.dylib"
-
-for exe in RockchipDDRTestUtility RockchipDDRTestUtilityCLI; do
-    add_rpath_once "$BUNDLE_DIR/Contents/MacOS/$exe" "@executable_path/../Frameworks"
-    verify_libusb "$BUNDLE_DIR/Contents/MacOS/$exe"
-done
+# (No step 6: libusb is inside the executables now — no Frameworks/, no rpath.)
 
 # ── Step 7: Verify ──
 
 echo "=== Verifying bundle ==="
 echo "Architectures:"
 lipo -info "$BUNDLE_DIR/Contents/MacOS/RockchipDDRTestUtility"
-lipo -info "$BUNDLE_DIR/Contents/Frameworks/libusb-1.0.0.dylib"
-echo "Dynamic libraries:"
-otool -L "$BUNDLE_DIR/Contents/MacOS/RockchipDDRTestUtility" | grep -E "libusb|rpath"
-echo "Rpaths:"
-otool -l "$BUNDLE_DIR/Contents/MacOS/RockchipDDRTestUtility" | grep -A2 LC_RPATH
+lipo -info "$BUNDLE_DIR/Contents/MacOS/RockchipDDRTestUtilityCLI"
+
+# Nothing may reference libusb dynamically any more. A leftover reference means
+# the static archive was not picked up and the binary would die on a machine
+# without Homebrew — the exact failure this change removes.
+assert_no_dynamic_libusb() {
+    local bin="$1" refs
+    refs="$(otool -L "$bin" | grep -i libusb || true)"
+    if [ -n "$refs" ]; then
+        echo "ERROR: $(basename "$bin") still links libusb dynamically:"
+        echo "$refs"
+        exit 1
+    fi
+}
+for exe in RockchipDDRTestUtility RockchipDDRTestUtilityCLI; do
+    assert_no_dynamic_libusb "$BUNDLE_DIR/Contents/MacOS/$exe"
+done
+echo "libusb: statically linked (no dynamic reference)"
 
 # ── Step 7.5: Assemble standalone CLI distribution ──
-# The CLI ships as a self-contained tarball (binary + a sibling libusb dylib),
-# NOT the .app: it embeds the whole cfg library (Sources/CDDRBlob), so it needs
-# no DDRTestFiles/. Every slice references @rpath/libusb-1.0.0.dylib; adding an
-# @loader_path rpath makes that resolve to the sibling dylib. Same universal
-# libusb as the GUI → identical OS compatibility (arm64+x86_64, macOS 12+, no brew).
+# The CLI ships as ONE file: it embeds the whole cfg library (Sources/CDDRBlob)
+# and links libusb statically, so there is no DDRTestFiles/ to place, no sibling
+# dylib and no rpath. arm64+x86_64, macOS 12+, no Homebrew on the target machine.
 echo "=== Packaging standalone CLI ==="
 CLI_DIST="$STAGING_DIR/cli"
 CLI_TARBALL="$PROJECT_DIR/RockchipDDRTestUtilityCLI-macos.tar.gz"
@@ -224,25 +203,19 @@ rm -rf "$CLI_DIST"
 mkdir -p "$CLI_DIST"
 CLI_BIN="RockchipDDRTestUtilityCLI"
 cp "$BUILD_DIR/RockchipDDRTestUtilityCLI" "$CLI_DIST/$CLI_BIN"
-cp "$UNIVERSAL_LIBUSB" "$CLI_DIST/libusb-1.0.0.dylib"
-chmod u+w "$CLI_DIST/$CLI_BIN" "$CLI_DIST/libusb-1.0.0.dylib"
-
-add_rpath_once "$CLI_DIST/$CLI_BIN" "@loader_path"
-verify_libusb "$CLI_DIST/$CLI_BIN"
+chmod u+w "$CLI_DIST/$CLI_BIN"
+assert_no_dynamic_libusb "$CLI_DIST/$CLI_BIN"
 
 echo "CLI arch:"; lipo -info "$CLI_DIST/$CLI_BIN"
-echo "CLI libusb + rpath:"; otool -L "$CLI_DIST/$CLI_BIN" | grep -E "libusb"; otool -l "$CLI_DIST/$CLI_BIN" | grep -A2 LC_RPATH
 
-# Ad-hoc codesign — lipo (fat binary) + install_name_tool/add_rpath above invalidate
-# the linker's per-slice ad-hoc signature; on Apple Silicon an unsigned/broken-signature
-# binary is killed at launch (SIGKILL). Re-sign dependency (libusb) first, then the
-# executable, so the shipped tarball runs on any arm64/x86_64 machine (macOS 12+).
+# Ad-hoc codesign — lipo (fat binary) invalidates the linker's per-slice ad-hoc
+# signature, and on Apple Silicon a binary with a broken signature is killed at
+# launch (SIGKILL). One file to sign now.
 echo "=== Ad-hoc codesigning CLI ==="
-codesign --force --sign - "$CLI_DIST/libusb-1.0.0.dylib"
 codesign --force --sign - "$CLI_DIST/$CLI_BIN"
 codesign --verify --verbose "$CLI_DIST/$CLI_BIN"
 
-tar -czf "$CLI_TARBALL" -C "$CLI_DIST" "$CLI_BIN" libusb-1.0.0.dylib
+tar -czf "$CLI_TARBALL" -C "$CLI_DIST" "$CLI_BIN"
 echo "=== CLI tarball: $CLI_TARBALL ($(du -sh "$CLI_TARBALL" | cut -f1)) ==="
 
 # ── Step 8: Create DMG ──

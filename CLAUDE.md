@@ -98,6 +98,10 @@ Every rule above is pinned by a real-silicon capture in `ChipVariantTests` (RK35
 
 The DMG build script (`scripts/package.sh`) copies `DDRTestFiles/` to `Contents/Resources/DDRTestFiles` in the app bundle.
 
+**libusb is linked STATICALLY** (universal `libusb-1.0.a`, built from source per arch and `lipo`-merged when Homebrew's is single-arch). So the standalone CLI is ONE file — it already embeds the whole cfg library via `.incbin` — and the app bundle needs no `Frameworks/` dylib, no `@rpath`, and no `install_name_tool`. `package.sh` asserts that no shipped binary references libusb dynamically; a leftover reference means the archive was not picked up and the binary would die on a machine without Homebrew. Static linking needs libusb's own macOS dependencies passed explicitly (`-lobjc -framework IOKit -framework CoreFoundation -framework Security`, i.e. its `Libs.private`), and they go in as `-Xlinker` flags because SwiftPM's pkg-config handling does not pass `-framework` through — the `.pc` override supplies only the header path.
+
+**Licensing:** libusb is LGPL-2.1+. Dynamic linking was the obligation-free form; static linking requires letting a recipient relink against their own libusb — ship `libusb-1.0.a` plus the license, or the source, with any EXTERNAL distribution.
+
 ### Failure Detection
 
 Each test item's pass/fail is taken from the device's `RKU_TestDeviceReady`
