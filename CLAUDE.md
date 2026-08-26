@@ -22,7 +22,7 @@ swift run RockchipDDRTestUtility
 
 # Run CLI
 swift run RockchipDDRTestUtilityCLI --list
-swift run RockchipDDRTestUtilityCLI --cfg "/path/to/test.cfg"
+swift run RockchipDDRTestUtilityCLI --solder --json
 
 # Build universal DMG
 bash scripts/package.sh
@@ -45,7 +45,7 @@ Tests cover CfgBinaryParser, CfgRepository (SoC name extraction), TestExecutionE
 - **DDRCore** — Shared library: config/INI parsing, binary `.cfg` parser, test execution engine, result log writer, models. Also the DDR auto-detect logic: `DetectProfile` (per-SoC parameter table keyed by USB PID), `OsRegDecoder` (SYS_REG V1/V3 geometry decode), `CfgAutoSelect` (exact type+capacity+per-die-CS cfg ranking).
 - **DDRUSB** — USB transport layer: `RkUsbTransportLibusb` implements `UsbTransport` protocol using libusb. Handles control transfers (boot download), bulk transfers (command/data), ACK validation, and printf polling. Also `DdrDetector` (actor) — the dedicated DDR auto-detect driver (NOT the test engine).
 - **RockchipDDRTestUtility** — SwiftUI desktop app. `MainViewModel` orchestrates the workflow: load config → discover test files → discover USB devices → auto-detect DDR + preselect cfg → run test → save result.
-- **RockchipDDRTestUtilityCLI** — Command-line interface with `--list`, `--probe-bulk`, `--reset-usb`, `--cfg`, `--detect`, `--detect-then-test` modes.
+- **RockchipDDRTestUtilityCLI** — Command-line interface. FOUR production commands, all inside the `--json` contract: `--list`, `--detect`, `--solder`, `--eyescan`. The diagnostic modes that existed while the USB layer was being brought up (`--probe-bulk`, `--cfg`, `--repeat`) are gone — the link is settled, and they were the only modes outside the JSON contract.
 
 ### Key Data Flow
 
@@ -179,10 +179,9 @@ scan misbehaved, so no verdict about the DDR exists, and only a device verdict
 may scrap a board. The human summary says `NO VERDICT — <reason>` there, never
 FAIL.
 
-The JSON contract covers the four production commands (`--detect`, `--solder`,
-`--eyescan`, `--list`) plus every error path. `--cfg` / `--probe-bulk` are
-diagnostic-only and REJECT `--json` (`CLIMode.isDiagnostic`) rather than print an
-empty stdout. `CLIOut.json` is set by pre-scanning argv BEFORE `parse`, so an
+The JSON contract covers every command (`--detect`, `--solder`, `--eyescan`,
+`--list`) plus every error path — there is no longer any mode outside it, so
+`--json` always prints exactly one object. `CLIOut.json` is set by pre-scanning argv BEFORE `parse`, so an
 argument error still emits JSON. One verdict field named `pass` everywhere (the
 old `ok` / `solder.outcome` / `solder.state` / `eyescan.go` are gone), `mode`
 identifies the command (`--cfg` used to report itself under the `solder` key),
@@ -208,8 +207,8 @@ without re-plugging. Two mechanisms (both required, hardware-verified on RK3568)
    test firmware can't service → the first bulk OUT stalls
    (`LIBUSB_ERROR_TIMEOUT`). Windows holds its device handle open across every
    click (its 3-repeat capture has zero control transfers between clicks).
-   The CLI `--repeat N` mode exercises this path (boot once, then skip-boot +
-   reuse the handle for runs 2..N).
+   Verify this path by clicking 「开始」 twice in the GUI without re-plugging
+   (the CLI's `--repeat N` used to exercise it; the CLI is one-shot now).
 
 Re-booting an already-booted device fails (`expected 512 got -1`), so run 1 of a
 fresh connection needs a real bootrom (physical replug after the prior session).

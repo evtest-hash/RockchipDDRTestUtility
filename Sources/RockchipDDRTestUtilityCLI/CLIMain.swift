@@ -3,10 +3,8 @@ import DDRUSB
 import Foundation
 
 struct CLIArguments {
-    var cfgPath: String?
     var selectedDeviceID: String?
     var listOnly = false
-    var probeBulk = false
     /// DDR auto-detect: download the auto-probing rkbin DDR bin (0x471), run the
     /// osregdump probe cfg, read OS_REG over USB, decode + match a cfg.
     var detect = false
@@ -16,12 +14,6 @@ struct CLIArguments {
     /// open; the matched cfg then runs with skipBoot:true on that same Boot, then
     /// reboots to maskrom. The device USB printf is embedded in the JSON result.
     var solder = false
-    /// How many times to run the full cfg in one process. >1 exercises the
-    /// repeat-test / boot-skip path: the first run boots, and subsequent runs
-    /// pass `skipBoot: true` (mirroring MainViewModel's `deviceNeedsBoot`
-    /// latch, cleared only after `bootSucceeded`), exactly like clicking
-    /// "start test" repeatedly in the GUI without re-plugging.
-    var repeatCount: Int = 1
     /// EYE-SCAN mode: like --detect / --solder, driven by the SoC's packaged `DDR眼图.cfg`
     /// (auto-located by the connected device's PID → SoC). All payloads (DTT/item/trainonly/
     /// reboot) + the item base come from that cfg — no per-bin flags. `--eye-timeout` is a
@@ -35,15 +27,13 @@ struct CLIArguments {
     /// unless --json). Independent of --json.
     var quiet = false
 
-    /// The four production commands. ONLY these are inside the `--json` contract —
-    /// `--cfg` and `--probe-bulk` are diagnostic-only human tools (see `isDiagnostic`).
+    /// The four production commands — every mode this CLI has, and all of them
+    /// inside the `--json` contract.
     var mode: CLIMode {
         if listOnly { return .list }
         if eyescan { return .eyescan }
         if detect { return .detect }
         if solder { return .solder }
-        if probeBulk { return .probeBulk }
-        if cfgPath != nil { return .cfgRun }
         return .unknown
     }
 
@@ -54,12 +44,6 @@ struct CLIArguments {
         while idx < argv.count {
             let token = argv[idx]
             switch token {
-            case "--cfg":
-                idx += 1
-                guard idx < argv.count else {
-                    throw DDRToolError.invalidFormat("Missing value for --cfg")
-                }
-                args.cfgPath = argv[idx]
             case "--device-id":
                 idx += 1
                 guard idx < argv.count else {
@@ -68,8 +52,6 @@ struct CLIArguments {
                 args.selectedDeviceID = argv[idx]
             case "--list":
                 args.listOnly = true
-            case "--probe-bulk":
-                args.probeBulk = true
             case "--detect":
                 args.detect = true
             case "--solder":
@@ -80,12 +62,6 @@ struct CLIArguments {
                     throw DDRToolError.invalidFormat("Missing value for --detect-cfg")
                 }
                 args.detectCfgPath = argv[idx]
-            case "--repeat":
-                idx += 1
-                guard idx < argv.count, let n = Int(argv[idx]), n >= 1 else {
-                    throw DDRToolError.invalidFormat("Missing/invalid value for --repeat (expect int >= 1)")
-                }
-                args.repeatCount = n
             case "--eyescan":
                 args.eyescan = true
             case "--eye-timeout":
@@ -115,14 +91,8 @@ struct CLIArguments {
 /// under the `solder` key, making a diagnostic run indistinguishable from a real
 /// soldering test.
 enum CLIMode: String, Encodable {
-    case detect, solder, eyescan, list      // production — inside the --json contract
-    case cfgRun, probeBulk                  // diagnostic-only — outside it
+    case detect, solder, eyescan, list      // every mode — all inside the --json contract
     case unknown                            // argument error before a mode was known
-
-    /// Diagnostic modes are human tools: they print progress and a summary, obey
-    /// the exit codes, but have no JSON schema. Combining them with --json is an
-    /// argument error rather than a silently empty stdout.
-    var isDiagnostic: Bool { self == .cfgRun || self == .probeBulk }
 }
 
 /// Output router. In `--json` mode stdout carries ONLY the final JSON object;
@@ -220,17 +190,6 @@ enum CLIErrorCode: String, Encodable {
             }
         }
         return .transport
-    }
-
-    /// A failed engine run maps to an errorCode ONLY when it wasn't a real device
-    /// verdict. `.deviceVerdict` returns nil, which is what routes it to exit 2.
-    static func from(_ failure: FailureKind?) -> CLIErrorCode? {
-        switch failure {
-        case .deviceVerdict, .none: return nil
-        case .transport: return .transport
-        case .cfg: return .cfgNotFound
-        case .noDevice: return .noDevice
-        }
     }
 }
 
@@ -443,10 +402,6 @@ func printUsageAndExit() -> Never {
                           Full transcript embedded in JSON as eyescan.transcript.
       --list              list connected Rockchip devices
 
-    Diagnostic only (human tools — no JSON schema; --json is rejected):
-      --cfg <cfg_path> [--repeat N]   run a specific cfg
-      --probe-bulk                    bulk-transfer probe
-
     Global options:
       --json          emit one JSON object on stdout; all human logs go to stderr
       --quiet         suppress progress lines (final summary still shown unless --json)
@@ -506,20 +461,11 @@ struct RockchipDDRTestUtilityCLI {
             let args = try CLIArguments.parse(argv)
             mode = args.mode
 
-            // Diagnostic modes have no JSON schema. Rejecting the combination keeps
-            // the promise "--json always prints one object" hole-free — better than
-            // exiting 0 with an empty stdout, which is what --list/--probe-bulk did.
-            if args.json && mode.isDiagnostic {
-                throw DDRToolError.invalidFormat("--json is not supported for diagnostic modes (--cfg / --probe-bulk)")
-            }
-
             switch mode {
             case .list:      finish(try runList(args: args))
             case .eyescan:   finish(try await runEyescan(args: args))
             case .detect:    finish(try await runDetect(args: args))
             case .solder:    finish(try await runSolder(args: args))
-            case .probeBulk: finish(try runProbeBulk(args: args))
-            case .cfgRun:    finish(try await runCfg(args: args))
             case .unknown:
                 throw DDRToolError.invalidFormat("--detect, --solder, --eyescan or --list is required")
             }
@@ -832,68 +778,6 @@ struct RockchipDDRTestUtilityCLI {
                                    bootSucceeded: run.bootSucceeded,
                                    log: ResultLogWriter().render(result: run, sourceCfgPath: matched.absolutePath))
         return result
-    }
-
-    // MARK: - diagnostics (no JSON schema)
-
-    static func runProbeBulk(args: CLIArguments) throws -> CLIResult {
-        let transport = try RkUsbTransportLibusb()
-        let devices = try transport.discoverDevices()
-        guard let device = chooseDevice(from: devices, selectedDeviceID: args.selectedDeviceID) else {
-            throw DDRToolError.noDevice
-        }
-        try transport.open(device: device)
-        let dummy = CfgItem(name: "probe", pathHint: nil, nameOffset: 0, payloadOffset: 0, payloadLength: 16)
-        try transport.downloadItem(item: dummy, payload: Data(repeating: 0, count: 16), address: 0)
-        try transport.close()
-        CLIOut.summary("Probe bulk transfer: OK")
-        return CLIResult(mode: .probeBulk, pass: true)
-    }
-
-    /// Run one cfg N times. Repeat-test harness mirroring MainViewModel.startTest:
-    /// one persistent transport + engine across all runs, held open via
-    /// keepTransportOpen (re-opening after boot re-issues SET_CONFIGURATION and
-    /// stalls the booted firmware's bulk endpoint). `deviceNeedsBoot` clears only
-    /// after run 1's real boot, so runs 2..N pass skipBoot=true — the exact path
-    /// of repeated GUI clicks. (No idle keep-alive is needed here: --repeat runs
-    /// are immediate, with no gap for macOS to suspend the pipe.)
-    static func runCfg(args: CLIArguments) async throws -> CLIResult {
-        guard let cfgPath = args.cfgPath else {
-            throw DDRToolError.invalidFormat("--cfg is required")
-        }
-        let runTransport = try RkUsbTransportLibusb()
-        let engine = TestExecutionEngine(parser: CfgBinaryParser(), transport: runTransport) { entry in
-            CLIOut.log("[\(entry.level.rawValue)] \(entry.code) \(entry.message)")
-        }
-        var deviceNeedsBoot = true
-        var pass = true
-        // The first non-verdict failure decides the exit code: a transport error
-        // means this cfg never got judged, so the run must not report FAIL.
-        var errorCode: CLIErrorCode?
-        var errorMessage: String?
-        for run in 1...args.repeatCount {
-            let isLast = (run == args.repeatCount)
-            let keepOpen = args.repeatCount > 1 && !isLast
-            CLIOut.log("\n=== Run \(run)/\(args.repeatCount) — skipBoot: \(!deviceNeedsBoot)  keepTransportOpen: \(keepOpen) ===")
-            let result = await engine.run(
-                cfgPath: cfgPath,
-                selectedDeviceID: args.selectedDeviceID,
-                skipBoot: !deviceNeedsBoot,
-                keepTransportOpen: keepOpen
-            )
-            if result.bootSucceeded { deviceNeedsBoot = false }
-            CLIOut.log("Run \(run) → \(result.outcome.rawValue), state: \(result.state.rawValue), bootSucceeded: \(result.bootSucceeded)"
-                + (result.failure.map { ", failure: \($0.rawValue)" } ?? ""))
-            if result.outcome != .passed {
-                pass = false
-                if errorCode == nil, let code = CLIErrorCode.from(result.failure) {
-                    errorCode = code
-                    errorMessage = result.logs.last(where: { $0.level == .error })?.message
-                }
-            }
-        }
-        CLIOut.summary("\n=== Summary: \(pass ? "ALL \(args.repeatCount) RUNS PASSED" : "SOME RUNS FAILED") ===")
-        return CLIResult(mode: .cfgRun, pass: pass, errorCode: errorCode, errorMessage: errorMessage)
     }
 
     // MARK: - helpers
