@@ -70,59 +70,6 @@ public final class CfgRepository {
         return cwdRelative
     }
 
-    public func loadSettings() throws -> (settings: ConfigSettings, languages: [AppLanguage], selectedLanguageTag: String) {
-        let configURL = rootURL.appendingPathComponent("resource/config.ini")
-        guard FileManager.default.fileExists(atPath: configURL.path) else {
-            return (.default, [], "ENG")
-        }
-        let ini = try IniParser.parse(url: configURL)
-        let language = ini.section("Language")
-        let system = ini.section("System")
-
-        let selected = language["Selected"] ?? "1"
-        let selectedTag = language["Lang\(selected)Tag"] ?? "ENG"
-
-        var languages: [AppLanguage] = []
-        let langCount = Int(language["Kinds"] ?? "0") ?? 0
-        for idx in 1...max(langCount, 1) where langCount > 0 {
-            let fileName = language["Lang\(idx)File"] ?? ""
-            guard !fileName.isEmpty else { continue }
-            let lang = AppLanguage(
-                tag: language["Lang\(idx)Tag"] ?? "LANG\(idx)",
-                titleChinese: language["Lang\(idx)CHNTitle"] ?? "",
-                titleEnglish: language["Lang\(idx)ENGTitle"] ?? "",
-                fileName: fileName
-            )
-            languages.append(lang)
-        }
-
-        let settings = ConfigSettings(
-            defaultTestFile: system["DEFAULT_TESTFILE"],
-            autoTest: system["AUTOTEST"],
-            logFlag: parseBool(system["LOGFLAG"], fallback: true),
-            supportLowUSB: parseBool(system["SUPPORTLOWUSB"], fallback: true),
-            mscWaitTime: Int(system["MSC_WAITTIME"] ?? "30") ?? 30,
-            rkusbWaitTime: Int(system["RKUSB_WAITTIME"] ?? "20") ?? 20,
-            printfInterval: Int(system["PRINTF_INTERVAL"] ?? "100") ?? 100,
-            supportDeviceSelect: parseBool(system["SUPPORT_DEVICE_SELECT"], fallback: false),
-            closeRC4List: (system["CLOSE_RC4_LIST"] ?? "").split(separator: "|").map(String.init)
-        )
-
-        return (settings, languages, selectedTag)
-    }
-
-    public func loadLanguageStrings(fileName: String) throws -> LocalizedStrings {
-        let langURL = rootURL.appendingPathComponent("resource/Language/\(fileName)")
-        let ini = try IniParser.parse(url: langURL)
-        var map: [String: String] = [:]
-        for section in ini.sections.values {
-            for (key, value) in section {
-                map[key] = value
-            }
-        }
-        return LocalizedStrings(map: map)
-    }
-
     public func discoverTestFiles() throws -> [TestFileEntry] {
         let manager = FileManager.default
         var entries: [TestFileEntry] = []
@@ -187,29 +134,6 @@ public final class CfgRepository {
         return Int(value * 1024)
     }
 
-    public func resolveDefaultTestFile(_ settings: ConfigSettings, allFiles: [TestFileEntry]) -> TestFileEntry? {
-        guard let configured = settings.defaultTestFile, !configured.isEmpty else {
-            return allFiles.first
-        }
-        let normalized = configured.replacingOccurrences(of: "\\", with: "/")
-        return allFiles.first { $0.relativePath == normalized }
-            ?? allFiles.first { $0.relativePath.hasSuffix(normalized) }
-            ?? allFiles.first
-    }
-
-    private func parseBool(_ value: String?, fallback: Bool) -> Bool {
-        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
-            return fallback
-        }
-        switch value.uppercased() {
-        case "TRUE", "1", "YES", "Y":
-            return true
-        case "FALSE", "0", "NO", "N":
-            return false
-        default:
-            return fallback
-        }
-    }
     private static func log(_ message: String) {
         fputs("[CfgRepository] \(message)\n", stderr)
     }

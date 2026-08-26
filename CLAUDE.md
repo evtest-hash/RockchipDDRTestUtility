@@ -45,8 +45,8 @@ Two test targets, no USB hardware required for either:
 
 **Swift Package Manager project** (swift-tools-version: 5.9, macOS 12+). Four targets:
 
-- **DDRCore** — Shared library: config/INI parsing, binary `.cfg` parser, test execution engine, result log writer, models. Also the DDR auto-detect logic: `DetectProfile` (per-SoC parameter table keyed by USB PID), `OsRegDecoder` (SYS_REG V1/V3 geometry decode), `CfgAutoSelect` (exact type+capacity+per-die-CS cfg ranking).
-- **DDRUSB** — USB transport layer: `RkUsbTransportLibusb` implements `UsbTransport` protocol using libusb. Handles control transfers (boot download), bulk transfers (command/data), ACK validation, and printf polling. Also `DdrDetector` (actor) — the dedicated DDR auto-detect driver (NOT the test engine).
+- **DDRCore** — Shared library: INI + binary `.cfg` parsing, test execution engine, the verdict layer, result log writer, models. It holds no presentation state: `TestStep`/`StepState` are the GUI's card model and live in that target. The Windows tool's `config.ini` + language subsystem (`loadSettings`, `AppLanguage`, `LocalizedStrings`, `ConfigSettings`, `resolveDefaultTestFile`) was ported faithfully and then never consumed by either app — it is gone; `CLOSE_RC4_LIST` lives in the transport, which was always its real source. Also the DDR auto-detect logic: `DetectProfile` (per-SoC parameter table keyed by USB PID), `OsRegDecoder` (SYS_REG V1/V3 geometry decode), `CfgAutoSelect` (exact type+capacity+per-die-CS cfg ranking).
+- **DDRUSB** — USB transport layer: `RkUsbTransportLibusb` implements `UsbTransport` protocol using libusb. `probeAlive()` is part of that protocol (not just the concrete class), so the GUI can hold a transport by protocol — it used to hold the libusb class purely to reach that one method, which pinned its whole session to real hardware. Handles control transfers (boot download), bulk transfers (command/data), ACK validation, and printf polling. Also `DdrDetector` (actor) — the dedicated DDR auto-detect driver (NOT the test engine).
 - **RockchipDDRTestUtility** — SwiftUI desktop app. `MainViewModel` orchestrates the workflow: load config → discover test files → discover USB devices → auto-detect DDR + preselect cfg → run test → save result.
 - **RockchipDDRTestUtilityCLI** — Command-line interface. FOUR production commands, all inside the `--json` contract: `--list`, `--detect`, `--solder`, `--eyescan`. The diagnostic modes that existed while the USB layer was being brought up (`--probe-bulk`, `--cfg`, `--repeat`) are gone — the link is settled, and they were the only modes outside the JSON contract.
 
@@ -114,9 +114,12 @@ used to collapse both into `outcome: .failed`, so a single bulk timeout was
 indistinguishable from a genuine soldering failure — and the CLI reported it as
 FAIL, which on a production line scraps a good board. `FailureKind.classify` maps
 a thrown error conservatively: anything unrecognised becomes `.transport`, never
-a device verdict. `ResultLogWriter.render` now appends host-side ERROR entries
-after the device printf, because the CLI embeds that render as the sole failure
-evidence in its JSON.
+a device verdict. `ResultLogWriter.render` appends host-side ERROR entries after
+the device printf, because the CLI embeds that render as the sole failure
+evidence in its JSON — and its `Result:` line is THREE-state like every other
+verdict surface (`PASS` / `FAIL` / `NO VERDICT (<reason>)`). It used to archive a
+cable pull as `Result: FAIL`: the same conflation the GUI badge had, hidden in
+the file an operator files away.
 
 ### Verdict layer — every pass/fail decision, in ONE place
 

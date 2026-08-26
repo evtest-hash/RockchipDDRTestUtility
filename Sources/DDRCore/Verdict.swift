@@ -59,7 +59,7 @@ public enum EyescanVerdict {
 /// Why a run produced no verdict. Distinct from `FailureKind` because the
 /// eye-scan has two failure modes the engine can't express (the device stopped
 /// answering; it was still streaming at the deadline).
-public enum InconclusiveReason: Sendable, Equatable {
+public enum InconclusiveReason: String, Sendable, Equatable {
     case transport        // control/bulk transfer failed, stalled, or timed out
     case cfg              // cfg missing, unparseable, or carrying no items
     case noDevice         // nothing in maskrom to talk to

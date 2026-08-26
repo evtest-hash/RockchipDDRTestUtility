@@ -54,16 +54,4 @@ final class CfgRepositoryTests: XCTestCase {
         let sortedSocNames = socNames.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
         XCTAssertEqual(socNames, sortedSocNames, "Entries should be sorted by SoC name")
     }
-
-    func testLoadSettingsReturnsDefaultsWhenNoIni() throws {
-        let root = repoRoot()
-        let repo = CfgRepository(rootURL: root)
-        let (settings, languages, tag) = try repo.loadSettings()
-
-        // No config.ini in DDRTestFiles, so defaults should be returned
-        XCTAssertEqual(tag, "ENG")
-        XCTAssertTrue(languages.isEmpty)
-        XCTAssertEqual(settings.mscWaitTime, 30)
-        XCTAssertEqual(settings.rkusbWaitTime, 20)
-    }
 }

@@ -24,11 +24,6 @@ final class MainViewModel: ObservableObject {
     /// which showed the operator the same red 「测试失败」 as a real device
     /// verdict — and that scraps good boards.
     @Published var overallConclusion: RunConclusion?
-    /// For the saved log file, which records PASS/FAIL only.
-    var overallOutcome: TestOutcome? {
-        guard let overallConclusion else { return nil }
-        return overallConclusion == .passed ? .passed : .failed
-    }
     @Published var selectedSoc: String? {
         didSet { if selectedSoc != oldValue { refreshEyescanCfgURL() } }
     }
@@ -144,7 +139,10 @@ final class MainViewModel: ObservableObject {
     /// interface instead of re-opening (which re-issues SET_CONFIGURATION and
     /// stalls the booted device's bulk endpoint). Torn down on device-set change
     /// or device-selection change.
-    private var activeTransport: RkUsbTransportLibusb?
+    /// Held as the PROTOCOL, not `RkUsbTransportLibusb`: the session logic only
+    /// needs the transport's contract, and binding it to libusb is what kept this
+    /// class impossible to drive from a test.
+    private var activeTransport: UsbTransport?
     private var activeTransportDeviceID: String?
     /// Idle keep-alive for the held transport. Mirrors DDR_UserTool's permanent
     /// printf-reader thread (PrintfReaderThreadProc / sub_405C30): while a device
@@ -157,7 +155,6 @@ final class MainViewModel: ObservableObject {
     /// `ioLock` serializes any residual overlap with the engine.
     private var keepAliveTask: Task<Void, Never>?
 
-    private var settings: ConfigSettings = .default
     private let parser = CfgBinaryParser()
     private let logWriter = ResultLogWriter()
     private(set) var lastResult: ExecutionResult?
@@ -198,9 +195,6 @@ final class MainViewModel: ObservableObject {
     func load() async {
         do {
             let repo = CfgRepository(rootURL: defaultRootURL())
-
-            let loaded = try repo.loadSettings()
-            settings = loaded.settings
 
             testFiles = try repo.discoverTestFiles()
 
@@ -493,7 +487,7 @@ final class MainViewModel: ObservableObject {
         }
 
         do {
-            _ = try logWriter.write(result: lastResult, sourceCfgPath: selected.absolutePath, outputURL: outputURL, outcome: overallOutcome)
+            _ = try logWriter.write(result: lastResult, sourceCfgPath: selected.absolutePath, outputURL: outputURL)
             statusMessage = "Saved result: \(outputURL.lastPathComponent)"
         } catch {
             statusMessage = error.localizedDescription
@@ -675,7 +669,7 @@ final class MainViewModel: ObservableObject {
         CfgRepository.makeDefaultRootURL()
     }
 
-    private func makeTransport() throws -> RkUsbTransportLibusb {
+    private func makeTransport() throws -> UsbTransport {
         return try RkUsbTransportLibusb()
     }
 

@@ -30,7 +30,10 @@ final class ResultLogWriterTests: XCTestCase {
         XCTAssertTrue(output.contains("Force init DDR pass."))
     }
 
-    func testRenderFailure() throws {
+    /// A run the DEVICE judged bad. Predates `FailureKind`, so it used to pass a
+    /// bare `.failed` — which now (correctly) renders as NO VERDICT, since a
+    /// failure naming no reason must never be archived as a bad board.
+    func testRenderDeviceVerdictFailure() throws {
         let started = Date(timeIntervalSince1970: 1_700_000_000)
         let finished = Date(timeIntervalSince1970: 1_700_000_010)
         let logs = [
@@ -42,7 +45,8 @@ final class ResultLogWriterTests: XCTestCase {
             selectedDevice: nil,
             logs: logs,
             startedAt: started,
-            finishedAt: finished
+            finishedAt: finished,
+            failure: .deviceVerdict
         )
 
         let writer = ResultLogWriter()
@@ -50,5 +54,43 @@ final class ResultLogWriterTests: XCTestCase {
 
         XCTAssertTrue(output.contains("Result: FAIL"))
         XCTAssertTrue(output.contains("DQS0 错误!"))
+    }
+
+    // MARK: - three-state result line
+
+    /// The archived file is what an operator files away and what a later dispute
+    /// is settled from. It used to print `Result: FAIL` for a USB timeout — the
+    /// same conflation the GUI badge had, just hidden in a file nobody re-reads.
+    func testATransportFailureIsNotArchivedAsFAIL() throws {
+        let out = render(.failed, failure: .transport)
+        XCTAssertFalse(out.contains("Result: FAIL"), out)
+        XCTAssertTrue(out.contains("Result: NO VERDICT"), out)
+        XCTAssertTrue(out.contains("transport"), "the reason must be in the file too")
+    }
+
+    func testOnlyADeviceVerdictIsArchivedAsFAIL() throws {
+        XCTAssertTrue(render(.failed, failure: .deviceVerdict).contains("Result: FAIL"))
+    }
+
+    func testAMissingCfgIsNotADeviceVerdict() throws {
+        XCTAssertTrue(render(.failed, failure: .cfg).contains("Result: NO VERDICT"))
+    }
+
+    /// Conservative, like every other classifier here: a failure that names no
+    /// reason must not be archived as a bad board.
+    func testAFailureWithoutAReasonIsNotArchivedAsFAIL() throws {
+        XCTAssertTrue(render(.failed, failure: nil).contains("Result: NO VERDICT"))
+    }
+
+    func testPassIsStillPass() throws {
+        XCTAssertTrue(render(.passed, failure: nil).contains("Result: PASS"))
+    }
+
+    private func render(_ outcome: TestOutcome, failure: FailureKind?) -> String {
+        let t = Date(timeIntervalSince1970: 1_700_000_000)
+        let result = ExecutionResult(outcome: outcome, state: outcome == .passed ? .completed : .failed,
+                                     selectedDevice: nil, logs: [], startedAt: t, finishedAt: t,
+                                     failure: failure)
+        return ResultLogWriter().render(result: result, sourceCfgPath: "/tmp/x.cfg")
     }
 }

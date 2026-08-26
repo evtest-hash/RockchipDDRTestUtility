@@ -26,6 +26,11 @@ public protocol UsbTransport {
     /// itself (drain fn `sub_FDCC1904`), so the ack is redundant there. High-rate
     /// drains (eye-scan) pass false; other flows keep true.
     func readPrintf(acknowledge: Bool) throws -> String?
+    /// Cheap "is the device still answering us" probe, used by the GUI's idle
+    /// keep-alive (macOS suspends an idle handle otherwise) and as the readiness
+    /// gate between detect and the first test item. Never throws: liveness is the
+    /// answer, so a failed transfer IS the answer (false).
+    func probeAlive() -> Bool
     func close() throws
 }
 
@@ -36,6 +41,10 @@ public extension UsbTransport {
     }
     /// Default: conformers that only implement `readPrintf()` (e.g. test mocks)
     /// ignore the flag.
+    /// A transport that doesn't model liveness is treated as alive — the neutral
+    /// answer for test doubles, which have no device to lose.
+    func probeAlive() -> Bool { true }
+
     func readPrintf(acknowledge: Bool) throws -> String? {
         try readPrintf()
     }

@@ -29,66 +29,7 @@ public enum DDRToolError: Error, LocalizedError, Sendable {
     }
 }
 
-public struct AppLanguage: Hashable, Identifiable, Sendable {
-    public var id: String { tag }
-    public let tag: String
-    public let titleChinese: String
-    public let titleEnglish: String
-    public let fileName: String
 
-    public init(tag: String, titleChinese: String, titleEnglish: String, fileName: String) {
-        self.tag = tag
-        self.titleChinese = titleChinese
-        self.titleEnglish = titleEnglish
-        self.fileName = fileName
-    }
-}
-
-public struct ConfigSettings: Sendable {
-    public let defaultTestFile: String?
-    public let autoTest: String?
-    public let logFlag: Bool
-    public let supportLowUSB: Bool
-    public let mscWaitTime: Int
-    public let rkusbWaitTime: Int
-    public let printfInterval: Int
-    public let supportDeviceSelect: Bool
-    public let closeRC4List: [String]
-
-    public init(
-        defaultTestFile: String?,
-        autoTest: String?,
-        logFlag: Bool,
-        supportLowUSB: Bool,
-        mscWaitTime: Int,
-        rkusbWaitTime: Int,
-        printfInterval: Int,
-        supportDeviceSelect: Bool,
-        closeRC4List: [String]
-    ) {
-        self.defaultTestFile = defaultTestFile
-        self.autoTest = autoTest
-        self.logFlag = logFlag
-        self.supportLowUSB = supportLowUSB
-        self.mscWaitTime = mscWaitTime
-        self.rkusbWaitTime = rkusbWaitTime
-        self.printfInterval = printfInterval
-        self.supportDeviceSelect = supportDeviceSelect
-        self.closeRC4List = closeRC4List
-    }
-
-    public static let `default` = ConfigSettings(
-        defaultTestFile: nil,
-        autoTest: nil,
-        logFlag: true,
-        supportLowUSB: true,
-        mscWaitTime: 30,
-        rkusbWaitTime: 20,
-        printfInterval: 100,
-        supportDeviceSelect: false,
-        closeRC4List: []
-    )
-}
 
 public struct TestFileEntry: Identifiable, Hashable, Sendable {
     public let id: String
@@ -380,28 +321,6 @@ public struct DeviceReadyStatus: Sendable {
     }
 }
 
-public enum StepState: Sendable {
-    case pending
-    case downloading
-    case running
-    case passed
-    case failed
-}
-
-public struct TestStep: Identifiable {
-    public let id: String
-    public let name: String
-    public var state: StepState
-    public var messages: [String]
-
-    public init(name: String, state: StepState = .pending) {
-        self.id = name
-        self.name = name
-        self.state = state
-        self.messages = []
-    }
-}
-
 public struct ExecutionResult: Sendable {
     public let outcome: TestOutcome
     public let state: ExecutionState
@@ -439,14 +358,3 @@ public struct ExecutionResult: Sendable {
     }
 }
 
-public struct LocalizedStrings: Sendable {
-    public let map: [String: String]
-
-    public init(map: [String: String]) {
-        self.map = map
-    }
-
-    public subscript(_ key: String, fallback fallbackValue: String) -> String {
-        map[key] ?? fallbackValue
-    }
-}

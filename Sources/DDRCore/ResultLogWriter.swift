@@ -9,8 +9,12 @@ public final class ResultLogWriter {
 
     public init() {}
 
-    public func render(result: ExecutionResult, sourceCfgPath: String, outcome: TestOutcome? = nil) -> String {
-        let finalOutcome = outcome ?? result.outcome
+    /// The archived record of one run. `Result:` is THREE-state, like every other
+    /// verdict surface: only a device verdict may say FAIL. This file is what an
+    /// operator files away, so archiving a USB timeout as FAIL is the same error
+    /// the GUI badge used to make — just hidden where nobody re-reads it.
+    public func render(result: ExecutionResult, sourceCfgPath: String) -> String {
+        let conclusion = RunConclusion.solder(result)
 
         var lines: [String] = []
         lines.append("Cfg: \(URL(fileURLWithPath: sourceCfgPath).lastPathComponent)")
@@ -18,7 +22,7 @@ public final class ResultLogWriter {
             lines.append("Device: \(device.productName)")
         }
         lines.append("Time: \(Self.dateFormatter.string(from: result.startedAt))")
-        lines.append("Result: \(finalOutcome == .passed ? "PASS" : "FAIL")")
+        lines.append("Result: \(Self.resultLine(conclusion))")
         lines.append("")
 
         for entry in result.logs where entry.code == "INFO_PRINTF" {
@@ -49,9 +53,17 @@ public final class ResultLogWriter {
         return lines.joined(separator: "\n")
     }
 
+    private static func resultLine(_ c: RunConclusion) -> String {
+        switch c {
+        case .passed: return "PASS"
+        case .deviceFailed: return "FAIL"
+        case .inconclusive(let reason): return "NO VERDICT (\(reason.rawValue)) — the board was not judged"
+        }
+    }
+
     @discardableResult
-    public func write(result: ExecutionResult, sourceCfgPath: String, outputURL: URL, outcome: TestOutcome? = nil) throws -> URL {
-        let content = render(result: result, sourceCfgPath: sourceCfgPath, outcome: outcome)
+    public func write(result: ExecutionResult, sourceCfgPath: String, outputURL: URL) throws -> URL {
+        let content = render(result: result, sourceCfgPath: sourceCfgPath)
         try content.write(to: outputURL, atomically: true, encoding: .utf8)
         return outputURL
     }

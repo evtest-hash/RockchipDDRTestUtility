@@ -155,7 +155,7 @@ public actor TestExecutionEngine {
                 }
 
                 if let preParamPrintf = try transport.readPrintf(), !preParamPrintf.isEmpty {
-                    await append(context, .info, "INFO_PRINTF", preParamPrintf)
+                    await append(context, .info, "INFO_PRINTF", preParamPrintf, itemName: item.name)
                 }
 
                 // Download params — equivalent to RKU_WriteMemory
@@ -176,7 +176,7 @@ public actor TestExecutionEngine {
                     }
 
                     if let preRunPrintf = try transport.readPrintf(), !preRunPrintf.isEmpty {
-                        await append(context, .info, "INFO_PRINTF", preRunPrintf)
+                        await append(context, .info, "INFO_PRINTF", preRunPrintf, itemName: item.name)
                     }
                 }
 
