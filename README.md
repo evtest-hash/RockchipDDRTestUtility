@@ -50,6 +50,8 @@ Without auto-detect the config must be picked by hand from the toolbar pop-up; t
 
 `DDRTestFiles/` also carries configs for **RK3028, RK3528, RV1126B, RV1126BP**, which currently have no maskrom-PID mapping — a connected board of those SoCs is listed but its SoC can't be identified automatically. **RK3506** (0x350F) is recognized but ships no configs.
 
+Release notes: [CHANGELOG.md](CHANGELOG.md) · third-party licenses: [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)
+
 ## Requirements
 
 - macOS 12.0 (Monterey) or later
