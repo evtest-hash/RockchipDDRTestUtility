@@ -69,9 +69,27 @@ struct ContentView: View {
                 Circle()
                     .fill(viewModel.devices.isEmpty ? Color.red : Color.green)
                     .frame(width: 8, height: 8)
-                Text(viewModel.devices.isEmpty ? "未连接设备" : (viewModel.selectedSoc ?? "已连接设备"))
-                    .font(.system(size: 14))
-                    .foregroundStyle(.secondary)
+                // One board: just name it. Several: let the operator say WHICH —
+                // every path already honours `selectedDeviceID` (the CLI exposes
+                // the same choice as --device-id); only this control was missing.
+                if viewModel.devices.count > 1 {
+                    Picker("", selection: $viewModel.selectedDeviceID) {
+                        ForEach(viewModel.devices) { device in
+                            Text(viewModel.deviceLabel(device)).tag(Optional(device.deviceID))
+                        }
+                    }
+                    .labelsHidden()
+                    .fixedSize()
+                    .disabled(viewModel.phase != .idle)
+                    .onChange(of: viewModel.selectedDeviceID) { _ in
+                        viewModel.onDeviceSelectionChanged()
+                    }
+                    .help("选择要测试的板子。切换会放弃当前板子的连接状态（下次开始重新 boot、重新探测）。")
+                } else {
+                    Text(viewModel.devices.isEmpty ? "未连接设备" : (viewModel.selectedSoc ?? "已连接设备"))
+                        .font(.system(size: 14))
+                        .foregroundStyle(.secondary)
+                }
             }
 
             // 模式分段：选「测什么」，下面的「开始」按钮按此分派。眼图对不支持

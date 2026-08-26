@@ -7,7 +7,24 @@ final class MainViewModel: ObservableObject {
     @Published var testFiles: [TestFileEntry] = []
     @Published var selectedFileID: String?
     @Published var devices: [UsbDevice] = []
-    @Published var selectedDeviceID: String?
+    /// The board the tool is pointed at. Everything in `connection` describes ONE
+    /// board, so moving the selection to a different one drops all of it.
+    ///
+    /// This matters with more than one board on the bus: unplugging the probed
+    /// board hands the selection to the survivor, and that is NOT the
+    /// "device removed" path (the bus never went empty), so the fresh-connection
+    /// reset never ran. The next 开始 then skipped both the boot and the detect
+    /// and ran the first board's cfg against the second.
+    @Published var selectedDeviceID: String? {
+        didSet {
+            guard selectedDeviceID != oldValue,
+                  connection.deviceID != selectedDeviceID else { return }
+            stopKeepAlive()
+            try? connection.transport?.close()
+            connection = Connection()
+            carryDetectStepIntoTest = false
+        }
+    }
     /// What the session is doing. Was two independent booleans (`isRunning`,
     /// `isDetecting`), which made "detecting AND testing" representable and left
     /// every guard checking both. Both are now derived, so the view is unchanged.
@@ -139,30 +156,9 @@ final class MainViewModel: ObservableObject {
     /// `startTest` to APPEND its steps after it (one timeline) instead of clearing.
     /// Consumed by that `startTest`; a fresh detect re-arms it, an unplug clears it.
     private var carryDetectStepIntoTest = false
-    /// Set the moment `performDetectThenTest` is launched for the current
-    /// device, so a subsequent `pollDevices` tick (the 1s timer) can't launch a
-    /// second, overlapping detect for the same connection — detect's own
-    /// reboot-to-maskrom step drops the device off USB and re-enumerates for up
-    /// to ~6s, during which two racing detects (or a reboot-induced re-enum
-    /// re-triggering detect) would otherwise loop. Cleared in
-    /// `resetConnectionState()` so a genuine unplug re-arms it.
-    /// True until a boot download succeeds on the current device connection.
-    /// Mirrors DDR_UserTool's `this+0x4B8` flag: set whenever the device set
-    /// changes (device (re)connected), cleared after the first successful boot,
-    /// so repeated "start test" runs skip boot and just re-run the bulk test —
-    /// exactly how Windows lets you keep clicking start.
     /// 眼图流式展示的跨 chunk 行缓冲:readPrintf 的字节不按行对齐,末尾未完成的
     /// 一行暂存于此,待下一段补齐后再落成一条消息(见 appendEyescanLines)。
     private var eyescanLineCarry = ""
-    /// Persistent USB transport held open across "start test" clicks for the
-    /// selected device — mirrors Windows' persistent device handle. The engine
-    /// is told `keepTransportOpen`, so repeat tests reuse the same claimed
-    /// interface instead of re-opening (which re-issues SET_CONFIGURATION and
-    /// stalls the booted device's bulk endpoint). Torn down on device-set change
-    /// or device-selection change.
-    /// Held as the PROTOCOL, not `RkUsbTransportLibusb`: the session logic only
-    /// needs the transport's contract, and binding it to libusb is what kept this
-    /// class impossible to drive from a test.
     /// Idle keep-alive for the held transport. Mirrors DDR_UserTool's permanent
     /// printf-reader thread (PrintfReaderThreadProc / sub_405C30): while a device
     /// is connected and no test is running, poll `readPrintf()` (opcode 0x80 on
@@ -180,13 +176,22 @@ final class MainViewModel: ObservableObject {
     struct Connection {
         /// Which board the held handle belongs to; nil when nothing is held.
         var deviceID: String?
-        /// Held open across clicks — re-opening reissues SET_CONFIGURATION,
-        /// which a booted device can't service (first bulk OUT stalls).
+        /// Held open across "start" clicks, mirroring Windows' persistent device
+        /// handle: the engine is told `keepTransportOpen`, so a repeat run reuses
+        /// the claimed interface instead of re-opening — which reissues
+        /// SET_CONFIGURATION, and a booted device can't service that (first bulk
+        /// OUT stalls, verified on RK3568). Held as the PROTOCOL, not
+        /// `RkUsbTransportLibusb`: binding it to libusb is what kept this class
+        /// impossible to drive from a test.
         var transport: UsbTransport?
         /// DDR_UserTool's `this+0x4B8`: true until a real boot succeeds on this
         /// connection, so repeat runs skip the control-transfer boot.
         var needsBoot = true
-        /// DDR auto-detect has already run for this connection.
+        /// DDR auto-detect has already run for this connection. Set the moment
+        /// `performDetectThenTest` launches, so a `pollDevices` tick can't start a
+        /// second overlapping detect: detect's reboot-to-maskrom drops the device
+        /// off USB and re-enumerates for up to ~6s, and two racing detects (or a
+        /// re-enum re-triggering detect) would otherwise loop.
         var probed = false
     }
     var connection = Connection()
@@ -196,6 +201,9 @@ final class MainViewModel: ObservableObject {
     private let parser = CfgBinaryParser()
     private let logWriter = ResultLogWriter()
     private(set) var lastResult: ExecutionResult?
+    /// The cfg that produced `lastResult`. Kept with the result rather than read
+    /// back off the current selection, which a board swap clears.
+    private var lastResultCfgPath: String?
     /// 最近一次眼图扫描的完整 transcript(供「保存结果」写出;眼图不产生
     /// `ExecutionResult`,所以单独存)。
     @Published private(set) var lastEyescanTranscript: String?
@@ -326,6 +334,7 @@ final class MainViewModel: ObservableObject {
                 keepTransportOpen: true
             )
             lastResult = result
+            lastResultCfgPath = selected.absolutePath
             // Clear the latch only after a real boot succeeds — a failed boot
             // leaves it set so the next run retries (matches Windows, which
             // clears 0x4B8 solely after a good boot).
@@ -498,7 +507,7 @@ final class MainViewModel: ObservableObject {
 
     /// 「保存结果」是否可点(按当前模式:眼图存 transcript,焊接存 ExecutionResult)。
     var canSaveResult: Bool {
-        guard !isRunning else { return false }
+        guard phase == .idle else { return false }
         return mode == .eyescan ? lastEyescanTranscript != nil : lastResult != nil
     }
 
@@ -518,14 +527,13 @@ final class MainViewModel: ObservableObject {
             return
         }
 
-        guard let lastResult,
-              let selected = testFiles.first(where: { $0.id == selectedFileID }) else {
+        guard let lastResult, let cfgPath = lastResultCfgPath else {
             statusMessage = "No result to save"
             return
         }
 
         do {
-            _ = try logWriter.write(result: lastResult, sourceCfgPath: selected.absolutePath, outputURL: outputURL)
+            _ = try logWriter.write(result: lastResult, sourceCfgPath: cfgPath, outputURL: outputURL)
             statusMessage = "Saved result: \(outputURL.lastPathComponent)"
         } catch {
             statusMessage = error.localizedDescription
@@ -540,9 +548,8 @@ final class MainViewModel: ObservableObject {
     /// current selection / falls back to manual).
     ///
     /// The actual "does this candidate exist" decision is delegated to
-    /// `CfgAutoSelect.firstAvailable` (DDRCore, pure, unit-tested) — this
-    /// wrapper only exists to apply the result to `@Published` state, since
-    /// this app target itself isn't unit-testable (executable, not a library).
+    /// `CfgAutoSelect.firstAvailable` (DDRCore, pure, unit-tested); this wrapper
+    /// only applies the result to `@Published` state.
     func applyDetectCandidates(_ candidates: [CfgAutoSelect.Candidate]) -> String? {
         guard let entry = CfgAutoSelect.firstAvailable(candidates, in: testFiles) else { return nil }
         selectedFileID = entry.id
@@ -550,13 +557,27 @@ final class MainViewModel: ObservableObject {
         return entry.id
     }
 
+    /// Operator-facing name for one board. Two boards of the same model are told
+    /// apart by the SOCKET they sit in — which is exactly why `deviceID`'s second
+    /// field is the physical port chain rather than the USB address (that one is
+    /// reassigned on every re-enumeration and recycled between devices).
+    func deviceLabel(_ device: UsbDevice) -> String {
+        let chip = device.socName?.isEmpty == false ? device.socName! : device.productName
+        let fields = device.deviceID.split(separator: "-")
+        guard fields.count >= 2 else { return chip }
+        return "\(chip) · 插口 \(fields[0]).\(fields[1])"
+    }
+
+    /// The operator picked a different board: retarget the tool at its chip. The
+    /// held handle and the boot/probe latches are dropped by `selectedDeviceID`'s
+    /// own didSet, since those describe the board being left behind.
     func onDeviceSelectionChanged() {
         guard let deviceID = selectedDeviceID,
-              let device = devices.first(where: { $0.deviceID == deviceID }),
-              let soc = device.socName else { return }
+              let device = devices.first(where: { $0.deviceID == deviceID }) else { return }
+        let soc = device.socName.flatMap { $0.isEmpty ? nil : $0 }
         if selectedSoc != soc {
             selectedSoc = soc
-            selectedFileID = nil
+            selectedFileID = nil      // another chip's cfg must not stay selected
         }
     }
 

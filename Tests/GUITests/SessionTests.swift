@@ -118,3 +118,83 @@ extension SessionTests {
         XCTAssertFalse(vm.connection.probed, "a replug must detect again")
     }
 }
+
+@MainActor
+extension SessionTests {
+
+    /// With two boards on the bus, unplugging the one that was probed hands the
+    /// selection to the OTHER board — but the latches describing the first one
+    /// stayed put. The next 开始 would then skip both the boot and the detect,
+    /// and run the first board's cfg against the second board.
+    ///
+    /// (`deviceRemoved` only fires when the bus goes empty, so the fresh-connection
+    /// reset never ran for this case.)
+    func testHandingTheSelectionToAnotherBoardDoesNotInheritItsPredecessorsLatches() async throws {
+        let vm = MainViewModel()
+        let bus = FakeBus(devices: [board("a"), board("b")])
+        vm.transportFactory = { bus.makeTransport() }
+        try await vm.refreshDevices()
+        XCTAssertEqual(vm.selectedDeviceID, "a")
+
+        // Board "a" has been booted and probed, and its handle is held.
+        let held = bus.makeTransport()
+        try held.open(device: vm.devices[0])
+        vm.connection = MainViewModel.Connection(deviceID: "a", transport: held,
+                                                 needsBoot: false, probed: true)
+
+        // "a" goes away; "b" is still there, so the bus never goes empty.
+        bus.devices = [board("b")]
+        try await vm.refreshDevices()
+
+        XCTAssertEqual(vm.selectedDeviceID, "b")
+        XCTAssertTrue(vm.connection.needsBoot, "board b must be booted, not assumed booted")
+        XCTAssertFalse(vm.connection.probed, "board b must be detected, not assumed detected")
+        XCTAssertNil(vm.connection.transport, "board a's handle must not be reused for b")
+        XCTAssertEqual(bus.closed, 1, "board a's handle must be closed")
+    }
+}
+
+@MainActor
+extension SessionTests {
+
+    /// The CLI has always been able to target one board (`--device-id`), and the
+    /// view model honours `selectedDeviceID` on every path — but nothing in the
+    /// UI could set it, and `onDeviceSelectionChanged` had no callers at all.
+    func testPickingAnotherBoardRetargetsTheToolToThatChip() async throws {
+        let vm = MainViewModel()
+        let bus = FakeBus(devices: [board("a", soc: "RK3576"), board("b", soc: "RK3568&RK3566")])
+        vm.transportFactory = { bus.makeTransport() }
+        try await vm.refreshDevices()
+        vm.selectedFileID = "some-cfg"
+        XCTAssertEqual(vm.selectedSoc, "RK3576")
+
+        vm.selectedDeviceID = "002-1.1-2207-350E-b"
+        vm.onDeviceSelectionChanged()
+
+        XCTAssertEqual(vm.selectedSoc, "RK3568&RK3566")
+        XCTAssertNil(vm.selectedFileID, "the other chip's cfg must not stay selected")
+    }
+
+    /// Two boards of the SAME model are told apart by the socket they sit in —
+    /// which is why deviceID's second field is the port chain and not the USB
+    /// address (that one is reassigned on every re-enumeration).
+    func testTwoIdenticalBoardsAreLabelledByTheirSocket() {
+        let vm = MainViewModel()
+        let a = UsbDevice(deviceID: "002-1.1-2207-350A-NA", vendorID: 0x2207, productID: 0x350A,
+                          productName: "Rockchip RK3568&RK3566 (0x350A)", serialNumber: nil,
+                          socName: "RK3568&RK3566")
+        let b = UsbDevice(deviceID: "002-1.4-2207-350A-NA", vendorID: 0x2207, productID: 0x350A,
+                          productName: "Rockchip RK3568&RK3566 (0x350A)", serialNumber: nil,
+                          socName: "RK3568&RK3566")
+
+        XCTAssertNotEqual(vm.deviceLabel(a), vm.deviceLabel(b))
+        XCTAssertTrue(vm.deviceLabel(a).contains("RK3568&RK3566"))
+        XCTAssertTrue(vm.deviceLabel(a).contains("1.1"), vm.deviceLabel(a))
+        XCTAssertTrue(vm.deviceLabel(b).contains("1.4"), vm.deviceLabel(b))
+    }
+
+    private func board(_ id: String, soc: String) -> UsbDevice {
+        UsbDevice(deviceID: "002-1.1-2207-350E-\(id)", vendorID: 0x2207, productID: 0x350E,
+                  productName: soc, serialNumber: nil, socName: soc)
+    }
+}
